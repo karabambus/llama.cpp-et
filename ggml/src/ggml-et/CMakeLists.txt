@@ -36,6 +36,7 @@ set(KERNELS
     mul_mat_id_Q4_0
     mul_mat_id_Q8_0
     mul_mat_Q8_0
+    mul_mat_Q8_0_group
     mul_mat_Q8_0_matrix_engine
     mul_mat_Q4_0
     mul_mat_Q4_0_matrix_engine
@@ -120,6 +121,7 @@ set(UBERKERNEL_SUPPORTED_KERNELS
     mul_mat_Q5_K
     mul_mat_Q6_K
     mul_mat_Q8_0
+    mul_mat_Q8_0_group
     norm_f32
     pad_f32
     repeat_f32

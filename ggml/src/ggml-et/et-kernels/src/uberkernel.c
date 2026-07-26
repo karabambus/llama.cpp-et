@@ -80,6 +80,8 @@ extern int mul_mat_f16_matrix_engine_entry(struct ggml_et_binary_params *, void 
 extern int mul_mat_f32_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_f32_matrix_engine_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_Q8_0_entry(struct ggml_et_mm_q8_params *, void *);
+struct ggml_et_mul_mat_group_params;
+extern int mul_mat_Q8_0_group_entry(struct ggml_et_mul_mat_group_params *, void *);
 extern int mul_mat_Q4_0_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_Q4_K_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_Q2_K_entry(struct ggml_et_binary_params *, void *);
@@ -480,6 +482,14 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                     struct ggml_et_mm_q8_params * p = (struct ggml_et_mm_q8_params *) inst_params;
                     // evict_region_past_l2(p->src0.data, tensor_bytes(&p->src0));
                     rc                              = mul_mat_Q8_0_entry(p, env);
+                    break;
+                }
+            case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q8_0_GROUP:
+                {
+                    // Independent Q8_0 mul_mats sharing one activation. Running them inside a
+                    // single instruction is the point: the loop above executes a chip-wide
+                    // barrier per instruction, and these members need none between them.
+                    rc = mul_mat_Q8_0_group_entry((struct ggml_et_mul_mat_group_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q4_0:

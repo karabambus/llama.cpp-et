@@ -689,6 +689,47 @@ bool ggml_et_op_glu(ggml_backend_et_device_context * dev_ctx, const ggml_tensor 
     return kernel_result;
 }
 
+bool ggml_et_op_mul_mat_group(ggml_backend_et_device_context * dev_ctx,
+                              const ggml_tensor * const *      nodes,
+                              int                              n_mats) {
+    ET_PERF_START();
+
+    if (!dev_ctx || !nodes || n_mats < 2 || n_mats > ET_MUL_MAT_GROUP_MAX) {
+        GGML_LOG_ERROR("ET: Invalid parameters for grouped MUL_MAT operation\n");
+        return false;
+    }
+
+    ggml_et_mul_mat_group_params params;
+    // The group path never fuses a residual ADD, so every bias slot must read as absent:
+    // the Q8_0 kernel decides purely on bias.data being non-NULL.
+    memset(&params, 0, sizeof(params));
+    params.n_mats   = n_mats;
+    params.reserved = 0;
+    params.src1     = *nodes[0]->src[1];
+    for (int g = 0; g < n_mats; g++) {
+        params.src0[g] = *nodes[g]->src[0];
+        params.dst[g]  = *nodes[g];
+    }
+
+    const bool kernel_result =
+        ggml_et_launch_kernel(dev_ctx, "mul_mat_Q8_0_group", &params, sizeof(params), 0xFFFFFFFF);
+
+    {
+        int64_t total_flops = 0;
+        for (int g = 0; g < n_mats; g++) {
+            const int64_t m = nodes[g]->ne[1];
+            const int64_t n = nodes[g]->ne[0];
+            const int64_t k = nodes[g]->src[0]->ne[0];
+            total_flops += nodes[g]->ne[2] * nodes[g]->ne[3] * m * n * (2 * k - 1);
+        }
+        char kernel_variant[64];
+        snprintf(kernel_variant, sizeof(kernel_variant), "mul_mat_Q8_0_group_x%d", n_mats);
+        ET_PERF_END_EXT("MUL_MAT_GROUP", kernel_variant, nodes[0], "flops=%" PRId64, total_flops);
+    }
+
+    return kernel_result;
+}
+
 bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
                         const ggml_tensor *              node,
                         const ggml_tensor *              add_node) {
