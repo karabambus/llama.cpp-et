@@ -390,3 +390,22 @@ bool ggml_et_op_ssm_scan(ggml_backend_et_device_context * dev_ctx, const ggml_te
 bool ggml_et_op_rms_norm_mul(ggml_backend_et_device_context * dev_ctx,
                              const ggml_tensor *              rms_norm_node,
                              const ggml_tensor *              mul_node);
+
+// Independent Q8_0 mul_mats that share one activation, issued as one dispatch.
+// Members write disjoint outputs and none reads another's, so no barrier is needed
+// between them -- which is the whole saving under the uberkernel, where every
+// instruction is preceded by a chip-wide barrier.
+#define ET_MUL_MAT_GROUP_MAX 3
+
+struct ggml_et_mul_mat_group_params {
+    int32_t     n_mats;
+    int32_t     reserved;  // keeps the tensor array 8B-aligned
+    ggml_tensor src0[ET_MUL_MAT_GROUP_MAX];
+    ggml_tensor src1;
+    ggml_tensor dst[ET_MUL_MAT_GROUP_MAX];
+    ggml_tensor bias[ET_MUL_MAT_GROUP_MAX];  // .data == nullptr means no residual bias
+};
+
+bool ggml_et_op_mul_mat_group(ggml_backend_et_device_context * dev_ctx,
+                              const ggml_tensor * const *      nodes,
+                              int                              n_mats);

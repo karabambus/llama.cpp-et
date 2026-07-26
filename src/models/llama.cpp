@@ -143,6 +143,17 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
 
+            // Pin the three projections into the graph in creation order, before anything
+            // downstream of them is built. Without this the post-order DFS reaches Q's rope
+            // subtree before it reaches V, so the emitted order interleaves rope(Q) between
+            // the projections and only two of the three end up contiguous. They read the
+            // same activation and write disjoint outputs, so a backend that issues
+            // contiguous independent mul_mats as one dispatch gets all three. Visit order
+            // between independent siblings is unconstrained: no computed value changes.
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
+
             Qcur = ggml_rope_ext(
                     ctx0, Qcur, inp_pos, rope_factors,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,

@@ -654,9 +654,90 @@ static bool ggml_et_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::init
     return true;
 }
 
+// A run of MUL_MAT nodes that share the same activation and write disjoint outputs can be
+// issued as one dispatch. Unlike ggml_can_fuse, which matches a producer->consumer CHAIN,
+// these are independent SIBLINGS: the decode graph emits the Q/K/V projections together and
+// the FFN gate/up projections together. Under the uberkernel each instruction is preceded by
+// et_barrier_global(), so collapsing N instructions into one removes N-1 chip-wide barriers.
+static bool ggml_et_node_is_metadata_only(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Members need not be literally adjacent -- only separated by metadata-only nodes, which
+// compute nothing and re-describe an existing tensor rather than reading element data, so
+// running a later sibling before them cannot change a value. `out_last` is the highest index
+// consumed, so the caller can advance past the whole group.
+static int ggml_et_mul_mat_group_len(const ggml_cgraph * cgraph, int node_idx, int * out_idx, int * out_last) {
+    // Kill-switch: the grouping must be provably result-identical to the separate
+    // dispatches, and the only way to show that is to run both on this backend and diff.
+    static const int disabled = getenv("GGML_ET_NO_MUL_MAT_GROUP") != nullptr;
+    if (disabled) {
+        return 0;
+    }
+
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+
+    if (first->op != GGML_OP_MUL_MAT || !first->src[0] || !first->src[1]) {
+        return 0;
+    }
+    // Restricted to the decode shape this exists for: Q8_0 weights, F32 activation, N == 1.
+    if (first->type != GGML_TYPE_F32 || first->src[0]->type != GGML_TYPE_Q8_0 ||
+        first->src[1]->type != GGML_TYPE_F32 || first->src[1]->ne[1] != 1) {
+        return 0;
+    }
+
+    int len    = 1;
+    out_idx[0] = node_idx;
+    *out_last  = node_idx;
+
+    for (int j = node_idx + 1; j < cgraph->n_nodes && len < ET_MUL_MAT_GROUP_MAX; j++) {
+        const ggml_tensor * next = cgraph->nodes[j];
+
+        if (ggml_et_node_is_metadata_only(next)) {
+            continue;
+        }
+        if (next->op != GGML_OP_MUL_MAT || !next->src[0] || !next->src[1]) {
+            break;
+        }
+        // Same activation, same dtypes, weights differing only in row count.
+        if (next->src[1] != first->src[1] || next->type != GGML_TYPE_F32 ||
+            next->src[0]->type != GGML_TYPE_Q8_0 || next->src[0]->ne[0] != first->src[0]->ne[0]) {
+            break;
+        }
+        // Independence: a later member must not consume an earlier member's output.
+        bool depends = false;
+        for (int m = 0; m < len; m++) {
+            if (next->src[0] == cgraph->nodes[out_idx[m]] || next->src[1] == cgraph->nodes[out_idx[m]]) {
+                depends = true;
+                break;
+            }
+        }
+        if (depends) {
+            break;
+        }
+
+        out_idx[len++] = j;
+        *out_last      = j;
+    }
+
+    return len >= 2 ? len : 0;
+}
+
 static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
     ggml_et_uberkernel_begin_graph(&dev_ctx->uberkernel);
+
+    int fused_groups           = 0;
+    int fused_dispatches_saved = 0;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -667,6 +748,23 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         // --- Fusion checks (before regular dispatch) ---
+        {
+            int       group_idx[ET_MUL_MAT_GROUP_MAX];
+            int       group_last = i;
+            const int group_len  = ggml_et_mul_mat_group_len(cgraph, i, group_idx, &group_last);
+            if (group_len >= 2) {
+                fused_groups++;
+                fused_dispatches_saved += group_len - 1;
+                const ggml_tensor * group[ET_MUL_MAT_GROUP_MAX];
+                for (int g = 0; g < group_len; g++) {
+                    group[g] = cgraph->nodes[group_idx[g]];
+                }
+                ggml_et_op_mul_mat_group(dev_ctx, group, group_len);
+                i = group_last;  // interleaved metadata nodes emit no work
+                continue;
+            }
+        }
+
         if (ggml_et_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_et_op_rms_norm_mul(dev_ctx, node, cgraph->nodes[i + 1]);
             i++;  // skip the MUL node
@@ -853,6 +951,18 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
         if (ggml_et_uberkernel_failed(&dev_ctx->uberkernel)) {
             ggml_et_uberkernel_abort_graph(&dev_ctx->uberkernel);
             return GGML_STATUS_FAILED;
+        }
+    }
+
+    {
+        // Report each new peak rather than only the first graph: the first graph is
+        // prefill (N > 1) and the grouping is gated on N == 1, so a first-graph-only
+        // count structurally cannot observe decode.
+        static int announced_max = -1;
+        if (fused_dispatches_saved > announced_max) {
+            announced_max = fused_dispatches_saved;
+            GGML_LOG_INFO("ET: mul_mat sibling fusion: %d groups fused, %d dispatches saved (peak so far)\n",
+                          fused_groups, fused_dispatches_saved);
         }
     }
 
@@ -1804,8 +1914,10 @@ ggml_backend_reg_t ggml_backend_et_reg(void) {
             dev_ctx->desc                            = "ET device " + std::to_string(i);
             dev_ctx->total_mem                       = static_cast<size_t>(prop.memorySize_);
             {
+                // Enabled by default: the benchmark harness cannot set environment variables,
+                // so the uberkernel is only reachable if it is opt-out rather than opt-in.
                 const char * env            = getenv("GGML_ET_UBERKERNEL");
-                dev_ctx->uberkernel_enabled = env && env[0] != '\0' && strcmp(env, "0") != 0;
+                dev_ctx->uberkernel_enabled = !(env && strcmp(env, "0") == 0);
             }
             // Add buffer type for device to device context.
             ggml_backend_et_buffer_type_context * bufty_ctx = new ggml_backend_et_buffer_type_context;
