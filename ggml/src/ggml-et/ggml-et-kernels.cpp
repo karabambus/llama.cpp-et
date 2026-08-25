@@ -243,7 +243,10 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
                 GGML_LOG_ERROR("ET: Errors detected before kernel \"%s\" launch\n", kernel_name.c_str());
                 for (const auto & error : errors) {
                     GGML_LOG_ERROR("ET: Error code: %d\n", (int) error.errorCode_);
+                    fprintf(stderr, "ET-SYNC-CHECK: error BEFORE kernel \"%s\": code=%d\n", kernel_name.c_str(),
+                            (int) error.errorCode_);
                 }
+                fflush(stderr);
                 abort();
             }
         }
@@ -280,7 +283,14 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
                 GGML_LOG_ERROR("ET: Errors detected during kernel \"%s\" execution\n", kernel_name.c_str());
                 for (const auto & error : errors) {
                     GGML_LOG_ERROR("ET: Error code: %d\n", (int) error.errorCode_);
+                    int ctx_type = -1;
+                    if (error.errorContext_.has_value() && !error.errorContext_.value().empty()) {
+                        ctx_type = (int) error.errorContext_.value()[0].type_;
+                    }
+                    fprintf(stderr, "ET-SYNC-CHECK: error DURING kernel \"%s\": code=%d ctx_type=%d\n",
+                            kernel_name.c_str(), (int) error.errorCode_, ctx_type);
                 }
+                fflush(stderr);
                 abort();
             }
         }
@@ -457,6 +467,17 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context * dev_ctx,
                            bool                             sync_error_check) {
     if (!dev_ctx) {
         return false;
+    }
+
+    // GGML_ET_SYNC_CHECK=1: wait after every kernel and attribute device stream errors to the kernel that
+    // raised them (debug aid; serialises launches). Without it a device exception surfaces only at the next
+    // synchronize() as an anonymous "stream error" abort.
+    {
+        static const bool force_sync = [] {
+            const char * e = getenv("GGML_ET_SYNC_CHECK");
+            return e && *e && strcmp(e, "0") != 0;
+        }();
+        sync_error_check = sync_error_check || force_sync;
     }
 
     if (!dev_ctx->uberkernel_enabled) {
