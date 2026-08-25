@@ -981,6 +981,26 @@ static bool et_ggml_is_row_contiguous(const ggml_tensor * t) {
 }
 
 static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // In-place ops (ggml_clamp, *_inplace, ...) are VIEWS of their source: dst->data == view root's data,
+    // which ggml-alloc places wherever the root was computed. If that root fell back to the CPU (common in
+    // MoE routing on this backend), a device kernel would write through a host pointer -> U-mode exception
+    // (Exp 001: ffn_moe_weights_sum_clamped). Only accept an in-place op when its view root is (or will be)
+    // ET-resident: a pre-allocated root must sit in a non-host buffer, a computed root must itself be an op
+    // this backend supports. This intentionally over-rejects the rare case where a supported root is still
+    // scheduled elsewhere; the CPU fallback is correct, the device write is not.
+    if (op->view_src != NULL) {
+        const ggml_tensor * root = op->view_src;
+        while (root->view_src != NULL) {
+            root = root->view_src;
+        }
+        if (root->buffer != NULL) {
+            if (ggml_backend_buffer_is_host(root->buffer)) {
+                return false;
+            }
+        } else if (root->op != GGML_OP_NONE && !ggml_backend_et_device_supports_op(dev, root)) {
+            return false;
+        }
+    }
     // GGML_ET_DISABLE_OPS="CLAMP,MUL_MAT_ID": force the listed ops (ggml_op_name spelling; UNARY sub-ops as
     // e.g. "UNARY:SILU") to the CPU backend. Debug/bring-up aid for kernels that misbehave on silicon.
     {
