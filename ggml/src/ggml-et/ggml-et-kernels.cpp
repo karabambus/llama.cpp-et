@@ -447,6 +447,30 @@ static bool ggml_et_launch_uberkernel(ggml_backend_et_device_context * dev_ctx,
         uk_ctx->shire_mask = shire_mask;
     }
 
+        if (sync_error_check) {
+        // GGML_ET_SYNC_CHECK: commit the segment now (this op is its last instruction) and attribute any
+        // device error to this kernel, mirroring the standalone-launch path.
+        if (!ggml_et_launch_uberkernel_segment(dev_ctx, uk_ctx)) {
+            return false;
+        }
+        std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+        if (runtime) {
+            runtime->waitForStream(dev_ctx->default_stream);
+            auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
+            if (!errors.empty()) {
+                for (const auto & error : errors) {
+                    int ctx_type = -1;
+                    if (error.errorContext_.has_value() && !error.errorContext_.value().empty()) {
+                        ctx_type = (int) error.errorContext_.value()[0].type_;
+                    }
+                    fprintf(stderr, "ET-SYNC-CHECK: error DURING uberkernel op \"%s\": code=%d ctx_type=%d\n",
+                            kernel_name.c_str(), (int) error.errorCode_, ctx_type);
+                }
+                fflush(stderr);
+                abort();
+            }
+        }
+    }
     return true;
 }
 
