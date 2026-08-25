@@ -981,6 +981,38 @@ static bool et_ggml_is_row_contiguous(const ggml_tensor * t) {
 }
 
 static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    // GGML_ET_DISABLE_OPS="CLAMP,MUL_MAT_ID": force the listed ops (ggml_op_name spelling; UNARY sub-ops as
+    // e.g. "UNARY:SILU") to the CPU backend. Debug/bring-up aid for kernels that misbehave on silicon.
+    {
+        static const std::vector<std::string> disabled = [] {
+            std::vector<std::string> v;
+            const char * e = getenv("GGML_ET_DISABLE_OPS");
+            if (e) {
+                std::string cur;
+                for (const char * c = e;; ++c) {
+                    if (*c == ',' || *c == '\0') {
+                        if (!cur.empty()) { v.push_back(cur); }
+                        cur.clear();
+                        if (*c == '\0') { break; }
+                    } else if (*c != ' ') {
+                        cur.push_back(*c);
+                    }
+                }
+            }
+            return v;
+        }();
+        if (!disabled.empty()) {
+            std::string name = ggml_op_name(op->op);
+            if (op->op == GGML_OP_UNARY) {
+                name += std::string(":") + ggml_unary_op_name(ggml_get_unary_op(op));
+            }
+            for (const auto & d : disabled) {
+                if (d == name || (op->op == GGML_OP_UNARY && d == "UNARY")) {
+                    return false;
+                }
+            }
+        }
+    }
     GGML_UNUSED(dev);
 
     bool supported = false;
