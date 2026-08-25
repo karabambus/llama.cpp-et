@@ -1,4 +1,6 @@
 #include "ggml-et-ops.h"
+#include <cstdio>
+#include <cstdlib>
 
 #include "ggml-et-cpu-compare.h"
 #include "ggml-et-kernels.h"
@@ -468,6 +470,21 @@ bool ggml_et_op_clamp(ggml_backend_et_device_context * dev_ctx, const ggml_tenso
         }
     }
 
+    if (getenv("GGML_ET_SYNC_CHECK")) {
+        auto dump = [](const char * tag, const ggml_tensor * t) {
+            fprintf(stderr,
+                    "ET-CLAMP %s: name=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] data=%p view_src=%p "
+                    "view_offs=%zu buffer=%s contiguous=%d\n",
+                    tag, t->name, ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1],
+                    (long long) t->ne[2], (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3], t->data,
+                    (void *) t->view_src, t->view_offs, t->buffer ? ggml_backend_buffer_name(t->buffer) : "(null)",
+                    (int) ggml_is_contiguous(t));
+        };
+        dump("src0", node->src[0]);
+        dump("dst ", node);
+        fprintf(stderr, "ET-CLAMP params: min=%g max=%g\n", params.min_val, params.max_val);
+        fflush(stderr);
+    }
     bool kernel_result = ggml_et_launch_kernel(dev_ctx, "clamp_f32", &params, sizeof(params), 0xFFFFFFFF);
 
     if (cpu_comparison_active) {
