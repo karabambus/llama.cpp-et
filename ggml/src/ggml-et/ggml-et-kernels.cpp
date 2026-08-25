@@ -6,6 +6,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#include <string>
 #include <fstream>
 
 #define ET_TRACE_DECODER_IMPL
@@ -417,7 +419,34 @@ static bool ggml_et_launch_uberkernel(ggml_backend_et_device_context * dev_ctx,
     }
 
     ggml_backend_et_uberkernel_context * uk_ctx        = &dev_ctx->uberkernel;
-    const uint16_t                       uberkernel_id = ggml_et_uberkernel_kernel_id_from_name(kernel_name.c_str());
+    uint16_t                             uberkernel_id = ggml_et_uberkernel_kernel_id_from_name(kernel_name.c_str());
+    // GGML_ET_UBERKERNEL_EXCLUDE="softmax_f32,scale_f32": launch the listed kernels standalone (flushing the
+    // pending segment first) instead of batching them. Bisect aid for inter-instruction visibility bugs.
+    {
+        static const std::vector<std::string> excluded = [] {
+            std::vector<std::string> v;
+            const char * e = getenv("GGML_ET_UBERKERNEL_EXCLUDE");
+            if (e) {
+                std::string cur;
+                for (const char * c = e;; ++c) {
+                    if (*c == ',' || *c == '\0') {
+                        if (!cur.empty()) { v.push_back(cur); }
+                        cur.clear();
+                        if (*c == '\0') { break; }
+                    } else if (*c != ' ') {
+                        cur.push_back(*c);
+                    }
+                }
+            }
+            return v;
+        }();
+        for (const auto & x : excluded) {
+            if (x == kernel_name) {
+                uberkernel_id = GGML_ET_UBERKERNEL_KERNEL_INVALID;
+                break;
+            }
+        }
+    }
     if (uberkernel_id == GGML_ET_UBERKERNEL_KERNEL_INVALID) {
         if (!ggml_et_launch_uberkernel_segment(dev_ctx, uk_ctx)) {
             return false;
