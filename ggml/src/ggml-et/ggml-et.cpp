@@ -565,7 +565,9 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
     }
     for (const auto & err : errors) {
         GGML_LOG_ERROR("ET: stream error detected at synchronization point. Code: %d,Type: %d\n", (int) err.errorCode_,
-                       (int) err.errorContext_.value()[0].type_);
+                       err.errorContext_.has_value() && !err.errorContext_.value().empty() ? (int) err.errorContext_.value()[0].type_ : -1);
+        fprintf(stderr, "ET: stream error: %s\n", err.getString().c_str());
+        fflush(stderr);
     }
     abort();
 }
