@@ -13,9 +13,19 @@
 // The host only fuses when E % 16 == 0, dst rows are line-aligned and contiguous
 // in e (nb0 == 4, nb1 % 64 == 0). dst may alias slot 0 of src0 (in-place ADD chain):
 // each (e,t) is read for all s before it is written, by the same hart.
+// T2 fusion 4: optional residual `res` [E, N] (res.data == NULL -> none) seeds the
+// accumulators, folding llama.cpp's `l_out = moe_out + ffn_inp` ADD into the launch.
+// res may alias dst (in-place ADD) — same read-before-write argument.
 //******************************************************************************
 
-int entry_point(struct ggml_et_binary_params * params, void * env) {
+struct ggml_et_moe_sum_params {
+    struct ggml_tensor src0;  // experts [E, S, N]
+    struct ggml_tensor src1;  // weights [1, S, N]
+    struct ggml_tensor dst;   // [E, N]
+    struct ggml_tensor res;   // residual [E, N] (optional)
+};
+
+int entry_point(struct ggml_et_moe_sum_params * params, void * env) {
     kernel_environment_t * kernel_env = (kernel_environment_t *) env;
     if (!kernel_env) {
         return -1;
@@ -48,6 +58,12 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
     const size_t nb01 = src0->nb[1], nb02 = src0->nb[2];   // slot, token strides of experts
     const size_t nb11 = src1->nb[1], nb12 = src1->nb[2];   // slot, token strides of weights
     const size_t nbd1 = dst->nb[1];
+    const char * r_base = (const char *) params->res.data;
+    const size_t nbr1   = params->res.nb[1];
+    if (r_base && (params->res.type != GGML_TYPE_F32 || params->res.nb[0] != sizeof(float) || params->res.ne[0] != E ||
+                   params->res.ne[1] != N)) {
+        return -1;
+    }
 
     const int64_t lines_per_row = E / 16;
     const int64_t total_lines   = N * lines_per_row;
@@ -62,8 +78,16 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
         const char *  x  = x_base + t * nb02 + e0 * sizeof(float);
         const char *  w  = w_base + t * nb12;
         float *       d  = (float *) (d_base + t * nbd1 + e0 * sizeof(float));
-        float zero = 0.0f;
-        __asm__ volatile("fbc.ps f10, %[z]\n fbc.ps f11, %[z]\n" : : [z] "m"(zero) : "f10", "f11");
+        if (r_base) {
+            const float * r = (const float *) (r_base + t * nbr1 + e0 * sizeof(float));
+            __asm__ volatile("flw.ps f10, %[r0]\n flw.ps f11, %[r1]\n"
+                             :
+                             : [r0] "m"(*(const float (*)[8]) r), [r1] "m"(*(const float (*)[8]) (r + 8))
+                             : "f10", "f11");
+        } else {
+            float zero = 0.0f;
+            __asm__ volatile("fbc.ps f10, %[z]\n fbc.ps f11, %[z]\n" : : [z] "m"(zero) : "f10", "f11");
+        }
         for (int64_t s = 0; s < S; ++s) {
             const float * xs = (const float *) (x + s * nb01);
             const float * ws = (const float *) (w + s * nb11);

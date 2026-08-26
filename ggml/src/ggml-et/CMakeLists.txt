@@ -39,6 +39,7 @@ set(KERNELS
     mul_mat_Q8_0_group
     mul_mat_Q8_0_matrix_engine
     mul_mat_Q4_0
+    mul_mat_Q4_0_group
     mul_mat_Q4_0_matrix_engine
     mul_mat_Q4_K
     mul_mat_Q4_K_matrix_engine
@@ -59,6 +60,8 @@ set(KERNELS
     sum_rows_f32
     argsort_f32
     moe_sum_f32
+    moe_router_f32
+    attn_qkv_glue_f32
     mean_f32
     cumsum_f32
     norm_f32

@@ -347,13 +347,90 @@ struct ggml_et_scale_params {
     float       bias;   // Bias (additive offset)
 };
 
+// ---- T2 launch-count fusions (experiments/T2, 2026-08-26) ----------------------------------------------------
+
+// Fusion 1: the llama.cpp MoE routing chain SOFT_MAX -> ARGSORT(top_k view) -> GET_ROWS -> SUM_ROWS -> CLAMP -> DIV
+// as one moe_router_f32 launch. Only the tensors the rest of the graph reads are written: the first n_top entries
+// of every ARGSORT row (the top_k view feeds MUL_MAT_ID) and the normalised weights (the DIV output).
+struct ggml_et_moe_router_params {
+    ggml_tensor src0;       // logits [E, N] F32 (the SOFT_MAX input)
+    ggml_tensor ids;        // ARGSORT output [E, N] I32
+    ggml_tensor dst;        // DIV output [K, N] F32
+    float       clamp_min;  // CLAMP bounds applied to the weight sum
+    float       clamp_max;
+    int32_t     n_top;      // K = n_expert_used
+    int32_t     reserved;
+};
+
+// Fusion 4b: 038's moe_sum with the layer's residual ADD folded in (res.data == nullptr -> none).
+struct ggml_et_moe_sum_params {
+    ggml_tensor src0;  // experts [E, S, N]
+    ggml_tensor src1;  // weights [1, S, N]
+    ggml_tensor dst;   // [E, N]
+    ggml_tensor res;   // residual [E, N] (optional)
+};
+
+// Fusion 2: attention glue — per job: y = rms_norm(x)*w (optional), z = rope(y) (optional), z -> dst (optional),
+// z -> kv[idx[t]] (SET_ROWS into the KV cache, optional). Compact descriptors (no ggml_tensor copies) so three
+// jobs fit comfortably in the launch argument block. Layout must match attn_qkv_glue_f32.c exactly.
+#define ET_QKV_GLUE_MAX_JOBS 3
+struct ggml_et_qkv_job {
+    const void * src;
+    const void * w;
+    const void * pos;
+    void *       dst;
+    void *       kv;
+    const void * idx;
+    uint64_t     src_nb1, src_nb2;
+    uint64_t     dst_nb1, dst_nb2;
+    uint64_t     kv_nb1, idx_nb0;
+    int64_t      kv_rows;
+    int32_t      D, H, N;
+    int32_t      kv_f16;
+    float        eps;
+    int32_t      reserved;
+};
+
+struct ggml_et_qkv_glue_params {
+    ggml_et_qkv_job       job[ET_QKV_GLUE_MAX_JOBS];
+    ggml_et_rope_settings rope;
+    int32_t               n_jobs;
+    int32_t               reserved;
+};
+
+// Host-side description of one matched glue job (filled by the graph matcher in ggml-et.cpp).
+struct ggml_et_qkv_glue_job_desc {
+    const ggml_tensor * x;         // [D, H, N] input rows (the RMS_NORM's src, or the SET_ROWS source for a copy job)
+    const ggml_tensor * rms_norm;  // nullptr for a copy-only job
+    const ggml_tensor * mul;       // the MUL that applies the norm weight
+    const ggml_tensor * rope;      // nullptr for a copy-only job
+    const ggml_tensor * set_rows;  // nullptr when the rope output is only materialised
+    int64_t             D, H, N;
+};
+
+struct ggml_et_qkv_glue_plan {
+    ggml_et_qkv_glue_job_desc job[ET_QKV_GLUE_MAX_JOBS];
+    int                       n_jobs;
+    int                       last_idx;  // last graph node consumed
+};
+
 bool ggml_et_op_cumsum(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_sqr(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_unary(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_sum_rows(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_argsort(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
-// 038: fused MoE expert aggregation dst = sum_s experts[:,s,:] * weights[0,s,:] (MUL + view-ADD chain)
-bool ggml_et_op_moe_sum(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * mul_node, const ggml_tensor * dst_node);
+// 038: fused MoE expert aggregation dst = sum_s experts[:,s,:] * weights[0,s,:] (MUL + view-ADD chain);
+// T2: optional residual `res` (the following ADD) folded into the same launch.
+bool ggml_et_op_moe_sum(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * mul_node, const ggml_tensor * dst_node,
+                        const ggml_tensor * res = nullptr);
+// T2 fusion 1: routing chain. logits = the SOFT_MAX input, argsort = the ARGSORT node, div_node = the DIV output,
+// clamp_node supplies the CLAMP bounds.
+bool ggml_et_op_moe_router(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * logits, const ggml_tensor * argsort,
+                           const ggml_tensor * div_node, const ggml_tensor * clamp_node, int n_top);
+// T2 fusion 2: attention glue (norm + rope + set_rows jobs), see ggml_et_qkv_glue_plan.
+bool ggml_et_op_qkv_glue(ggml_backend_et_device_context * dev_ctx, const ggml_et_qkv_glue_plan & plan);
+// Packs a ROPE node's op_params into the kernel settings struct (shared by rope and the glue kernel).
+void ggml_et_fill_rope_settings(const ggml_tensor * rope_node, ggml_et_rope_settings * out);
 bool ggml_et_op_mean(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_clamp(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_scale(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
