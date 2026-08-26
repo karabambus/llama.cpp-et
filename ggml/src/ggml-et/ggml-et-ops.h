@@ -352,6 +352,8 @@ bool ggml_et_op_sqr(ggml_backend_et_device_context * dev_ctx, const ggml_tensor 
 bool ggml_et_op_unary(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_sum_rows(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_argsort(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
+// 038: fused MoE expert aggregation dst = sum_s experts[:,s,:] * weights[0,s,:] (MUL + view-ADD chain)
+bool ggml_et_op_moe_sum(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * mul_node, const ggml_tensor * dst_node);
 bool ggml_et_op_mean(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_clamp(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_scale(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);

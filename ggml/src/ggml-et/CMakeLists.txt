@@ -58,6 +58,7 @@ set(KERNELS
     clamp_f32
     sum_rows_f32
     argsort_f32
+    moe_sum_f32
     mean_f32
     cumsum_f32
     norm_f32
