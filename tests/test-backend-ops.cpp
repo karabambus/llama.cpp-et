@@ -8945,6 +8945,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 77, 77, {12,1}, {1,1}));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
+    // ET: extra MUL_MAT shapes from the environment — GGML_ET_TBO_MM_SHAPES="m,n,k[,bs0,bs1];..."
+    // (type_a from GGML_ET_TBO_MM_TYPE, default q4_0). Gate for kernel paths the fixed list never
+    // reaches: the Q4_0 matrix-engine REUSE (ru_n>=2) vs ORIGINAL split, partial N-tiles, deep C-scratch.
+    if (const char * shapes_env = getenv("GGML_ET_TBO_MM_SHAPES")) {
+        ggml_type type_a_env = GGML_TYPE_Q4_0;
+        if (const char * tname = getenv("GGML_ET_TBO_MM_TYPE")) {
+            for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+                const char * nm = ggml_type_name((ggml_type) i);
+                if (nm && strcmp(nm, tname) == 0) { type_a_env = (ggml_type) i; }
+            }
+        }
+        std::string shapes(shapes_env);
+        size_t pos = 0;
+        while (pos < shapes.size()) {
+            size_t end = shapes.find(';', pos);
+            if (end == std::string::npos) { end = shapes.size(); }
+            std::string item = shapes.substr(pos, end - pos);
+            pos = end + 1;
+            long long em = 0, en = 0, ek = 0, eb0 = 1, eb1 = 1;
+            if (sscanf(item.c_str(), "%lld,%lld,%lld,%lld,%lld", &em, &en, &ek, &eb0, &eb1) >= 3) {
+                test_cases.emplace_back(new test_mul_mat(type_a_env, GGML_TYPE_F32, em, en, ek, {eb0, eb1}, {1, 1}));
+            }
+        }
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1, 64, 256, {1,  1}, {1, 1}));

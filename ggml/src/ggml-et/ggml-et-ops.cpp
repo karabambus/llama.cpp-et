@@ -1,6 +1,7 @@
 #include "ggml-et-ops.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "ggml-et-cpu-compare.h"
 #include "ggml-et-kernels.h"
@@ -888,6 +889,20 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
     params.src0 = *node->src[0];  // weight matrix
     params.src1 = *node->src[1];  // activation matrix
     params.dst  = *fused_dst;     // output (= add_node when fused, else node)
+
+    // GGML_ET_DEBUG_MM=1: print the device addresses of every MUL_MAT launch (Exp 049 / W24: tensor_load and
+    // tensor_store silently truncate addresses to 64 B / 16 B, so operand placement matters for engine kernels).
+    {
+        static const bool debug_mm = [] { const char * e = getenv("GGML_ET_DEBUG_MM"); return e && *e && strcmp(e, "0") != 0; }();
+        if (debug_mm) {
+            fprintf(stderr, "ET-MM: %s M=%lld N=%lld K=%lld src0=%p(%%64=%lu) src1=%p(%%64=%lu) dst=%p(%%64=%lu) nb1_1=%zu nb1_d=%zu\n",
+                    kernel_name, (long long) node->src[0]->ne[1], (long long) node->src[1]->ne[1], (long long) node->src[0]->ne[0],
+                    node->src[0]->data, (unsigned long) ((uintptr_t) node->src[0]->data % 64),
+                    node->src[1]->data, (unsigned long) ((uintptr_t) node->src[1]->data % 64),
+                    fused_dst->data, (unsigned long) ((uintptr_t) fused_dst->data % 64),
+                    node->src[1]->nb[1], fused_dst->nb[1]);
+        }
+    }
 
     ggml_et_cpu_compare_ctx cpu_cmp_ctx;
     bool                    cpu_comparison_active = false;
