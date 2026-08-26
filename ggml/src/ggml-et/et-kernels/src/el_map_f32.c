@@ -88,6 +88,71 @@ DEFINE_BLOCK_OP_BROADCAST(block_mul_broadcast, "fmul.ps")
 DEFINE_BLOCK_OP_BROADCAST(block_add_broadcast, "fadd.ps")
 DEFINE_BLOCK_OP_BROADCAST(block_sub_broadcast, "fsub.ps")
 
+// Reciprocal without fdiv (the core has no float divide): FRCP.PS seed on lane 0, two Newton steps
+// r = r * (2 - b * r) (fmul/fsub only), giving full FP32 precision for the routing-weight normalisation.
+static inline float et_recip(float b) {
+    float         r;
+    unsigned long temp;
+    __asm__ volatile(
+        "mova.x.m  %[temp]              \n\t"
+        "mov.m.x   m0, x0, 1            \n\t"
+        "frcp.ps   %[r], %[b]           \n\t"
+        "mova.m.x  %[temp]              \n\t"
+        : [temp] "=&r"(temp), [r] "=&f"(r)
+        : [b] "f"(b));
+    r = r * (2.0f - b * r);
+    r = r * (2.0f - b * r);
+    return r;
+}
+
+// Vector a / b for `elements` floats: frcp.ps seed + two Newton steps, masked tail. Clobbers f10-f14.
+static inline void block_div_cache_aligned(float * dst_block, const float * src0_block, const float * src1_block, int elements) {
+    static const float two = 2.0f;
+    const int32_t vec_end = (elements / 8) * 8;
+    const int32_t tail    = elements - vec_end;
+    unsigned long temp_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(temp_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+    __asm__ volatile("fbc.ps f13, %[t]\n" : : [t] "m"(two) : "f13");
+    for (int32_t i = 0; i < vec_end; i += 8) {
+        __asm__ volatile(
+            "flw.ps  f10, %[s0]\n"
+            "flw.ps  f11, %[s1]\n"
+            "frcp.ps f12, f11\n"
+            "fmul.ps f14, f11, f12\n"
+            "fsub.ps f14, f13, f14\n"
+            "fmul.ps f12, f12, f14\n"
+            "fmul.ps f14, f11, f12\n"
+            "fsub.ps f14, f13, f14\n"
+            "fmul.ps f12, f12, f14\n"
+            "fmul.ps f12, f10, f12\n"
+            "fsw.ps  f12, %[d]\n"
+            : [d] "=m"(*(float (*)[8]) & dst_block[i])
+            : [s0] "m"(*(const float (*)[8]) & src0_block[i]), [s1] "m"(*(const float (*)[8]) & src1_block[i])
+            : "f10", "f11", "f12", "f14");
+    }
+    if (tail > 0) {
+        const unsigned long tail_m0 = (1ul << tail) - 1;
+        __asm__ volatile(
+            "mov.m.x m0, %[tm], 0\n"
+            "flw.ps  f10, 0(%[s0])\n"
+            "flw.ps  f11, 0(%[s1])\n"
+            "frcp.ps f12, f11\n"
+            "fmul.ps f14, f11, f12\n"
+            "fsub.ps f14, f13, f14\n"
+            "fmul.ps f12, f12, f14\n"
+            "fmul.ps f14, f11, f12\n"
+            "fsub.ps f14, f13, f14\n"
+            "fmul.ps f12, f12, f14\n"
+            "fmul.ps f12, f10, f12\n"
+            "fsw.ps  f12, 0(%[d])\n"
+            :
+            : [s0] "r"(&src0_block[vec_end]), [s1] "r"(&src1_block[vec_end]), [d] "r"(&dst_block[vec_end]), [tm] "r"(tail_m0)
+            : "f10", "f11", "f12", "f14", "memory");
+    }
+    __asm__ volatile("mova.m.x %0" ::"r"(temp_mask));
+}
+
 static inline float scalar_el_map(float src0, float src1, enum ggml_op operation) {
     switch (operation) {
         case GGML_OP_MUL:
@@ -96,6 +161,8 @@ static inline float scalar_el_map(float src0, float src1, enum ggml_op operation
             return src0 + src1;
         case GGML_OP_SUB:
             return src0 - src1;
+        case GGML_OP_DIV:
+            return src0 * et_recip(src1);
         default:
             return 0.0f;
     }
@@ -153,7 +220,7 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
 
     enum ggml_op operation = dst->op;
 
-    if (operation != GGML_OP_MUL && operation != GGML_OP_ADD && operation != GGML_OP_SUB) {
+    if (operation != GGML_OP_MUL && operation != GGML_OP_ADD && operation != GGML_OP_SUB && operation != GGML_OP_DIV) {
         return -1;  // Unsupported operation
     }
 
@@ -204,6 +271,9 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                 break;
             case GGML_OP_SUB:
                 block_sub_cache_aligned(dst_data + elem_start, src0_data + elem_start, src1_data + elem_start, count);
+                break;
+            case GGML_OP_DIV:
+                block_div_cache_aligned(dst_data + elem_start, src0_data + elem_start, src1_data + elem_start, count);
                 break;
             default:
                 return 1;
@@ -334,6 +404,9 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                 case GGML_OP_SUB:
                     block_sub_broadcast(dst_ptr, src0_ptr, scalar, (int) ne0);
                     break;
+                case GGML_OP_DIV:
+                    block_mul_broadcast(dst_ptr, src0_ptr, et_recip(scalar), (int) ne0);
+                    break;
                 default:
                     return 1;
             }
@@ -354,6 +427,9 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                         break;
                     case GGML_OP_SUB:
                         block_sub_cache_aligned(dst_block, src0_block, src1_ptr, (int) ne10);
+                        break;
+                    case GGML_OP_DIV:
+                        block_div_cache_aligned(dst_block, src0_block, src1_ptr, (int) ne10);
                         break;
                     default:
                         return 1;

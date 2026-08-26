@@ -810,6 +810,12 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
             case GGML_OP_SUB:
                 ggml_et_op_sub(dev_ctx, node);
                 break;
+            case GGML_OP_DIV:
+                ggml_et_op_div(dev_ctx, node);
+                break;
+            case GGML_OP_ARGSORT:
+                ggml_et_op_argsort(dev_ctx, node);
+                break;
 
             case GGML_OP_CUMSUM:
                 ggml_et_op_cumsum(dev_ctx, node);
@@ -1048,9 +1054,14 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
                         op->ne[0] % 16 == 0 && ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]);
             break;
         case GGML_OP_SUM_ROWS:
-            // dst has ne[0]=1, src0 row length must be cache-aligned
+            // dst has ne[0]=1; any row length (036: the kernel sums a zero-padded tail)
             supported = op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
-                        op->src[0]->ne[0] % 16 == 0 && ggml_is_contiguous(op->src[0]);
+                        ggml_is_contiguous(op->src[0]);
+            break;
+        case GGML_OP_ARGSORT:
+            // 036: argsort_f32 — one row per hart, rows up to 8192 elements (per-hart L2-SCP scratch)
+            supported = op->type == GGML_TYPE_I32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                        op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(int32_t) && op->src[0]->ne[0] <= 8192;
             break;
         case GGML_OP_MEAN:
             // Kernel handles arbitrary ne00 (per-row alignment guard with
@@ -1103,6 +1114,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_MUL:
         case GGML_OP_ADD:
         case GGML_OP_SUB:
+        case GGML_OP_DIV:  // 036: el_map_f32 DIV (frcp + Newton)
             supported = op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->src[1] &&
                         op->src[1]->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float) &&
                         op->src[0]->nb[0] == sizeof(float) &&
@@ -1533,7 +1545,7 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
                  op->src[0]->type == GGML_TYPE_Q2_K || op->src[0]->type == GGML_TYPE_Q3_K ||
                  op->src[0]->type == GGML_TYPE_Q5_K) &&
                 op->src[1] && op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op) &&
-                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
+                ggml_is_contiguous(op->src[0]) && op->src[1]->nb[0] == sizeof(int32_t)) {  // 036: strided index view OK
                 // Validate dimension constraints from ggml implementation
                 supported = (op->src[0]->ne[2] == op->src[1]->ne[1]) && (op->src[1]->ne[3] == 1);
             } else {
