@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <vector>
 #include <string>
 #include <fstream>
@@ -188,6 +189,29 @@ bool ggml_et_load_kernel(ggml_backend_et_device_context * dev_ctx, const std::st
     }
 }
 
+// W23 mitigation (backlog 035): env-gated launch retry + counter, reported at exit when non-zero.
+static const bool g_et_launch_retry = [] {
+    const char * e = getenv("GGML_ET_LAUNCH_RETRY");
+    return e && *e && strcmp(e, "0") != 0;
+}();
+static std::atomic<int> g_et_launch_retries{0};
+// GGML_ET_LAUNCH_SYNC_EVERY=D: wait for the stream after every D-th launch (caps the host run-ahead that exhausts the
+// firmware's dispatch slots — W23) without the per-kernel cost of GGML_ET_LAUNCH_RETRY. 0 = off.
+static const int g_et_launch_sync_every = [] {
+    const char * e = getenv("GGML_ET_LAUNCH_SYNC_EVERY");
+    return e && *e ? atoi(e) : 0;
+}();
+static std::atomic<long> g_et_launch_count{0};
+static const int g_et_launch_retry_report = [] {
+    atexit([] {
+        if (g_et_launch_retries.load() > 0) {
+            fprintf(stderr, "ET-RETRY: %d kernel dispatch(es) were dropped by the firmware and re-issued in this process\n",
+                    g_et_launch_retries.load());
+        }
+    });
+    return 0;
+}();
+
 static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_ctx,
                                            const std::string &              kernel_name,
                                            void *                           params,
@@ -257,6 +281,57 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
                                                          reinterpret_cast<std::byte *>(params), params_size, k_opts);
         if (out_event) {
             *out_event = launch_event;
+        }
+
+        // GGML_ET_LAUNCH_RETRY=1 (W23 / backlog 035): the firmware intermittently drops a dispatch
+        // (KernelLaunchUnexpectedError, no error context, kernel never ran — Exp 005). Wait for this launch and,
+        // if the only stream errors are dropped dispatches, re-issue it once. Safe because the stream is drained
+        // (nothing else in flight) and a dropped launch touched no memory. Costs one host round trip per kernel.
+        if (g_et_launch_sync_every > 0 && !g_et_launch_retry && !sync_error_check &&
+            (++g_et_launch_count % g_et_launch_sync_every) == 0) {
+            runtime->waitForStream(dev_ctx->default_stream);
+        }
+        if (g_et_launch_retry && !sync_error_check) {
+            runtime->waitForStream(dev_ctx->default_stream);
+            auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
+            if (!errors.empty()) {
+                bool only_dropped = true;
+                for (const auto & error : errors) {
+                    if (error.errorCode_ != rt::DeviceErrorCode::KernelLaunchUnexpectedError) {
+                        only_dropped = false;
+                    }
+                }
+                if (!only_dropped) {
+                    for (const auto & error : errors) {
+                        GGML_LOG_ERROR("ET: stream error after kernel \"%s\". Code: %d\n", kernel_name.c_str(),
+                                       (int) error.errorCode_);
+                        fprintf(stderr, "ET: stream error after kernel \"%s\": %s\n", kernel_name.c_str(),
+                                error.getString().c_str());
+                    }
+                    fflush(stderr);
+                    abort();
+                }
+                g_et_launch_retries++;
+                fprintf(stderr, "ET-RETRY: dispatch of kernel \"%s\" dropped by the firmware (KernelLaunchUnexpectedError x%zu); "
+                                "re-issuing once (total retries so far: %d)\n", kernel_name.c_str(), errors.size(),
+                        g_et_launch_retries.load());
+                fflush(stderr);
+                launch_event = runtime->kernelLaunch(dev_ctx->default_stream, kernel_id,
+                                                     reinterpret_cast<std::byte *>(params), params_size, k_opts);
+                if (out_event) {
+                    *out_event = launch_event;
+                }
+                runtime->waitForStream(dev_ctx->default_stream);
+                auto errors2 = runtime->retrieveStreamErrors(dev_ctx->default_stream);
+                if (!errors2.empty()) {
+                    for (const auto & error : errors2) {
+                        fprintf(stderr, "ET-RETRY: kernel \"%s\" failed again after re-issue: code=%d %s\n",
+                                kernel_name.c_str(), (int) error.errorCode_, error.getString().c_str());
+                    }
+                    fflush(stderr);
+                    abort();
+                }
+            }
         }
 
         if (enable_print) {
