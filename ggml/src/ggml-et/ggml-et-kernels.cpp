@@ -289,8 +289,8 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
                     if (error.errorContext_.has_value() && !error.errorContext_.value().empty()) {
                         ctx_type = (int) error.errorContext_.value()[0].type_;
                     }
-                    fprintf(stderr, "ET-SYNC-CHECK: error DURING kernel \"%s\": code=%d ctx_type=%d\n",
-                            kernel_name.c_str(), (int) error.errorCode_, ctx_type);
+                    fprintf(stderr, "ET-SYNC-CHECK: error DURING kernel \"%s\": code=%d ctx_type=%d\n  runtime: %s\n",
+                            kernel_name.c_str(), (int) error.errorCode_, ctx_type, error.getString().c_str());
                 }
                 fflush(stderr);
                 abort();
@@ -492,8 +492,8 @@ static bool ggml_et_launch_uberkernel(ggml_backend_et_device_context * dev_ctx,
                     if (error.errorContext_.has_value() && !error.errorContext_.value().empty()) {
                         ctx_type = (int) error.errorContext_.value()[0].type_;
                     }
-                    fprintf(stderr, "ET-SYNC-CHECK: error DURING uberkernel op \"%s\": code=%d ctx_type=%d\n",
-                            kernel_name.c_str(), (int) error.errorCode_, ctx_type);
+                    fprintf(stderr, "ET-SYNC-CHECK: error DURING uberkernel op \"%s\": code=%d ctx_type=%d\n  runtime: %s\n",
+                            kernel_name.c_str(), (int) error.errorCode_, ctx_type, error.getString().c_str());
                 }
                 fflush(stderr);
                 abort();
