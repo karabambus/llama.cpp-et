@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 //******************************************************************************
-// MOE_SUM F32 kernel (backlog 038 — fused expert aggregation)
+// MOE_SUM F32 kernel (backlog 038 - fused expert aggregation)
 //   dst[e, t] = sum_{s < S} src0[e, s, t] * src1[0, s, t]
 // replaces MUL(experts [E,S,N], weights [1,S,N]) + (S-1) view-ADDs per MoE layer
 // (8 el_map_f32 launches, the slow strided path on 32 harts) with one launch.
@@ -15,7 +15,7 @@
 // each (e,t) is read for all s before it is written, by the same hart.
 // T2 fusion 4: optional residual `res` [E, N] (res.data == NULL -> none) seeds the
 // accumulators, folding llama.cpp's `l_out = moe_out + ffn_inp` ADD into the launch.
-// res may alias dst (in-place ADD) — same read-before-write argument.
+// res may alias dst (in-place ADD) - same read-before-write argument.
 //******************************************************************************
 
 struct ggml_et_moe_sum_params {
