@@ -566,6 +566,22 @@ bool ggml_et_op_div(ggml_backend_et_device_context * dev_ctx, const ggml_tensor 
     return ggml_et_op_elmap(dev_ctx, node);
 }
 
+// 038: fused MoE expert aggregation — one moe_sum_f32 launch instead of MUL + (S-1) strided view-ADDs
+bool ggml_et_op_moe_sum(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * mul_node, const ggml_tensor * dst_node) {
+    ET_PERF_START();
+    if (!dev_ctx || !mul_node || !dst_node || !mul_node->src[0] || !mul_node->src[1]) {
+        GGML_LOG_ERROR("ET: Invalid parameters for MOE_SUM operation\n");
+        return false;
+    }
+    ggml_et_binary_params params;
+    params.src0 = *mul_node->src[0];  // experts [E, S, N] (mul_mat_id output)
+    params.src1 = *mul_node->src[1];  // weights [1, S, N]
+    params.dst  = *dst_node;          // final ADD of the chain [E, N]
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "moe_sum_f32", &params, sizeof(params), 0xFFFFFFFF);
+    ET_PERF_END("MOE_SUM", "moe_sum_f32", dst_node);
+    return kernel_result;
+}
+
 // 036: ARGSORT on device (MoE expert selection = ARGSORT + VIEW in this llama.cpp tree)
 bool ggml_et_op_argsort(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node) {
     ET_PERF_START();

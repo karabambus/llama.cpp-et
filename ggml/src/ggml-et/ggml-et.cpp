@@ -734,6 +734,60 @@ static int ggml_et_mul_mat_group_len(const ggml_cgraph * cgraph, int node_idx, i
     return len >= 2 ? len : 0;
 }
 
+// 038: recognise llama.cpp's MoE aggregation — MUL(experts [E,S,N], weights [1,S,N]) followed (after the S VIEW
+// nodes) by an ADD chain over the S [E,N] slot views: add_1 = v0 + v1, add_k = add_{k-1} + v_{k+1}. Returns the index
+// of the last ADD; the fused kernel writes that tensor. Falls back to per-op dispatch when anything differs.
+static bool ggml_et_moe_sum_match(const ggml_cgraph * cgraph, int i, int * last_idx) {
+    const ggml_tensor * mul = cgraph->nodes[i];
+    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !mul->src[0] || !mul->src[1]) {
+        return false;
+    }
+    const ggml_tensor * ex = mul->src[0];
+    const ggml_tensor * w  = mul->src[1];
+    const int64_t E = mul->ne[0], S = mul->ne[1], N = mul->ne[2];
+    if (mul->ne[3] != 1 || S < 2 || S > 64 || E % 16 != 0) {
+        return false;
+    }
+    if (ex->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, ex) ||
+        ex->nb[0] != sizeof(float) || w->nb[0] != sizeof(float) ||
+        !(w->ne[0] == 1 && w->ne[1] == S && w->ne[2] == N && w->ne[3] == 1)) {
+        return false;
+    }
+    auto is_slot_view = [&](const ggml_tensor * t, int64_t slot) {
+        return t && t->op == GGML_OP_VIEW && t->view_src == mul && t->view_offs == (size_t) slot * mul->nb[1] &&
+               t->ne[0] == E && t->ne[1] == N && t->ne[2] == 1 && t->ne[3] == 1 &&
+               t->nb[0] == sizeof(float) && t->nb[1] == mul->nb[2];
+    };
+    int j = i + 1;
+    while (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_VIEW) {
+        j++;
+    }
+    const ggml_tensor * prev = nullptr;
+    int count = 0;
+    for (int k = j; k < cgraph->n_nodes && count < S - 1; ++k, ++count) {
+        const ggml_tensor * add = cgraph->nodes[k];
+        if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || add->ne[0] != E || add->ne[1] != N ||
+            add->ne[2] != 1 || add->ne[3] != 1 || add->nb[0] != sizeof(float) || add->nb[1] % 64 != 0) {
+            return false;
+        }
+        if (count == 0) {
+            if (!(is_slot_view(add->src[0], 0) && is_slot_view(add->src[1], 1))) {
+                return false;
+            }
+        } else {
+            if (!(add->src[0] == prev && is_slot_view(add->src[1], count + 1)) || !ggml_node_has_n_uses(cgraph, k - 1, 1)) {
+                return false;
+            }
+        }
+        prev = add;
+    }
+    if (count != S - 1 || !ggml_node_has_n_uses(cgraph, i, (int) S)) {  // product consumed only by its S views
+        return false;
+    }
+    *last_idx = j + (int) S - 2;
+    return true;
+}
+
 static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
     ggml_et_uberkernel_begin_graph(&dev_ctx->uberkernel);
@@ -767,6 +821,15 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
 
+        {
+            static const bool no_moe_sum = [] { const char * e = getenv("GGML_ET_NO_MOE_SUM"); return e && *e && strcmp(e, "0") != 0; }();
+            int last_idx = -1;
+            if (!no_moe_sum && ggml_et_moe_sum_match(cgraph, i, &last_idx)) {
+                ggml_et_op_moe_sum(dev_ctx, node, cgraph->nodes[last_idx]);
+                i = last_idx;  // MUL + views + ADD chain done
+                continue;
+            }
+        }
         if (ggml_et_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_et_op_rms_norm_mul(dev_ctx, node, cgraph->nodes[i + 1]);
             i++;  // skip the MUL node
