@@ -480,7 +480,7 @@ static void ggml_backend_et_free(ggml_backend_t backend) {
             }
             // Drain any in-flight uberkernel launches before freeing the
             // device buffers they read from.
-            runtime->waitForStream(dev_ctx->default_stream);
+            ggml_et_wait_stream(dev_ctx, "synchronize");
             for (auto & slot : dev_ctx->uberkernel.slots) {
                 if (slot.device_insts) {
                     runtime->freeDevice(dev_ctx->rtid, slot.device_insts);
@@ -561,7 +561,7 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
     }
 
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
-    runtime->waitForStream(dev_ctx->default_stream);
+    ggml_et_wait_stream(dev_ctx, "synchronize");
 
     auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
     if (errors.empty()) {
@@ -1105,7 +1105,7 @@ bool et_fcheck_enabled() {
 
 void et_fcheck_sync(ggml_backend_et_device_context * dev_ctx) {
     std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
-    runtime->waitForStream(dev_ctx->default_stream);
+    ggml_et_wait_stream(dev_ctx, "synchronize");
     auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
     if (!errors.empty()) {
         for (const auto & err : errors) {

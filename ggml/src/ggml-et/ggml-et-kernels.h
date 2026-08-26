@@ -24,6 +24,11 @@ bool ggml_et_load_kernel(ggml_backend_et_device_context * dev_ctx, const std::st
 // Kernel path: ${GGML_ET_KERNELS_PATH}/${kernel_name}.elf (default: /opt/et/ggml/kernels/)
 // Returns true on success, false on failure
 // Execution is synchronous - waits for completion
+// Wait for the device stream. GGML_ET_WAIT_TIMEOUT=<seconds> (default 0 = wait forever): on expiry the stream is
+// aborted through the firmware (rt::IRuntime::abortStream) and the process exits with a clear message instead of
+// sitting on a hung kernel (a hung launch left the card unusable until a PCIe reset, Exp 039). Returns false on timeout.
+bool ggml_et_wait_stream(ggml_backend_et_device_context * dev_ctx, const char * where);
+
 bool ggml_et_launch_kernel(ggml_backend_et_device_context * dev_ctx,
                            const std::string &              kernel_name,
                            void *                           params,
