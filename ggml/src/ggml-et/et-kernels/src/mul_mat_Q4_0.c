@@ -20,8 +20,19 @@
 #define KSPLIT_GROUP_ROWS          4
 #define SIMPLE_X2_ROWS             2
 
-int entry_point(struct ggml_et_binary_params * params, void * env) {
+// T2 fusion 4: optional residual epilogue. bias.data == NULL -> plain MUL_MAT; otherwise dst = mm + bias, where bias
+// has dst's shape and strides (validated by the host), so it is addressed with dst's own offsets. bias may alias dst
+// (ggml-alloc in-place ADD): every element is read right before it is written, by the same hart.
+static inline void q4_store_out(char * dst_ptr2, const char * bias_ptr2, size_t off, float v) {
+    if (bias_ptr2) {
+        v += *(const float *) (bias_ptr2 + off);
+    }
+    atomic_store_f32((volatile float *) (dst_ptr2 + off), v);
+}
+
+int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     uint64_t hart_id = get_hart_id();
+    const char * bias_base = (const char *) params->bias.data;
 
     // Matrix dimensions
     const int64_t K    = params->src0.ne[0];
@@ -89,12 +100,14 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
             const char *  src0_ptr3 = (const char *) params->src0.data + i03 * nb03;
             const char *  src1_ptr3 = (const char *) params->src1.data + i3 * nb13;
             char *        dst_ptr3  = (char *) params->dst.data + i3 * nbd3;
+            const char *  bias_ptr3 = bias_base ? bias_base + i3 * nbd3 : (const char *) 0;
 
             for (int64_t i2 = 0; i2 < ne12; i2++) {
                 const int64_t i02       = i2 / r2;
                 const char *  src0_ptr2 = src0_ptr3 + i02 * nb02;
                 const char *  src1_ptr2 = src1_ptr3 + i2 * nb12;
                 char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
+                const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbd2 : (const char *) 0;
 
                 for (int64_t n = 0; n < N; n++) {
                     const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
@@ -116,8 +129,7 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                             float other = *l2scp_slot;
                             et_sem_post(ET_BARRIER_MINION);
 
-                            float * dst_entry = (float *) (dst_ptr2 + n * nbd1 + m * sizeof(float));
-                            atomic_store_f32((volatile float *) dst_entry, partial + other);
+                            q4_store_out(dst_ptr2, bias_ptr2, n * nbd1 + m * sizeof(float), partial + other);
                         }
                     }
                 }
@@ -141,12 +153,14 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
             const char *  src0_ptr3 = (const char *) params->src0.data + i03 * nb03;
             const char *  src1_ptr3 = (const char *) params->src1.data + i3 * nb13;
             char *        dst_ptr3  = (char *) params->dst.data + i3 * nbd3;
+            const char *  bias_ptr3 = bias_base ? bias_base + i3 * nbd3 : (const char *) 0;
 
             for (int64_t i2 = 0; i2 < ne12; i2++) {
                 const int64_t i02       = i2 / r2;
                 const char *  src0_ptr2 = src0_ptr3 + i02 * nb02;
                 const char *  src1_ptr2 = src1_ptr3 + i2 * nb12;
                 char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
+                const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbd2 : (const char *) 0;
 
                 for (int64_t n = 0; n < N; n++) {
                     const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
@@ -206,18 +220,18 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                             const float p3 = l2scp_slot[3];
                             et_sem_post(ET_BARRIER_MINION);
 
-                            float * c_base = (float *) (dst_ptr2 + n * nbd1);
+                            const size_t c_off = n * nbd1;
                             if (m0 < M) {
-                                atomic_store_f32((volatile float *) (c_base + m0), s0 + p0);
+                                q4_store_out(dst_ptr2, bias_ptr2, c_off + m0 * sizeof(float), s0 + p0);
                             }
                             if (m1 < M) {
-                                atomic_store_f32((volatile float *) (c_base + m1), s1 + p1);
+                                q4_store_out(dst_ptr2, bias_ptr2, c_off + m1 * sizeof(float), s1 + p1);
                             }
                             if (m2 < M) {
-                                atomic_store_f32((volatile float *) (c_base + m2), s2 + p2);
+                                q4_store_out(dst_ptr2, bias_ptr2, c_off + m2 * sizeof(float), s2 + p2);
                             }
                             if (m3 < M) {
-                                atomic_store_f32((volatile float *) (c_base + m3), s3 + p3);
+                                q4_store_out(dst_ptr2, bias_ptr2, c_off + m3 * sizeof(float), s3 + p3);
                             }
                         }
                     }
@@ -237,12 +251,14 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
             const char *  src0_ptr3 = (const char *) params->src0.data + i03 * nb03;
             const char *  src1_ptr3 = (const char *) params->src1.data + i3 * nb13;
             char *        dst_ptr3  = (char *) params->dst.data + i3 * nbd3;
+            const char *  bias_ptr3 = bias_base ? bias_base + i3 * nbd3 : (const char *) 0;
 
             for (int64_t i2 = 0; i2 < ne12; i2++) {
                 const int64_t i02       = i2 / r2;
                 const char *  src0_ptr2 = src0_ptr3 + i02 * nb02;
                 const char *  src1_ptr2 = src1_ptr3 + i2 * nb12;
                 char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
+                const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbd2 : (const char *) 0;
 
                 for (int64_t n = 0; n < N; n++) {
                     const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
@@ -277,16 +293,16 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                             }
                         }
 
-                        float * dst_base = (float *) (dst_ptr2 + n * nbd1);
-                        atomic_store_f32((volatile float *) (dst_base + m0), s0);
+                        const size_t d_off = n * nbd1;
+                        q4_store_out(dst_ptr2, bias_ptr2, d_off + m0 * sizeof(float), s0);
                         if (m1 < M) {
-                            atomic_store_f32((volatile float *) (dst_base + m1), s1);
+                            q4_store_out(dst_ptr2, bias_ptr2, d_off + m1 * sizeof(float), s1);
                         }
                         if (m2 < M) {
-                            atomic_store_f32((volatile float *) (dst_base + m2), s2);
+                            q4_store_out(dst_ptr2, bias_ptr2, d_off + m2 * sizeof(float), s2);
                         }
                         if (m3 < M) {
-                            atomic_store_f32((volatile float *) (dst_base + m3), s3);
+                            q4_store_out(dst_ptr2, bias_ptr2, d_off + m3 * sizeof(float), s3);
                         }
                     }
                 }
@@ -305,12 +321,14 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
             const char *  src0_ptr3 = (const char *) params->src0.data + i03 * nb03;
             const char *  src1_ptr3 = (const char *) params->src1.data + i3 * nb13;
             char *        dst_ptr3  = (char *) params->dst.data + i3 * nbd3;
+            const char *  bias_ptr3 = bias_base ? bias_base + i3 * nbd3 : (const char *) 0;
 
             for (int64_t i2 = 0; i2 < ne12; i2++) {
                 const int64_t i02       = i2 / r2;
                 const char *  src0_ptr2 = src0_ptr3 + i02 * nb02;
                 const char *  src1_ptr2 = src1_ptr3 + i2 * nb12;
                 char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
+                const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbd2 : (const char *) 0;
 
                 for (int64_t n = 0; n < N; n++) {
                     const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
@@ -327,14 +345,11 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                                 float              s0, s1;
                                 q4_dot_compute_x2_aligned(q_row0, q_row1, b_col_base, K_blocks, &s0, &s1);
 
-                                float * dst0 = (float *) (dst_ptr2 + n * nbd1 + m0 * sizeof(float));
-                                float * dst1 = (float *) (dst_ptr2 + n * nbd1 + m1 * sizeof(float));
-                                atomic_store_f32((volatile float *) dst0, s0);
-                                atomic_store_f32((volatile float *) dst1, s1);
+                                q4_store_out(dst_ptr2, bias_ptr2, n * nbd1 + m0 * sizeof(float), s0);
+                                q4_store_out(dst_ptr2, bias_ptr2, n * nbd1 + m1 * sizeof(float), s1);
                             } else {
-                                float   sum = q4_dot_compute(q_row0, b_col_base, K_blocks);
-                                float * dst = (float *) (dst_ptr2 + n * nbd1 + m0 * sizeof(float));
-                                atomic_store_f32((volatile float *) dst, sum);
+                                float sum = q4_dot_compute(q_row0, b_col_base, K_blocks);
+                                q4_store_out(dst_ptr2, bias_ptr2, n * nbd1 + m0 * sizeof(float), sum);
                             }
                         }
                     } else {
@@ -342,9 +357,7 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                             const block_q4_0 * q_row = (const block_q4_0 *) (src0_ptr2 + m * nb01);
 
                             float sum = q4_dot_compute(q_row, b_col_base, K_blocks);
-
-                            float * dst_entry = (float *) (dst_ptr2 + n * nbd1 + m * sizeof(float));
-                            atomic_store_f32((volatile float *) dst_entry, sum);
+                            q4_store_out(dst_ptr2, bias_ptr2, n * nbd1 + m * sizeof(float), sum);
                         }
                     }
 

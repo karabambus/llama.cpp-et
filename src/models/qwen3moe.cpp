@@ -94,6 +94,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
 
+            // keep the three projections adjacent in the graph (before the q/k norm+rope chains) so a backend can
+            // issue them as one grouped launch; ordering hint only, no numerical effect (ggml-et T2 fusion 3)
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
+
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 

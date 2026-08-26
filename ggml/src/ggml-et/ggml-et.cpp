@@ -14,7 +14,11 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
+#include <functional>
+#include <map>
+#include <string>
 #include <vector>
 
 #if __has_include(<filesystem>)
@@ -581,10 +585,13 @@ static bool ggml_et_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::init
         const ggml_tensor * mm  = cgraph->nodes[node_idx];
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
 
-        // Only Q8_0 weights x F32 activations -> F32 (the kernel that has
-        // the bias path).  Other MM variants must wait for their own kernel
-        // bias support.
-        if (mm->type != GGML_TYPE_F32 || mm->src[0]->type != GGML_TYPE_Q8_0 || mm->src[1]->type != GGML_TYPE_F32) {
+        // Q8_0 weights x F32 activations -> F32 (the kernel that has the bias path), and — T2 fusion 4a — Q4_0 on
+        // the scalar kernel (N < 53; the matrix-engine Q4_0 kernel has no epilogue). Other MM variants must wait
+        // for their own kernel bias support.
+        static const bool no_q4_bias = [] { const char * e = getenv("GGML_ET_NO_MM_BIAS"); return e && *e && strcmp(e, "0") != 0; }();
+        const bool q4_scalar = mm->src[0]->type == GGML_TYPE_Q4_0 && mm->src[1]->ne[1] < 53 && !no_q4_bias;
+        if (mm->type != GGML_TYPE_F32 || (mm->src[0]->type != GGML_TYPE_Q8_0 && !q4_scalar) ||
+            mm->src[1]->type != GGML_TYPE_F32) {
             return false;
         }
 
@@ -691,9 +698,11 @@ static int ggml_et_mul_mat_group_len(const ggml_cgraph * cgraph, int node_idx, i
     if (first->op != GGML_OP_MUL_MAT || !first->src[0] || !first->src[1]) {
         return 0;
     }
-    // Restricted to the decode shape this exists for: Q8_0 weights, F32 activation, N == 1.
-    if (first->type != GGML_TYPE_F32 || first->src[0]->type != GGML_TYPE_Q8_0 ||
-        first->src[1]->type != GGML_TYPE_F32 || first->src[1]->ne[1] != 1) {
+    // Q8_0: restricted to the decode shape this exists for (F32 activation, N == 1).
+    // Q4_0 (T2 fusion 3): every N the scalar kernel serves (N < 53) — the verify block is N <= 32.
+    const ggml_type wt = first->src[0]->type;
+    if (first->type != GGML_TYPE_F32 || first->src[1]->type != GGML_TYPE_F32 ||
+        !((wt == GGML_TYPE_Q8_0 && first->src[1]->ne[1] == 1) || (wt == GGML_TYPE_Q4_0 && first->src[1]->ne[1] < 53))) {
         return 0;
     }
 
@@ -712,7 +721,7 @@ static int ggml_et_mul_mat_group_len(const ggml_cgraph * cgraph, int node_idx, i
         }
         // Same activation, same dtypes, weights differing only in row count.
         if (next->src[1] != first->src[1] || next->type != GGML_TYPE_F32 ||
-            next->src[0]->type != GGML_TYPE_Q8_0 || next->src[0]->ne[0] != first->src[0]->ne[0]) {
+            next->src[0]->type != wt || next->src[0]->ne[0] != first->src[0]->ne[0]) {
             break;
         }
         // Independence: a later member must not consume an earlier member's output.
@@ -788,6 +797,414 @@ static bool ggml_et_moe_sum_match(const ggml_cgraph * cgraph, int i, int * last_
     return true;
 }
 
+// ---- T2 launch-count fusions ------------------------------------------------------------------------------------
+
+static int et_next_compute(const ggml_cgraph * cgraph, int j) {
+    for (++j; j < cgraph->n_nodes; ++j) {
+        if (!ggml_et_node_is_metadata_only(cgraph->nodes[j])) {
+            return j;
+        }
+    }
+    return cgraph->n_nodes;
+}
+
+static int32_t et_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t h = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (!ggml_bitset_get(cgraph->visited_hash_set.used, h)) {
+        return 0;
+    }
+    return cgraph->use_counts[h];
+}
+
+static bool et_env_on(const char * name) {
+    const char * e = getenv(name);
+    return e && *e && strcmp(e, "0") != 0;
+}
+
+static bool et_line_aligned(const void * p) {
+    return ((uintptr_t) p % 64) == 0;
+}
+
+// T2 fusion 4b: the residual ADD after the 038 chain — l_out = ffn_moe_out + ffn_inp. `last` is the chain's final
+// ADD; returns the residual ADD's index (or -1) and the residual operand.
+static int ggml_et_moe_sum_residual(const ggml_cgraph * cgraph, int last, const ggml_tensor ** res_out) {
+    static const bool off = et_env_on("GGML_ET_NO_MOE_SUM_RES");
+    if (off) {
+        return -1;
+    }
+    const ggml_tensor * sum = cgraph->nodes[last];
+    const int           k   = et_next_compute(cgraph, last);
+    if (k >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * add = cgraph->nodes[k];
+    if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 || !ggml_node_has_n_uses(cgraph, last, 1)) {
+        return -1;
+    }
+    const ggml_tensor * res = add->src[0] == sum ? add->src[1] : (add->src[1] == sum ? add->src[0] : nullptr);
+    if (!res || res->type != GGML_TYPE_F32 || !ggml_are_same_shape(add, sum) || !ggml_are_same_shape(res, sum) ||
+        add->nb[0] != sizeof(float) || res->nb[0] != sizeof(float) || add->nb[1] % 64 != 0 || !et_line_aligned(add->data) ||
+        add->ne[2] != 1 || add->ne[3] != 1) {
+        return -1;
+    }
+    *res_out = res;
+    return k;
+}
+
+// T2 fusion 1: llama.cpp's MoE routing chain (build_moe_ffn, softmax gating + norm_w):
+//   S = SOFT_MAX(logits [E,N]); A = ARGSORT(S, DESC); V = view(A, [K,N]); G = GET_ROWS(reshape(S,[1,E,N]), V) [1,K,N];
+//   W2 = reshape(G,[K,N]); R = SUM_ROWS(W2) [1,N]; C = CLAMP(R) (in place); D = DIV(W2, C) [K,N].
+// One moe_router_f32 launch writes the top-K of A and D. Everything in between must be private to the chain.
+struct et_router_match {
+    int softmax, argsort, get_rows, sum_rows, clamp, div;
+    int n_top;
+};
+
+static bool ggml_et_moe_router_match(const ggml_cgraph * cgraph, int i, et_router_match * m) {
+    static const bool off = et_env_on("GGML_ET_NO_MOE_ROUTER");
+    if (off) {
+        return false;
+    }
+    const ggml_tensor * S = cgraph->nodes[i];
+    if (S->op != GGML_OP_SOFT_MAX || S->type != GGML_TYPE_F32 || !S->src[0] || S->src[1] || S->src[2]) {
+        return false;
+    }
+    float scale = 1.0f, max_bias = 0.0f;
+    memcpy(&scale, (const float *) S->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) S->op_params + 1, sizeof(float));
+    if (scale != 1.0f || max_bias != 0.0f) {
+        return false;
+    }
+    const ggml_tensor * L = S->src[0];
+    const int64_t       E = L->ne[0], N = L->ne[1];
+    if (L->type != GGML_TYPE_F32 || L->nb[0] != sizeof(float) || L->ne[2] != 1 || L->ne[3] != 1 || E < 1 || E > 512 ||
+        !ggml_are_same_shape(S, L) || !ggml_node_has_n_uses(cgraph, i, 2)) {
+        return false;
+    }
+    const int a = et_next_compute(cgraph, i);
+    if (a >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * A = cgraph->nodes[a];
+    if (A->op != GGML_OP_ARGSORT || A->src[0] != S || A->type != GGML_TYPE_I32 || A->nb[0] != sizeof(int32_t) ||
+        ((const int32_t *) A->op_params)[0] != GGML_SORT_ORDER_DESC || !ggml_are_same_shape(A, S) ||
+        !ggml_node_has_n_uses(cgraph, a, 1)) {
+        return false;
+    }
+    const int g = et_next_compute(cgraph, a);
+    if (g >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * G = cgraph->nodes[g];
+    if (G->op != GGML_OP_GET_ROWS || G->type != GGML_TYPE_F32 || !G->src[0] || !G->src[1]) {
+        return false;
+    }
+    const ggml_tensor * P = G->src[0];  // reshape(S, [1, E, N])
+    const ggml_tensor * V = G->src[1];  // view(A, [K, N])
+    if (P->view_src != S || P->view_offs != 0 || P->ne[0] != 1 || P->ne[1] != E || P->ne[2] != N || P->ne[3] != 1) {
+        return false;
+    }
+    const int64_t K = V->ne[0];
+    if (V->op != GGML_OP_VIEW || V->view_src != A || V->view_offs != 0 || K < 1 || K > 32 || K > E || V->ne[1] != N ||
+        V->ne[2] != 1 || V->ne[3] != 1 || V->nb[0] != sizeof(int32_t) || V->nb[1] != A->nb[1]) {
+        return false;
+    }
+    if (G->ne[0] != 1 || G->ne[1] != K || G->ne[2] != N || G->ne[3] != 1 || !ggml_node_has_n_uses(cgraph, g, 1)) {
+        return false;
+    }
+    const int r = et_next_compute(cgraph, g);
+    if (r >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * R  = cgraph->nodes[r];
+    const ggml_tensor * W2 = R->src[0];  // reshape(G, [K, N])
+    if (R->op != GGML_OP_SUM_ROWS || R->type != GGML_TYPE_F32 || !W2 || W2->view_src != G || W2->view_offs != 0 ||
+        W2->ne[0] != K || W2->ne[1] != N || W2->ne[2] != 1 || W2->ne[3] != 1 || et_use_count(cgraph, W2) != 2 ||
+        R->ne[0] != 1 || R->ne[1] != N || !ggml_node_has_n_uses(cgraph, r, 1)) {
+        return false;
+    }
+    const int c = et_next_compute(cgraph, r);
+    if (c >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * C = cgraph->nodes[c];
+    if (C->op != GGML_OP_CLAMP || C->src[0] != R || C->view_src != R || et_use_count(cgraph, C) != 1) {
+        return false;
+    }
+    const int d = et_next_compute(cgraph, c);
+    if (d >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * D = cgraph->nodes[d];
+    if (D->op != GGML_OP_DIV || D->type != GGML_TYPE_F32 || D->src[0] != W2 || D->src[1] != C || D->ne[0] != K ||
+        D->ne[1] != N || D->ne[2] != 1 || D->ne[3] != 1 || D->nb[0] != sizeof(float) || D->view_src) {
+        return false;
+    }
+    m->softmax  = i;
+    m->argsort  = a;
+    m->get_rows = g;
+    m->sum_rows = r;
+    m->clamp    = c;
+    m->div      = d;
+    m->n_top    = (int) K;
+    return true;
+}
+
+// T2 fusion 2: attention glue. One "norm+rope" chain = RMS_NORM(x [D,H,N]) -> MUL(w [D]) -> ROPE, optionally
+// consumed by SET_ROWS(kv cache, view(rope,[D*H,N]), idx). After the k chain, v's SET_ROWS (a plain copy) follows.
+static bool et_set_rows_ok(const ggml_tensor * sr, int64_t D, int64_t H, int64_t N) {
+    if (sr->op != GGML_OP_SET_ROWS || !sr->src[0] || !sr->src[1] || (sr->type != GGML_TYPE_F16 && sr->type != GGML_TYPE_F32) ||
+        sr->src[0]->type != GGML_TYPE_F32 || sr->src[1]->type != GGML_TYPE_I64 || sr->src[2] == nullptr) {
+        return false;
+    }
+    const size_t esz = ggml_type_size(sr->type);
+    if (sr->ne[0] != D * H || sr->ne[2] != 1 || sr->ne[3] != 1 || sr->nb[0] != esz || sr->nb[1] % 64 != 0 ||
+        (D * esz) % 64 != 0 || !et_line_aligned(sr->data)) {
+        return false;
+    }
+    const ggml_tensor * x = sr->src[0];
+    if (x->ne[0] != D * H || x->ne[1] != N || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const ggml_tensor * idx = sr->src[1];
+    if (idx->ne[0] != N || idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1 || idx->nb[0] != sizeof(int64_t)) {
+        return false;
+    }
+    return true;
+}
+
+static bool et_match_norm_rope(const ggml_cgraph * cgraph, int i, ggml_et_qkv_glue_job_desc * job, int * last) {
+    const ggml_tensor * RN = cgraph->nodes[i];
+    if (RN->op != GGML_OP_RMS_NORM || RN->type != GGML_TYPE_F32 || !RN->src[0] || !ggml_node_has_n_uses(cgraph, i, 1)) {
+        return false;
+    }
+    const ggml_tensor * X = RN->src[0];
+    const int64_t       D = X->ne[0], H = X->ne[1], N = X->ne[2];
+    if (X->type != GGML_TYPE_F32 || X->ne[3] != 1 || D < 8 || D > 256 || D % 16 != 0 || X->nb[0] != sizeof(float) ||
+        X->nb[1] != D * sizeof(float) || !ggml_are_same_shape(RN, X)) {
+        return false;
+    }
+    const int m = et_next_compute(cgraph, i);
+    if (m >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * M = cgraph->nodes[m];
+    if (M->op != GGML_OP_MUL || M->type != GGML_TYPE_F32 || !(M->src[0] == RN || M->src[1] == RN) ||
+        !ggml_are_same_shape(M, RN) || !ggml_node_has_n_uses(cgraph, m, 1)) {
+        return false;
+    }
+    const ggml_tensor * W = M->src[0] == RN ? M->src[1] : M->src[0];
+    if (W->type != GGML_TYPE_F32 || W->ne[0] != D || W->ne[1] != 1 || W->ne[2] != 1 || W->ne[3] != 1 ||
+        !ggml_is_contiguous(W)) {
+        return false;
+    }
+    const int r = et_next_compute(cgraph, m);
+    if (r >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * RO = cgraph->nodes[r];
+    if (RO->op != GGML_OP_ROPE || RO->type != GGML_TYPE_F32 || RO->src[0] != M || RO->src[2] || !RO->src[1] ||
+        RO->src[1]->type != GGML_TYPE_I32 || RO->src[1]->ne[0] != N || !ggml_is_contiguous(RO->src[1]) ||
+        !ggml_are_same_shape(RO, X) || RO->view_src || RO->nb[0] != sizeof(float) || RO->nb[1] != D * sizeof(float) ||
+        RO->nb[2] % 64 != 0 || !et_line_aligned(RO->data)) {
+        return false;
+    }
+    const int32_t mode   = ((const int32_t *) RO->op_params)[2];
+    const int32_t n_dims = ((const int32_t *) RO->op_params)[1];
+    if ((mode & GGML_ROPE_TYPE_MROPE) || n_dims <= 0 || n_dims > D || (n_dims & 1) || (n_dims / 2) % 8 != 0) {
+        return false;
+    }
+    job->x        = X;
+    job->rms_norm = RN;
+    job->mul      = M;
+    job->rope     = RO;
+    job->set_rows = nullptr;
+    job->D        = D;
+    job->H        = H;
+    job->N        = N;
+    *last         = r;
+    // optional SET_ROWS consuming the rope output through a [D*H, N] view
+    const int sidx = et_next_compute(cgraph, r);
+    if (sidx < cgraph->n_nodes) {
+        const ggml_tensor * SR = cgraph->nodes[sidx];
+        if (SR->op == GGML_OP_SET_ROWS && SR->src[0] && SR->src[0]->view_src == RO && SR->src[0]->view_offs == 0 &&
+            et_use_count(cgraph, RO) == 1 && et_set_rows_ok(SR, D, H, N)) {
+            job->set_rows = SR;
+            *last         = sidx;
+        }
+    }
+    return true;
+}
+
+static bool ggml_et_qkv_glue_match(const ggml_cgraph * cgraph, int i, ggml_et_qkv_glue_plan * plan) {
+    static const bool off = et_env_on("GGML_ET_NO_QKV_GLUE");
+    if (off) {
+        return false;
+    }
+    plan->n_jobs = 0;
+    int idx      = i;
+    while (plan->n_jobs < ET_QKV_GLUE_MAX_JOBS && idx < cgraph->n_nodes) {
+        const ggml_tensor * node = cgraph->nodes[idx];
+        int                 last = idx;
+        if (node->op == GGML_OP_RMS_NORM) {
+            ggml_et_qkv_glue_job_desc job;
+            if (!et_match_norm_rope(cgraph, idx, &job, &last)) {
+                break;
+            }
+            if (plan->n_jobs > 0 && memcmp(job.rope->op_params, plan->job[0].rope->op_params, sizeof(int32_t) * 15) != 0) {
+                break;  // the launch shares one rope parameter block
+            }
+            plan->job[plan->n_jobs++] = job;
+        } else if (node->op == GGML_OP_SET_ROWS && plan->n_jobs > 0 && plan->job[plan->n_jobs - 1].set_rows) {
+            // v's SET_ROWS right after k's: a copy job over the sibling's (D, H)
+            const ggml_et_qkv_glue_job_desc & sib = plan->job[plan->n_jobs - 1];
+            const ggml_tensor *               x   = node->src[0];
+            if (!et_set_rows_ok(node, sib.D, sib.H, sib.N) || !x) {
+                break;
+            }
+            bool from_chain = false;
+            for (int j = 0; j < plan->n_jobs; ++j) {
+                if (x == plan->job[j].rope || x->view_src == plan->job[j].rope) {
+                    from_chain = true;
+                }
+            }
+            if (from_chain) {
+                break;
+            }
+            ggml_et_qkv_glue_job_desc job = {};
+            job.x                         = x;
+            job.set_rows                  = node;
+            job.D                         = sib.D;
+            job.H                         = sib.H;
+            job.N                         = sib.N;
+            plan->job[plan->n_jobs++]     = job;
+            plan->last_idx                = idx;
+            break;
+        } else {
+            break;
+        }
+        plan->last_idx = last;
+        idx            = et_next_compute(cgraph, last);
+    }
+    return plan->n_jobs > 0;
+}
+
+// ---- GGML_ET_FUSION_CHECK=1: run every fused launch AND its per-op equivalent, diff the outputs -------------------
+namespace {
+struct et_fcheck_stats {
+    double  max_abs = 0.0, max_rel = 0.0;
+    int64_t mism = 0, n = 0;
+    int     sites = 0;
+};
+std::map<std::string, et_fcheck_stats> g_et_fcheck;
+
+bool et_fcheck_enabled() {
+    static const bool on = et_env_on("GGML_ET_FUSION_CHECK");
+    return on;
+}
+
+void et_fcheck_sync(ggml_backend_et_device_context * dev_ctx) {
+    std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    runtime->waitForStream(dev_ctx->default_stream);
+    auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
+    if (!errors.empty()) {
+        for (const auto & err : errors) {
+            fprintf(stderr, "ET-FCHECK: stream error: %s\n", err.getString().c_str());
+        }
+        fflush(stderr);
+        abort();
+    }
+}
+
+std::vector<uint8_t> et_fcheck_read(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * t) {
+    std::vector<uint8_t>          buf(ggml_nbytes(t));
+    std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    if (!buf.empty()) {
+        rt::EventId ev = runtime->memcpyDeviceToHost(dev_ctx->default_stream, (const std::byte *) t->data,
+                                                     (std::byte *) buf.data(), buf.size(), true);
+        runtime->waitForEvent(ev);
+    }
+    return buf;
+}
+
+void et_fcheck_write(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * t, const std::vector<uint8_t> & buf) {
+    std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    if (!buf.empty()) {
+        rt::EventId ev = runtime->memcpyHostToDevice(dev_ctx->default_stream, (const std::byte *) buf.data(),
+                                                     (std::byte *) t->data, buf.size(), true);
+        runtime->waitForEvent(ev);
+    }
+}
+
+double et_fcheck_elem(const ggml_tensor * t, const uint8_t * base, size_t off) {
+    switch (t->type) {
+        case GGML_TYPE_F32: { float v; memcpy(&v, base + off, 4); return v; }
+        case GGML_TYPE_F16: { ggml_fp16_t h; memcpy(&h, base + off, 2); return ggml_fp16_to_fp32(h); }
+        case GGML_TYPE_I32: { int32_t v; memcpy(&v, base + off, 4); return v; }
+        case GGML_TYPE_I64: { int64_t v; memcpy(&v, base + off, 8); return (double) v; }
+        default: return 0.0;
+    }
+}
+
+void et_fcheck_compare(const char * site, const ggml_tensor * t, const std::vector<uint8_t> & fused,
+                       const std::vector<uint8_t> & ref) {
+    et_fcheck_stats & st = g_et_fcheck[site];
+    double max_abs = 0.0, max_rel = 0.0;
+    int64_t mism = 0, n = 0, first_bad = -1;
+    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3)
+    for (int64_t i2 = 0; i2 < t->ne[2]; ++i2)
+    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1)
+    for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+        const size_t off = i0 * t->nb[0] + i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
+        const double a = et_fcheck_elem(t, fused.data(), off), b = et_fcheck_elem(t, ref.data(), off);
+        const double d = fabs(a - b), rel = d / (fabs(b) + 1e-6);
+        if (d > max_abs) { max_abs = d; }
+        if (rel > max_rel) { max_rel = rel; }
+        const bool bad = (a != a) != (b != b) || d > 1e-3 + 1e-3 * fabs(b);
+        if (bad) { if (first_bad < 0) { first_bad = n; } ++mism; }
+        ++n;
+    }
+    st.n += n; st.mism += mism; st.sites++;
+    if (max_abs > st.max_abs) { st.max_abs = max_abs; }
+    if (max_rel > st.max_rel) { st.max_rel = max_rel; }
+    if (mism > 0) {
+        fprintf(stderr, "ET-FCHECK: %s tensor %s [%lld,%lld,%lld,%lld] %s: %lld/%lld mismatches, max_abs %.3g max_rel %.3g (first at #%lld)\n",
+                site, t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                ggml_type_name(t->type), (long long) mism, (long long) n, max_abs, max_rel, (long long) first_bad);
+    }
+}
+
+// Runs `fused`, snapshots its outputs, restores the inputs (an output may alias an input in place), runs `unfused`,
+// compares. Leaves the per-op result in place.
+bool et_fcheck_run(ggml_backend_et_device_context * dev_ctx, const char * site, const std::vector<const ggml_tensor *> & inputs,
+                   const std::vector<const ggml_tensor *> & outputs, const std::function<bool()> & fused,
+                   const std::function<bool()> & unfused) {
+    et_fcheck_sync(dev_ctx);
+    std::vector<std::vector<uint8_t>> in_snap;
+    for (const ggml_tensor * t : inputs) { in_snap.push_back(et_fcheck_read(dev_ctx, t)); }
+    if (!fused()) { return false; }
+    et_fcheck_sync(dev_ctx);
+    std::vector<std::vector<uint8_t>> out_f;
+    for (const ggml_tensor * t : outputs) { out_f.push_back(et_fcheck_read(dev_ctx, t)); }
+    for (size_t i = 0; i < inputs.size(); ++i) { et_fcheck_write(dev_ctx, inputs[i], in_snap[i]); }
+    if (!unfused()) { return false; }
+    et_fcheck_sync(dev_ctx);
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        et_fcheck_compare(site, outputs[i], out_f[i], et_fcheck_read(dev_ctx, outputs[i]));
+    }
+    return true;
+}
+
+void et_fcheck_report() {
+    for (auto & kv : g_et_fcheck) {
+        fprintf(stderr, "ET-FCHECK: %-14s sites=%d elems=%lld mismatches=%lld max_abs=%.3g max_rel=%.3g\n", kv.first.c_str(),
+                kv.second.sites, (long long) kv.second.n, (long long) kv.second.mism, kv.second.max_abs, kv.second.max_rel);
+    }
+    fflush(stderr);
+    g_et_fcheck.clear();
+}
+}  // namespace
+
 static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
     ggml_et_uberkernel_begin_graph(&dev_ctx->uberkernel);
@@ -815,7 +1232,14 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
                 for (int g = 0; g < group_len; g++) {
                     group[g] = cgraph->nodes[group_idx[g]];
                 }
-                ggml_et_op_mul_mat_group(dev_ctx, group, group_len);
+                if (et_fcheck_enabled()) {
+                    std::vector<const ggml_tensor *> outs(group, group + group_len);
+                    et_fcheck_run(dev_ctx, "mul_mat_group", { group[0]->src[1] }, outs,
+                                  [&] { return ggml_et_op_mul_mat_group(dev_ctx, group, group_len); },
+                                  [&] { bool ok = true; for (int g = 0; g < group_len; g++) { ok = ggml_et_op_mul_mat(dev_ctx, group[g]) && ok; } return ok; });
+                } else {
+                    ggml_et_op_mul_mat_group(dev_ctx, group, group_len);
+                }
                 i = group_last;  // interleaved metadata nodes emit no work
                 continue;
             }
@@ -825,8 +1249,69 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
             static const bool no_moe_sum = [] { const char * e = getenv("GGML_ET_NO_MOE_SUM"); return e && *e && strcmp(e, "0") != 0; }();
             int last_idx = -1;
             if (!no_moe_sum && ggml_et_moe_sum_match(cgraph, i, &last_idx)) {
-                ggml_et_op_moe_sum(dev_ctx, node, cgraph->nodes[last_idx]);
-                i = last_idx;  // MUL + views + ADD chain done
+                const ggml_tensor * res     = nullptr;
+                const int           res_idx = ggml_et_moe_sum_residual(cgraph, last_idx, &res);  // T2 fusion 4b
+                const ggml_tensor * sum_dst = cgraph->nodes[last_idx];
+                const ggml_tensor * out     = res_idx >= 0 ? cgraph->nodes[res_idx] : sum_dst;
+                if (et_fcheck_enabled()) {
+                    std::vector<const ggml_tensor *> ins = { node->src[0], node->src[1] };
+                    if (res) { ins.push_back(res); }
+                    et_fcheck_run(dev_ctx, res ? "moe_sum+res" : "moe_sum", ins, { out },
+                                  [&] { return ggml_et_op_moe_sum(dev_ctx, node, out, res); },
+                                  [&] { bool ok = ggml_et_op_moe_sum(dev_ctx, node, sum_dst, nullptr); if (res_idx >= 0) { ok = ggml_et_op_add(dev_ctx, out) && ok; } return ok; });
+                } else {
+                    ggml_et_op_moe_sum(dev_ctx, node, out, res);
+                }
+                i = res_idx >= 0 ? res_idx : last_idx;  // MUL + views + ADD chain (+ residual ADD) done
+                continue;
+            }
+        }
+        {
+            et_router_match rm;
+            if (ggml_et_moe_router_match(cgraph, i, &rm)) {  // T2 fusion 1
+                const ggml_tensor * S = node;
+                const ggml_tensor * A = cgraph->nodes[rm.argsort];
+                const ggml_tensor * G = cgraph->nodes[rm.get_rows];
+                const ggml_tensor * R = cgraph->nodes[rm.sum_rows];
+                const ggml_tensor * C = cgraph->nodes[rm.clamp];
+                const ggml_tensor * D = cgraph->nodes[rm.div];
+                auto fused = [&] { return ggml_et_op_moe_router(dev_ctx, S->src[0], A, D, C, rm.n_top); };
+                if (et_fcheck_enabled()) {
+                    et_fcheck_run(dev_ctx, "moe_router", { S->src[0] }, { G->src[1], D }, fused,
+                                  [&] { return ggml_et_op_softmax(dev_ctx, S) && ggml_et_op_argsort(dev_ctx, A) && ggml_et_op_get_rows(dev_ctx, G) &&
+                                               ggml_et_op_sum_rows(dev_ctx, R) && ggml_et_op_clamp(dev_ctx, C) && ggml_et_op_div(dev_ctx, D); });
+                } else {
+                    fused();
+                }
+                i = rm.div;
+                continue;
+            }
+        }
+        {
+            ggml_et_qkv_glue_plan plan;
+            if (node->op == GGML_OP_RMS_NORM && ggml_et_qkv_glue_match(cgraph, i, &plan)) {  // T2 fusion 2
+                if (et_fcheck_enabled()) {
+                    std::vector<const ggml_tensor *> ins, outs;
+                    for (int j = 0; j < plan.n_jobs; ++j) {
+                        ins.push_back(plan.job[j].x);
+                        if (plan.job[j].rope) { outs.push_back(plan.job[j].rope); }
+                        if (plan.job[j].set_rows) { outs.push_back(plan.job[j].set_rows); }
+                    }
+                    et_fcheck_run(dev_ctx, "qkv_glue", ins, outs, [&] { return ggml_et_op_qkv_glue(dev_ctx, plan); },
+                                  [&] {
+                                      bool ok = true;
+                                      for (int j = 0; j < plan.n_jobs; ++j) {
+                                          const ggml_et_qkv_glue_job_desc & jd = plan.job[j];
+                                          if (jd.rms_norm) { ok = ggml_et_op_rms_norm_mul(dev_ctx, jd.rms_norm, jd.mul) && ok; }
+                                          if (jd.rope) { ok = ggml_et_op_rope(dev_ctx, jd.rope) && ok; }
+                                          if (jd.set_rows) { ok = ggml_et_op_set_rows(dev_ctx, jd.set_rows) && ok; }
+                                      }
+                                      return ok;
+                                  });
+                } else {
+                    ggml_et_op_qkv_glue(dev_ctx, plan);
+                }
+                i = plan.last_idx;
                 continue;
             }
         }
@@ -836,7 +1321,15 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
             continue;
         }
         if (ggml_et_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
-            ggml_et_op_mul_mat(dev_ctx, node, cgraph->nodes[i + 1]);
+            if (et_fcheck_enabled()) {
+                const ggml_tensor * add  = cgraph->nodes[i + 1];
+                const ggml_tensor * bias = add->src[0] == node ? add->src[1] : add->src[0];
+                et_fcheck_run(dev_ctx, "mul_mat+add", { node->src[1], bias }, { add },
+                              [&] { return ggml_et_op_mul_mat(dev_ctx, node, add); },
+                              [&] { return ggml_et_op_mul_mat(dev_ctx, node) && ggml_et_op_add(dev_ctx, add); });
+            } else {
+                ggml_et_op_mul_mat(dev_ctx, node, cgraph->nodes[i + 1]);
+            }
             i++;  // skip the ADD node
             continue;
         }
@@ -1040,6 +1533,10 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
     if (!ggml_et_uberkernel_end_graph(dev_ctx)) {
         ggml_et_uberkernel_abort_graph(&dev_ctx->uberkernel);
         return GGML_STATUS_FAILED;
+    }
+
+    if (et_fcheck_enabled()) {
+        et_fcheck_report();
     }
 
     return GGML_STATUS_SUCCESS;

@@ -82,7 +82,7 @@ extern int mul_mat_f32_matrix_engine_entry(struct ggml_et_binary_params *, void 
 extern int mul_mat_Q8_0_entry(struct ggml_et_mm_q8_params *, void *);
 struct ggml_et_mul_mat_group_params;
 extern int mul_mat_Q8_0_group_entry(struct ggml_et_mul_mat_group_params *, void *);
-extern int mul_mat_Q4_0_entry(struct ggml_et_binary_params *, void *);
+extern int mul_mat_Q4_0_entry(struct ggml_et_mm_q8_params *, void *);  // T2: bias-capable params (prefix-compatible)
 extern int mul_mat_Q4_K_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_Q2_K_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_Q3_K_entry(struct ggml_et_binary_params *, void *);
@@ -494,8 +494,9 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q4_0:
                 {
-                    struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
-                    rc                               = mul_mat_Q4_0_entry(p, env);
+                    // T2: the host packs ggml_et_mm_q8_params (bias-capable) for the scalar Q4_0 kernel
+                    struct ggml_et_mm_q8_params * p = (struct ggml_et_mm_q8_params *) inst_params;
+                    rc                              = mul_mat_Q4_0_entry(p, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q4_K:

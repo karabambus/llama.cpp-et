@@ -567,18 +567,111 @@ bool ggml_et_op_div(ggml_backend_et_device_context * dev_ctx, const ggml_tensor 
 }
 
 // 038: fused MoE expert aggregation — one moe_sum_f32 launch instead of MUL + (S-1) strided view-ADDs
-bool ggml_et_op_moe_sum(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * mul_node, const ggml_tensor * dst_node) {
+bool ggml_et_op_moe_sum(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * mul_node, const ggml_tensor * dst_node,
+                        const ggml_tensor * res) {
     ET_PERF_START();
     if (!dev_ctx || !mul_node || !dst_node || !mul_node->src[0] || !mul_node->src[1]) {
         GGML_LOG_ERROR("ET: Invalid parameters for MOE_SUM operation\n");
         return false;
     }
-    ggml_et_binary_params params;
+    ggml_et_moe_sum_params params = {};
     params.src0 = *mul_node->src[0];  // experts [E, S, N] (mul_mat_id output)
     params.src1 = *mul_node->src[1];  // weights [1, S, N]
-    params.dst  = *dst_node;          // final ADD of the chain [E, N]
+    params.dst  = *dst_node;          // final ADD of the chain [E, N] (or the residual ADD when res != nullptr)
+    if (res) {
+        params.res = *res;            // T2: l_out = moe_out + ffn_inp folded in
+    }
     bool kernel_result = ggml_et_launch_kernel(dev_ctx, "moe_sum_f32", &params, sizeof(params), 0xFFFFFFFF);
     ET_PERF_END("MOE_SUM", "moe_sum_f32", dst_node);
+    return kernel_result;
+}
+
+// T2 fusion 1: SOFT_MAX -> ARGSORT -> GET_ROWS -> SUM_ROWS -> CLAMP -> DIV as one launch (matched in ggml-et.cpp)
+bool ggml_et_op_moe_router(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * logits, const ggml_tensor * argsort,
+                           const ggml_tensor * div_node, const ggml_tensor * clamp_node, int n_top) {
+    ET_PERF_START();
+    if (!dev_ctx || !logits || !argsort || !div_node || !clamp_node || n_top < 1) {
+        GGML_LOG_ERROR("ET: Invalid parameters for MOE_ROUTER operation\n");
+        return false;
+    }
+    ggml_et_moe_router_params params = {};
+    params.src0 = *logits;
+    params.ids  = *argsort;
+    params.dst  = *div_node;
+    memcpy(&params.clamp_min, (const float *) clamp_node->op_params + 0, sizeof(float));
+    memcpy(&params.clamp_max, (const float *) clamp_node->op_params + 1, sizeof(float));
+    params.n_top = n_top;
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "moe_router_f32", &params, sizeof(params), 0xFFFFFFFF);
+    ET_PERF_END_EXT("MOE_ROUTER", "moe_router_f32", div_node, "n_expert=%lld|n_top=%d", (long long) logits->ne[0], n_top);
+    return kernel_result;
+}
+
+void ggml_et_fill_rope_settings(const ggml_tensor * node, ggml_et_rope_settings * rp) {
+    rp->n_past     = ((const int32_t *) node->op_params)[0];
+    rp->n_dims     = ((const int32_t *) node->op_params)[1];
+    rp->mode       = ((const int32_t *) node->op_params)[2];
+    rp->n_ctx      = ((const int32_t *) node->op_params)[3];
+    rp->n_ctx_orig = ((const int32_t *) node->op_params)[4];
+    memcpy(&rp->freq_base, (const int32_t *) node->op_params + 5, sizeof(float));
+    memcpy(&rp->freq_scale, (const int32_t *) node->op_params + 6, sizeof(float));
+    memcpy(&rp->ext_factor, (const int32_t *) node->op_params + 7, sizeof(float));
+    memcpy(&rp->attn_factor, (const int32_t *) node->op_params + 8, sizeof(float));
+    memcpy(&rp->beta_fast, (const int32_t *) node->op_params + 9, sizeof(float));
+    memcpy(&rp->beta_slow, (const int32_t *) node->op_params + 10, sizeof(float));
+    if (rp->mode & GGML_ROPE_TYPE_MROPE) {
+        memcpy(rp->sections, (const int32_t *) node->op_params + 11, sizeof(int32_t) * 4);
+    } else {
+        memset(rp->sections, 0, sizeof(rp->sections));
+    }
+}
+
+// T2 fusion 2: attention glue — RMS_NORM+MUL+ROPE (+SET_ROWS) jobs for q and k, plus v's SET_ROWS, one launch.
+bool ggml_et_op_qkv_glue(ggml_backend_et_device_context * dev_ctx, const ggml_et_qkv_glue_plan & plan) {
+    ET_PERF_START();
+    if (!dev_ctx || plan.n_jobs < 1 || plan.n_jobs > ET_QKV_GLUE_MAX_JOBS) {
+        GGML_LOG_ERROR("ET: Invalid parameters for QKV_GLUE operation\n");
+        return false;
+    }
+    ggml_et_qkv_glue_params params = {};
+    params.n_jobs = plan.n_jobs;
+    bool rope_set = false;
+    for (int j = 0; j < plan.n_jobs; ++j) {
+        const ggml_et_qkv_glue_job_desc & d  = plan.job[j];
+        ggml_et_qkv_job &                 kj = params.job[j];
+        kj.src     = d.x->data;
+        kj.src_nb1 = (uint64_t) d.D * sizeof(float);
+        kj.src_nb2 = d.x->nb[d.x->ne[1] == d.H && d.x->ne[0] == d.D ? 2 : 1];  // [D,H,N] tensor or a [D*H, N] view
+        kj.D       = (int32_t) d.D;
+        kj.H       = (int32_t) d.H;
+        kj.N       = (int32_t) d.N;
+        if (d.rms_norm) {
+            const ggml_tensor * w = (d.mul->src[0] == d.rms_norm) ? d.mul->src[1] : d.mul->src[0];
+            kj.w                  = w->data;
+            memcpy(&kj.eps, d.rms_norm->op_params, sizeof(float));
+        }
+        if (d.rope) {
+            kj.pos     = d.rope->src[1]->data;
+            kj.dst     = d.rope->data;
+            kj.dst_nb1 = d.rope->nb[1];
+            kj.dst_nb2 = d.rope->nb[2];
+            if (!rope_set) {
+                ggml_et_fill_rope_settings(d.rope, &params.rope);
+                rope_set = true;
+            }
+        }
+        if (d.set_rows) {
+            const ggml_tensor * sr = d.set_rows;
+            kj.kv      = sr->data;
+            kj.kv_nb1  = sr->nb[1];
+            kj.kv_rows = sr->ne[1];
+            kj.kv_f16  = sr->type == GGML_TYPE_F16 ? 1 : 0;
+            kj.idx     = sr->src[1]->data;
+            kj.idx_nb0 = sr->src[1]->nb[0];
+        }
+    }
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "attn_qkv_glue_f32", &params, sizeof(params), 0xFFFFFFFF);
+    const ggml_tensor * rep = plan.job[0].rope ? plan.job[0].rope : plan.job[0].set_rows;
+    ET_PERF_END_EXT("QKV_GLUE", "attn_qkv_glue_f32", rep, "n_jobs=%d", plan.n_jobs);
     return kernel_result;
 }
 
@@ -770,8 +863,11 @@ bool ggml_et_op_mul_mat_group(ggml_backend_et_device_context * dev_ctx,
         params.dst[g]  = *nodes[g];
     }
 
+    // T2 fusion 3: the Q4_0 group (q/k/v at N < 53, scalar kernel) shares this path; the kernel includes the
+    // single-matmul kernel verbatim, so members are bit-identical to separate launches.
+    const char * group_kernel = nodes[0]->src[0]->type == GGML_TYPE_Q4_0 ? "mul_mat_Q4_0_group" : "mul_mat_Q8_0_group";
     const bool kernel_result =
-        ggml_et_launch_kernel(dev_ctx, "mul_mat_Q8_0_group", &params, sizeof(params), 0xFFFFFFFF);
+        ggml_et_launch_kernel(dev_ctx, group_kernel, &params, sizeof(params), 0xFFFFFFFF);
 
     {
         int64_t total_flops = 0;
@@ -782,7 +878,7 @@ bool ggml_et_op_mul_mat_group(ggml_backend_et_device_context * dev_ctx,
             total_flops += nodes[g]->ne[2] * nodes[g]->ne[3] * m * n * (2 * k - 1);
         }
         char kernel_variant[64];
-        snprintf(kernel_variant, sizeof(kernel_variant), "mul_mat_Q8_0_group_x%d", n_mats);
+        snprintf(kernel_variant, sizeof(kernel_variant), "%s_x%d", group_kernel, n_mats);
         ET_PERF_END_EXT("MUL_MAT_GROUP", kernel_variant, nodes[0], "flops=%" PRId64, total_flops);
     }
 
@@ -805,7 +901,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
     }
 
     // Fused MM+ADD: when add_node is non-NULL the caller has already validated
-    // (Q8_0 weights, F32 acts, exact-shape ADD with stride parity to dst) via
+    // (Q8_0 weights — or Q4_0 on the scalar kernel (T2) —, F32 acts, exact-shape ADD with stride parity to dst) via
     // ggml_et_can_fuse({MUL_MAT, ADD}). The kernel writes dst = mm + bias and
     // the ADD's output replaces MM's as the actual dst.
     const ggml_tensor * fused_dst   = add_node ? add_node : node;
@@ -956,9 +1052,11 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
     }
 
     bool kernel_result;
-    if (node->src[0]->type == GGML_TYPE_Q8_0) {
+    if (node->src[0]->type == GGML_TYPE_Q8_0 ||
+        (node->src[0]->type == GGML_TYPE_Q4_0 && strcmp(kernel_name, "mul_mat_Q4_0") == 0)) {
         // Q8_0 kernel always takes the extended struct. bias.data is non-NULL
         // only on the fused path; otherwise the kernel skips the add entirely.
+        // T2 fusion 4a: the scalar Q4_0 kernel takes the same struct (residual epilogue for the o-projection).
         ggml_et_mm_q8_params q8_params = {};
         q8_params.src0                 = params.src0;
         q8_params.src1                 = params.src1;
@@ -1140,22 +1238,7 @@ bool ggml_et_op_rope(ggml_backend_et_device_context * dev_ctx, const ggml_tensor
     }
     params.dst = *node;                                // F32 output tensor
 
-    params.rope_params.n_past     = ((const int32_t *) node->op_params)[0];
-    params.rope_params.n_dims     = ((const int32_t *) node->op_params)[1];
-    params.rope_params.mode       = ((const int32_t *) node->op_params)[2];
-    params.rope_params.n_ctx      = ((const int32_t *) node->op_params)[3];
-    params.rope_params.n_ctx_orig = ((const int32_t *) node->op_params)[4];
-    memcpy(&params.rope_params.freq_base, (const int32_t *) node->op_params + 5, sizeof(float));
-    memcpy(&params.rope_params.freq_scale, (const int32_t *) node->op_params + 6, sizeof(float));
-    memcpy(&params.rope_params.ext_factor, (const int32_t *) node->op_params + 7, sizeof(float));
-    memcpy(&params.rope_params.attn_factor, (const int32_t *) node->op_params + 8, sizeof(float));
-    memcpy(&params.rope_params.beta_fast, (const int32_t *) node->op_params + 9, sizeof(float));
-    memcpy(&params.rope_params.beta_slow, (const int32_t *) node->op_params + 10, sizeof(float));
-    if (params.rope_params.mode & GGML_ROPE_TYPE_MROPE) {
-        memcpy(params.rope_params.sections, (const int32_t *) node->op_params + 11, sizeof(int32_t) * 4);
-    } else {
-        memset(params.rope_params.sections, 0, sizeof(params.rope_params.sections));
-    }
+    ggml_et_fill_rope_settings(node, &params.rope_params);
 
     // Phase 1: Initialize CPU comparison context and copy source buffers (before ET kernel)
     ggml_et_cpu_compare_ctx cpu_cmp_ctx;
