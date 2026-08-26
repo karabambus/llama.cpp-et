@@ -10,7 +10,8 @@
 // Hart 1: dequantize Q4_0 weights to FP32 into double-buffered L2 SCP.
 // Hart 0: tensor engine compute (FMA, reduce, store).
 //
-// Two execution paths (selected at runtime by N % TILE_N):
+// Two execution paths (selected at runtime by the ru_n wave-score search below,
+// i.e. reuse_ok = ru_n >= 2 — NOT by N % TILE_N; both paths handle partial N-tiles):
 //   * REUSE path  (N % TILE_N == 0): dequantize each weight K-window ONCE and
 //     reuse it across ru_n consecutive N-tiles, so the (producer-bound)
 //     dequant work is cut by ~ru_n. Partial C is round-tripped through an
@@ -281,6 +282,9 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
         if (is_hart1) {
             scp_signal(ready_ctr, 0);
             scp_signal(consumed_ctr, 0);
+            // W24: hart 0 must not read the counters before this reset (stale values from an earlier
+            // launch would let it consume unfilled panels) — same barrier as mul_mat_Q8_0_matrix_engine.
+            et_barrier(ET_BARRIER_MINION);
             uint32_t wid = 0;
 
             for (int64_t unit = my_start; unit < base_units; unit += tiles_stride) {
@@ -309,7 +313,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                                            src0_batch, mb, kb0 + i, nb1_0);
                     }
                     FENCE;
-                    flush_to_l2(cache_buf[buf], kbn * BLOCK_K, 64);
+                    flush_to_l2_multi(cache_buf[buf], kbn * BLOCK_K, 64);   // W24: FlushVA caps at 16 lines/op; a window is up to KWIN*32 lines
                     WAIT_CACHEOPS;
 
                     wid++;
@@ -326,6 +330,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
         ucache_control(1, REP_RATE, CACHEOP_MAX);
 #endif
         CLEAR_TENSOR_ERROR;
+        et_barrier(ET_BARRIER_MINION);   // W24: pair with hart 1's counter reset
         evict_to_l2((const void *) ready_ctr, 1, 64);    WAIT_CACHEOPS;
         evict_to_l2((const void *) consumed_ctr, 1, 64); WAIT_CACHEOPS;
 
@@ -426,6 +431,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
     if (is_hart1) {
         scp_signal(ready_ctr, 0);
         scp_signal(consumed_ctr, 0);
+        et_barrier(ET_BARRIER_MINION);   // W24: see REUSE path
         uint32_t chunk_id = 0;
 
         for (int64_t tile = my_start; tile < base_tiles; tile += tiles_stride) {
@@ -449,7 +455,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                 dequant_q4_0_panel(scp_panel[buf], src0_batch, mb, kb, nb1_0);
 
                 FENCE;
-                flush_to_l2(scp_panel[buf], BLOCK_K, 64);
+                flush_to_l2_multi(scp_panel[buf], BLOCK_K, 64);         // W24: 32 lines > the 16-line FlushVA cap
                 WAIT_CACHEOPS;
 
                 chunk_id++;
@@ -465,6 +471,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
     ucache_control(1, REP_RATE, CACHEOP_MAX);
 #endif
     CLEAR_TENSOR_ERROR;
+    et_barrier(ET_BARRIER_MINION);   // W24: pair with hart 1's counter reset
     evict_to_l2((const void *) ready_ctr, 1, 64);    WAIT_CACHEOPS;
     evict_to_l2((const void *) consumed_ctr, 1, 64); WAIT_CACHEOPS;
 
