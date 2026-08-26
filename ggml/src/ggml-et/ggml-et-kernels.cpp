@@ -1,4 +1,5 @@
 #include "ggml-et-kernels.h"
+#include <chrono>
 
 #include "ggml-et-kernels-embed.hpp"
 #include "ggml-et-uberkernel-kernel-map.h"
@@ -263,7 +264,7 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
         }
 
         if (sync_error_check) {
-            runtime->waitForStream(dev_ctx->default_stream);
+            ggml_et_wait_stream(dev_ctx, "launch");
             auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
             if (!errors.empty()) {
                 GGML_LOG_ERROR("ET: Errors detected before kernel \"%s\" launch\n", kernel_name.c_str());
@@ -289,10 +290,10 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
         // (nothing else in flight) and a dropped launch touched no memory. Costs one host round trip per kernel.
         if (g_et_launch_sync_every > 0 && !g_et_launch_retry && !sync_error_check &&
             (++g_et_launch_count % g_et_launch_sync_every) == 0) {
-            runtime->waitForStream(dev_ctx->default_stream);
+            ggml_et_wait_stream(dev_ctx, "launch");
         }
         if (g_et_launch_retry && !sync_error_check) {
-            runtime->waitForStream(dev_ctx->default_stream);
+            ggml_et_wait_stream(dev_ctx, "launch");
             auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
             if (!errors.empty()) {
                 bool only_dropped = true;
@@ -321,7 +322,7 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
                 if (out_event) {
                     *out_event = launch_event;
                 }
-                runtime->waitForStream(dev_ctx->default_stream);
+                ggml_et_wait_stream(dev_ctx, "launch");
                 auto errors2 = runtime->retrieveStreamErrors(dev_ctx->default_stream);
                 if (!errors2.empty()) {
                     for (const auto & error : errors2) {
@@ -338,7 +339,7 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
             std::vector<std::byte> host_trace_buf(ET_TRACE_BUFFER_SIZE);
             runtime->memcpyDeviceToHost(dev_ctx->default_stream, dev_ctx->trace_buffer, host_trace_buf.data(),
                                         ET_TRACE_BUFFER_SIZE);
-            runtime->waitForStream(dev_ctx->default_stream);
+            ggml_et_wait_stream(dev_ctx, "launch");
             const auto * trace_header = reinterpret_cast<const trace_buffer_std_header_t *>(host_trace_buf.data());
             const trace_entry_header_t * entry = nullptr;
             while ((entry = Trace_Decode(trace_header, entry))) {
@@ -353,7 +354,7 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
         if (sync_error_check) {
             // Already triggered. No need to retrigger
             if (!enable_print) {
-                runtime->waitForStream(dev_ctx->default_stream);
+                ggml_et_wait_stream(dev_ctx, "launch");
             }
             auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
             if (!errors.empty()) {
@@ -559,7 +560,7 @@ static bool ggml_et_launch_uberkernel(ggml_backend_et_device_context * dev_ctx,
         }
         std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
         if (runtime) {
-            runtime->waitForStream(dev_ctx->default_stream);
+            ggml_et_wait_stream(dev_ctx, "launch");
             auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
             if (!errors.empty()) {
                 for (const auto & error : errors) {
@@ -584,6 +585,36 @@ bool ggml_et_uberkernel_end_graph(ggml_backend_et_device_context * dev_ctx) {
     }
 
     return ggml_et_launch_uberkernel_segment(dev_ctx, &dev_ctx->uberkernel);
+}
+
+bool ggml_et_wait_stream(ggml_backend_et_device_context * dev_ctx, const char * where) {
+    static const int timeout_s = [] { const char * e = getenv("GGML_ET_WAIT_TIMEOUT"); return e ? atoi(e) : 0; }();
+    std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    if (!runtime) {
+        return false;
+    }
+    if (timeout_s <= 0) {
+        runtime->waitForStream(dev_ctx->default_stream);
+        return true;
+    }
+    if (runtime->waitForStream(dev_ctx->default_stream, std::chrono::seconds(timeout_s))) {
+        return true;
+    }
+    fprintf(stderr, "ET: waitForStream timed out after %d s at %s — hung kernel; aborting the stream\n", timeout_s, where);
+    fflush(stderr);
+    try {
+        rt::EventId ev = runtime->abortStream(dev_ctx->default_stream);
+        const bool  ok = runtime->waitForEvent(ev, std::chrono::seconds(10));
+        fprintf(stderr, "ET: abortStream %s\n", ok ? "completed" : "did not complete within 10 s");
+        auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
+        for (const auto & err : errors) {
+            fprintf(stderr, "ET: stream error after abort: %s\n", err.getString().c_str());
+        }
+    } catch (const std::exception & e) {
+        fprintf(stderr, "ET: abortStream threw: %s\n", e.what());
+    }
+    fflush(stderr);
+    abort();
 }
 
 bool ggml_et_launch_kernel(ggml_backend_et_device_context * dev_ctx,

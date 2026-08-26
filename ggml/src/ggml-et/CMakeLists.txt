@@ -34,6 +34,7 @@ set(KERNELS
     mul_mat_f32_matrix_engine
     mul_mat_id_f32
     mul_mat_id_Q4_0
+    mul_mat_id_Q4_0_v0
     mul_mat_id_Q8_0
     mul_mat_Q8_0
     mul_mat_Q8_0_group

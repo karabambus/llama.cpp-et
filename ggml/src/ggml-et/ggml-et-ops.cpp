@@ -1139,7 +1139,10 @@ bool ggml_et_op_mul_mat_id(ggml_backend_et_device_context * dev_ctx, const ggml_
 
     } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_Q4_0 &&
                node->src[1]->type == GGML_TYPE_F32 && node->src[2]->type == GGML_TYPE_I32) {
-        kernel_name    = "mul_mat_id_Q4_0";
+        // 039: GGML_ET_MMID_V1=1 selects the expert-grouped kernel (correct, but DRAM-bound like v0 at N <= 32 and
+        // not yet faster — see experiments/039_expert_grouped_mmid/NOTES.md); default = the per-pair v0 kernel
+        static const bool mmid_v1 = [] { const char * e = getenv("GGML_ET_MMID_V1"); return e && *e && strcmp(e, "0") != 0; }();
+        kernel_name    = mmid_v1 ? "mul_mat_id_Q4_0" : "mul_mat_id_Q4_0_v0";
         src0_type_name = "Q4_0";
 
     } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F16 &&
