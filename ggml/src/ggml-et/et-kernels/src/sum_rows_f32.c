@@ -75,12 +75,27 @@ int entry_point(struct ggml_et_sum_rows_params * params, void * env) {
         float zero = 0.0f;
         __asm__ volatile("fbc.ps f10, %[z]\n" : : [z] "m"(zero) : "f10");
 
-        for (int32_t i0 = 0; i0 < (int32_t) ne00; i0 += 8) {
+        // 036: rows need not be a multiple of 8 (MoE routing weights are [8, N]; tbo uses 10/11):
+        // sum whole 8-lane chunks, then a zero-padded copy of the tail (no read past the row).
+        const int32_t vec_end = (int32_t) ((ne00 / 8) * 8);
+        for (int32_t i0 = 0; i0 < vec_end; i0 += 8) {
             __asm__ volatile(
                 "flw.ps f11, %[x_vec]\n"
                 "fadd.ps f10, f10, f11\n"
                 :
                 : [x_vec] "m"(*(const float (*)[8]) & src_row[i0])
+                : "f10", "f11");
+        }
+        if (vec_end < (int32_t) ne00) {
+            float __attribute__((aligned(32))) tail_buf[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+            for (int32_t t = vec_end; t < (int32_t) ne00; ++t) {
+                tail_buf[t - vec_end] = src_row[t];
+            }
+            __asm__ volatile(
+                "flw.ps f11, %[x_vec]\n"
+                "fadd.ps f10, f10, f11\n"
+                :
+                : [x_vec] "m"(*(const float (*)[8]) & tail_buf[0])
                 : "f10", "f11");
         }
 

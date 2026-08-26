@@ -561,6 +561,31 @@ bool ggml_et_op_add(ggml_backend_et_device_context * dev_ctx, const ggml_tensor 
     return ggml_et_op_elmap(dev_ctx, node);
 }
 
+bool ggml_et_op_div(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node) {
+    // 036: el_map_f32 implements DIV as a * recip(b) (frcp.ps + Newton; the core has no fdiv)
+    return ggml_et_op_elmap(dev_ctx, node);
+}
+
+// 036: ARGSORT on device (MoE expert selection = ARGSORT + VIEW in this llama.cpp tree)
+bool ggml_et_op_argsort(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node) {
+    ET_PERF_START();
+    if (!dev_ctx || !node || !node->src[0]) {
+        GGML_LOG_ERROR("ET: Invalid parameters for ARGSORT operation\n");
+        return false;
+    }
+    if (node->type != GGML_TYPE_I32 || node->src[0]->type != GGML_TYPE_F32) {
+        GGML_LOG_ERROR("ET: ARGSORT operation with unsupported types: dst=%s src0=%s\n", ggml_type_name(node->type),
+                       ggml_type_name(node->src[0]->type));
+        return false;
+    }
+    ggml_et_argsort_params params;
+    params.src0 = *node->src[0];
+    params.dst  = *node;
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, "argsort_f32", &params, sizeof(params), 0xFFFFFFFF);
+    ET_PERF_END("ARGSORT", "argsort_f32", node);
+    return kernel_result;
+}
+
 bool ggml_et_op_sub(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node) {
     // Delegate to generic element map operation
     return ggml_et_op_elmap(dev_ctx, node);
@@ -1779,8 +1804,8 @@ bool ggml_et_op_get_rows(ggml_backend_et_device_context * dev_ctx, const ggml_te
         return false;
     }
 
-    if (!ggml_is_contiguous(node->src[1])) {
-        GGML_LOG_ERROR("ET: GET_ROWS operation requires contiguous indices tensor\n");
+    if (node->src[1]->nb[0] != sizeof(int32_t)) {  // 036: strided index views (argsort_top_k) are fine
+        GGML_LOG_ERROR("ET: GET_ROWS operation requires dim-0 contiguous indices tensor\n");
         return false;
     }
 

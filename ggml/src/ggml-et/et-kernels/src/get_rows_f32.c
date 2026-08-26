@@ -493,8 +493,9 @@ static int get_row_f32_mc_cacheline_aligned(struct ggml_et_get_rows_params * par
         const int64_t i10_idx = i - i13_idx * ne12 * ne11 * ne10 - i12_idx * ne11 * ne10 - i11_idx * ne10;
 
         // Get the row index from src1
-        const int64_t index_offset = i13_idx * ne12 * ne11 * ne10 + i12_idx * ne11 * ne10 + i11_idx * ne10 + i10_idx;
-        const int32_t row_index    = src1_data[index_offset];
+        // 036: src1 may be a strided view (ggml_argsort_top_k = ARGSORT + VIEW), so index by nb1x.
+        const int32_t row_index    = *(const int32_t *) ((const char *) src1_data + i10_idx * src1->nb[0] +
+                                                          i11_idx * src1->nb[1] + i12_idx * src1->nb[2] + i13_idx * src1->nb[3]);
 
         if (row_index < 0 || row_index >= ne01) {
             return -1;  // Index out of bounds
@@ -627,8 +628,9 @@ int entry_point(struct ggml_et_get_rows_params * params, void * env) {
         const int64_t i10_idx = i - i13_idx * ne12 * ne11 * ne10 - i12_idx * ne11 * ne10 - i11_idx * ne10;
 
         // Get the row index from src1
-        const int64_t index_offset = i13_idx * ne12 * ne11 * ne10 + i12_idx * ne11 * ne10 + i11_idx * ne10 + i10_idx;
-        const int32_t row_index    = src1_data[index_offset];
+        // 036: src1 may be a strided view (ggml_argsort_top_k = ARGSORT + VIEW), so index by nb1x.
+        const int32_t row_index    = *(const int32_t *) ((const char *) src1_data + i10_idx * src1->nb[0] +
+                                                          i11_idx * src1->nb[1] + i12_idx * src1->nb[2] + i13_idx * src1->nb[3]);
 
         if (row_index < 0 || row_index >= ne01) {
             return -1;  // Index out of bounds
