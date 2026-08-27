@@ -292,6 +292,12 @@ int ET_GLUE_ENTRY_NAME(struct ggml_et_qkv_glue_params * params, void * env) {
                 for (int32_t i0 = 0; i0 < D; i0 += 8) {
                     glue_store_f16_8(d + i0, &out[i0]);
                 }
+#ifdef ET_UBERKERNEL
+                // 052: inside an uberkernel segment flash_attn on other shires reads these rows next; the cache is
+                // far too big for the consumer-side evict, so the producer writes its own rows back past L2
+                FENCE;
+                evict_region_past_l2(d, (size_t) D * sizeof(uint16_t));
+#endif
             } else {
                 float * d = (float *) row + h * D;
                 for (int32_t i0 = 0; i0 < D; i0 += 8) {
@@ -302,11 +308,23 @@ int ET_GLUE_ENTRY_NAME(struct ggml_et_qkv_glue_params * params, void * env) {
                         : [src] "m"(*(const float (*)[8]) & out[i0])
                         : "f12", "memory");
                 }
+#ifdef ET_UBERKERNEL
+                FENCE;
+                evict_region_past_l2(d, (size_t) D * sizeof(float));
+#endif
             }
         }
     }
 
     __asm__ volatile("mova.m.x %0" ::"r"(saved_mask));
     FENCE;
+#ifdef ET_UBERKERNEL
+    // 052: drop this hart's dirty private-scratch lines from L1 (another kernel in the same segment may use the
+    // same L2-SCP addresses as shared lines; a late capacity write-back of stale scratch would clobber them)
+    for (int64_t off = 0; off < GLUE_SCRATCH_B; off += 16 * 64) {
+        evict_to_l2((const char *) scratch + off, 16, 64);
+    }
+    WAIT_CACHEOPS;  // also retires the kv-row evictions above
+#endif
     return 0;
 }

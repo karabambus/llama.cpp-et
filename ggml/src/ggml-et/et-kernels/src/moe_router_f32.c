@@ -223,6 +223,14 @@ int entry_point(struct ggml_et_moe_router_params * params, void * env) {
     }
 
     __asm__ volatile("mova.m.x %0" ::"r"(saved_mask));
+#ifdef ET_UBERKERNEL
+    // 052: see attn_qkv_glue_f32.c - evict this hart's private L2-SCP scratch from L1 before the next instruction
+    FENCE;
+    for (int64_t off = 0; off < (int64_t) (ROUTER_MAX_E * sizeof(float)); off += 16 * 64) {
+        evict_to_l2((const char *) p + off, 16, 64);
+    }
+    WAIT_CACHEOPS;
+#endif
     FENCE;
     return 0;
 }

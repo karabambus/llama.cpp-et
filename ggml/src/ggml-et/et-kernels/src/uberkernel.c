@@ -88,10 +88,131 @@ extern int mul_mat_Q2_K_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_Q3_K_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_Q5_K_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_Q6_K_entry(struct ggml_et_binary_params *, void *);
+// 052: Qwen3-MoE op set
+struct ggml_et_moe_router_params;
+struct ggml_et_moe_sum_params;
+struct ggml_et_qkv_glue_params;
+extern int mul_mat_id_Q4_0_entry(struct ggml_et_mul_mat_id_params *, void *);
+extern int mul_mat_id_Q4_0_v0_entry(struct ggml_et_mul_mat_id_params *, void *);
+extern int moe_router_f32_entry(struct ggml_et_moe_router_params *, void *);
+extern int attn_qkv_glue_f32_entry(struct ggml_et_qkv_glue_params *, void *);
+extern int moe_sum_f32_entry(struct ggml_et_moe_sum_params *, void *);
+extern int mul_mat_Q4_0_group_entry(struct ggml_et_mul_mat_group_params *, void *);
 
 static inline size_t tensor_bytes(const struct ggml_tensor * t) {
     return (size_t) t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3] * t->nb[0];
 }
+
+// 052: byte span of a possibly strided/permuted view (what a consumer may touch), not the packed size.
+static inline size_t tensor_span_bytes(const struct ggml_tensor * t) {
+    size_t span = t->nb[0];
+    for (int i = 0; i < 4; ++i) {
+        if (t->ne[i] > 1) {
+            span += (size_t) (t->ne[i] - 1) * t->nb[i];
+        }
+    }
+    return span;
+}
+
+// 052 eviction modes (ggml_et_uberkernel_params.flags bit 0, host env GGML_ET_UK_EVICT_MODE):
+//   0: every hart evicts every input region from its own L1+L2 (Saqib recipe; redundant 64x per shire - measured
+//      +195 ms/forward at N=32 where the spans reach 2 MB).
+//   1: every hart first evicts its WHOLE L1 to L2 with the M-mode syscall (cache_ops_priv_evict_l1: dirty outputs
+//      and private SCP scratch land in L2/SCP), then the L2->L3 walk of each region is split across the 64 harts
+//      of the shire (line h, h+64, ... via the 16-line/stride form), so each line is evicted once per shire.
+//      UNTESTED on the board as of 2026-08-27 (board went down before it could run) - keep 0 until verified.
+static uint32_t uk_mode;  // set by every hart at entry from params->flags (same value everywhere)
+
+static inline void uk_evict_region(const void * addr, size_t bytes) {
+    if (!addr || bytes == 0) {
+        return;
+    }
+    if (uk_mode == 0) {
+        evict_region_past_l2(addr, bytes);
+        return;
+    }
+    const uint64_t CL     = 64;
+    const uint64_t base   = (uint64_t) addr & ~(CL - 1);
+    const uint64_t end    = ((uint64_t) addr + bytes + CL - 1) & ~(CL - 1);
+    const uint64_t nlines = (end - base) / CL;
+    const uint64_t h      = get_hart_id() & 63;  // this hart's share: lines h, h+64, h+128, ...
+    for (uint64_t off = h; off < nlines; off += 16 * 64) {
+        uint64_t batch = (nlines - off + 63) / 64;  // lines left in this hart's share
+        if (batch > 16) {
+            batch = 16;
+        }
+        evict_past_l2((const void *) (base + off * CL), batch, 64 * CL);  // 16 lines, stride 64 lines
+    }
+}
+
+// Evict a tensor's span past L2 when it has data (writable inputs only - weights are never evicted, they are
+// read-only within a segment and enormous).
+static inline void uk_evict(const struct ggml_tensor * t) {
+    if (t->data) {
+        uk_evict_region(t->data, tensor_span_bytes(t));
+    }
+}
+
+// 052: evict the last (256 + n_batch) positions of a KV-cache view [D, n_kv, n_head_kv] (positions = ne[1]).
+// Positions are the outer stride in llama.cpp's cache view (nb[1] >= ne[2]*nb[2]); otherwise fall back to the span.
+static inline void uk_evict_kv_tail(const struct ggml_tensor * t, int64_t n_batch) {
+    if (!t->data) {
+        return;
+    }
+    const int64_t n_kv = t->ne[1];
+    if ((size_t) t->nb[1] >= (size_t) t->ne[2] * t->nb[2] && n_kv > 0) {
+        int64_t r0 = n_kv - 256 - n_batch;
+        if (r0 < 0) {
+            r0 = 0;
+        }
+        uk_evict_region((const char *) t->data + (size_t) r0 * t->nb[1], (size_t) (n_kv - r0) * t->nb[1]);
+    } else {
+        uk_evict_region(t->data, tensor_span_bytes(t));
+    }
+}
+
+// 052 mirrors of the MoE kernels' parameter structs (layouts must match the kernel sources exactly)
+struct uber_moe_router_params {
+    struct ggml_tensor src0;  // logits (written by the router mul_mat)
+    struct ggml_tensor ids;   // written here
+    struct ggml_tensor dst;   // written here
+    float              clamp_min, clamp_max;
+    int32_t            n_top, reserved;
+};
+struct uber_moe_sum_params {
+    struct ggml_tensor src0;  // experts (mul_mat_id output)
+    struct ggml_tensor src1;  // router weights
+    struct ggml_tensor dst;
+    struct ggml_tensor res;   // optional residual (.data == 0: none)
+};
+#define UBER_MUL_MAT_GROUP_MAX 3
+struct uber_mul_mat_group_params {
+    int32_t            n_mats, reserved;
+    struct ggml_tensor src0[UBER_MUL_MAT_GROUP_MAX];  // weights
+    struct ggml_tensor src1;                          // shared activation
+    struct ggml_tensor dst[UBER_MUL_MAT_GROUP_MAX];
+    struct ggml_tensor bias[UBER_MUL_MAT_GROUP_MAX];  // .data == 0: none
+};
+struct uber_qkv_job {
+    const void * src;
+    const void * w;
+    const void * pos;
+    void *       dst;
+    void *       kv;
+    const void * idx;
+    uint64_t     src_nb1, src_nb2;
+    uint64_t     dst_nb1, dst_nb2;
+    uint64_t     kv_nb1, idx_nb0;
+    int64_t      kv_rows;
+    int32_t      D, H, N;
+    int32_t      kv_f16;
+    float        eps;
+    int32_t      reserved;
+};
+#define UBER_GLUE_MAX_JOBS 3
+struct uber_qkv_glue_params {
+    struct uber_qkv_job job[UBER_GLUE_MAX_JOBS];  // rope settings + n_jobs follow; not needed for eviction
+};
 
 struct uber_glu_params {
     struct ggml_tensor src0;
@@ -244,18 +365,44 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
         return -1;
     }
 
+    // 052 per-instruction publication contract (SaqibAkram-10xE n_way recipe, backlog 052): L1 and L2 are
+    // incoherent (L2 is per shire), so before every instruction EVERY hart (1) drains its store buffer, (2) evicts
+    // the instruction's *writable* inputs from its own L1+L2 to L3/DRAM - on the producing shires this writes back
+    // what they computed, on the consuming shires it drops stale copies of a reused buffer - (3) waits for its
+    // cache ops, and (4) takes the chip-wide barrier, so no shire reads before every shire has published.
+    // Weights are never evicted (read-only in a segment). UK_SYNC() is steps 3+4, called by every case after its
+    // evictions; the barrier count is 32 = every launch is chip-wide (the host refuses to batch a narrowed one).
+    // A hart whose instruction failed keeps taking the barriers (it must never leave the loop while the others
+    // still wait for it) and reports the first error at the end.
+#define UK_SYNC()                 \
+    do {                          \
+        WAIT_CACHEOPS;            \
+        et_barrier_global(32ULL); \
+    } while (0)
+    int failed = 0;
+    uk_mode    = params->flags & 1u;
     for (uint32_t i = 0; i < params->num_insts; ++i) {
         struct ggml_et_uberkernel_inst * inst =
             (struct ggml_et_uberkernel_inst *) ((uint8_t *) insts + (i * params->inst_stride));
         void * inst_params = params_blob + inst->params_offset;
         int    rc          = -1;
 
-        et_barrier_global(32ULL);
+        FENCE;
+        if (uk_mode == 1) {
+            cache_ops_priv_evict_l1(0, to_L2);  // whole L1 -> L2 (dirty outputs + SCP scratch), M-mode syscall
+        }
+        if (failed) {
+            UK_SYNC();
+            continue;
+        }
 
         switch (inst->kernel_id) {
             case GGML_ET_UBERKERNEL_KERNEL_EL_MAP_F32:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src0);
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = el_map_f32_entry(p, env);
                     break;
                 }
@@ -285,11 +432,14 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             // }
             case GGML_ET_UBERKERNEL_KERNEL_GLU_F32:
                 {
+                    { struct uber_glu_params * g = (struct uber_glu_params *) inst_params; uk_evict(&g->src0); uk_evict(&g->src1); }
+                    UK_SYNC();
                     rc = glu_f32_entry((struct ggml_et_glu_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_ROPE_F32:
                 {
+                    UK_SYNC();
                     rc = rope_f32_entry((struct ggml_et_rope_params *) inst_params, env);
                     break;
                 }
@@ -297,24 +447,28 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                 {
                     // struct ggml_et_rms_norm_params *p = (struct ggml_et_rms_norm_params *) inst_params;
                     // evict_region_past_l2(p->src0.data, tensor_bytes(&p->src0));
+                    UK_SYNC();
                     rc = rms_norm_f32_entry((struct ggml_et_rms_norm_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_RMS_NORM_MUL_F32:
                 {
                     struct uber_rms_norm_mul_params * p = (struct uber_rms_norm_mul_params *) inst_params;
-                    evict_region_past_l2(p->src0.data, tensor_bytes(&p->src0));
-                    evict_region_past_l2(p->src1.data, tensor_bytes(&p->src1));
+                    uk_evict(&p->src0);
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc = rms_norm_mul_f32_entry((struct ggml_et_rms_norm_mul_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SOFTMAX_F32:
                 {
+                    UK_SYNC();
                     rc = softmax_f32_entry((struct ggml_et_softmax_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SET_ROWS_F32:
                 {
+                    UK_SYNC();
                     rc = set_rows_f32_entry((struct ggml_et_set_rows_params *) inst_params, env);
                     break;
                 }
@@ -322,71 +476,85 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             // Single-source ops (src0 → dst)
             case GGML_ET_UBERKERNEL_KERNEL_SQR_F32:
                 {
+                    UK_SYNC();
                     rc = sqr_f32_entry((struct ggml_et_sqr_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SCALE_F32:
                 {
+                    UK_SYNC();
                     rc = scale_f32_entry((struct ggml_et_scale_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SUM_ROWS_F32:
                 {
+                    UK_SYNC();
                     rc = sum_rows_f32_entry((struct ggml_et_sum_rows_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_CUMSUM_F32:
                 {
+                    UK_SYNC();
                     rc = cumsum_f32_entry((struct ggml_et_cumsum_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_NORM_F32:
                 {
+                    UK_SYNC();
                     rc = norm_f32_entry((struct ggml_et_norm_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_L2_NORM_F32:
                 {
+                    UK_SYNC();
                     rc = l2_norm_f32_entry((struct ggml_et_l2_norm_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_GROUP_NORM_F32:
                 {
+                    UK_SYNC();
                     rc = group_norm_f32_entry((struct ggml_et_group_norm_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_REPEAT_F32:
                 {
+                    UK_SYNC();
                     rc = repeat_f32_entry((struct ggml_et_repeat_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_DIAG_F32:
                 {
+                    UK_SYNC();
                     rc = diag_f32_entry((struct ggml_et_diag_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_TRI_F32:
                 {
+                    UK_SYNC();
                     rc = tri_f32_entry((struct ggml_et_tri_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_PAD_F32:
                 {
+                    UK_SYNC();
                     rc = pad_f32_entry((struct ggml_et_pad_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_CONT_F16:
                 {
+                    UK_SYNC();
                     rc = cont_f16_entry((struct ggml_et_cont_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_FILL_F32:
                 {
+                    UK_SYNC();
                     rc = fill_f32_entry((struct ggml_et_fill_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SET_F32:
                 {
+                    UK_SYNC();
                     rc = set_f32_entry((struct ggml_et_set_params *) inst_params, env);
                     break;
                 }
@@ -394,6 +562,7 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             // Two-source ops
             case GGML_ET_UBERKERNEL_KERNEL_CONCAT_F32:
                 {
+                    UK_SYNC();
                     rc = concat_f32_entry((struct ggml_et_concat_params *) inst_params, env);
                     break;
                 }
@@ -403,11 +572,13 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             // }
             case GGML_ET_UBERKERNEL_KERNEL_SOLVE_TRI_F32:
                 {
+                    UK_SYNC();
                     rc = solve_tri_f32_entry((struct ggml_et_solve_tri_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_IM2COL:
                 {
+                    UK_SYNC();
                     rc = im2col_entry((struct ggml_et_im2col_params *) inst_params, env);
                     break;
                 }
@@ -415,39 +586,58 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             // Three-source ops
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_ID_F32:
                 {
+                    UK_SYNC();
                     rc = mul_mat_id_f32_entry((struct ggml_et_mul_mat_id_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_FLASH_ATTN_EXT_F32:
                 {
+                    { struct uber_flash_attn_ext_params * f = (struct uber_flash_attn_ext_params *) inst_params; uk_evict(&f->src0); uk_evict(&f->src1); uk_evict(&f->src2); uk_evict(&f->mask); }
+                    UK_SYNC();
                     rc = flash_attn_ext_f32_entry((struct ggml_et_flash_attn_ext_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_FLASH_ATTN_EXT_F16_ME:
                 {
+                    {
+                        struct uber_flash_attn_ext_params * f = (struct uber_flash_attn_ext_params *) inst_params;
+                        uk_evict(&f->src0);
+                        uk_evict(&f->mask);
+                        // K/V cache: attn_qkv_glue wrote rows [kv_used-N, kv_used) earlier in this segment and this
+                        // shire may hold stale copies of exactly those rows (it read them as padding, n_kv is padded to
+                        // 256, in an earlier forward / prefetched them). Evict the tail that can contain them:
+                        // rows [n_kv - 256 - N, n_kv) - bounded, independent of the context length.
+                        uk_evict_kv_tail(&f->src1, f->src0.ne[1]);
+                        uk_evict_kv_tail(&f->src2, f->src0.ne[1]);
+                    }
+                    UK_SYNC();
                     rc = flash_attn_ext_f16_me_entry((struct ggml_et_flash_attn_ext_params *) inst_params, env);
                     break;
                 }
 
             case GGML_ET_UBERKERNEL_KERNEL_GATED_DELTA_NET_F32:
                 {
+                    UK_SYNC();
                     rc = gated_delta_net_f32_entry((struct ggml_et_gated_delta_net_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SSM_SCAN_F32:
                 {
+                    UK_SYNC();
                     rc = ssm_scan_f32_entry((struct ggml_et_ssm_scan_params *) inst_params, env);
                     break;
                 }
             // rwkv: raw float* params, no ggml_tensor fields to evict via
             case GGML_ET_UBERKERNEL_KERNEL_RWKV_WKV6_F32:
                 {
+                    UK_SYNC();
                     rc = rwkv_wkv6_f32_entry((struct ggml_et_rwkv_wkv6_params *) inst_params, env);
                     break;
                 }
 
             case GGML_ET_UBERKERNEL_KERNEL_RWKV_WKV7_F32:
                 {
+                    UK_SYNC();
                     rc = rwkv_wkv7_f32_entry((struct ggml_et_rwkv_wkv7_params *) inst_params, env);
                     break;
                 }
@@ -457,24 +647,32 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_F16:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = mul_mat_f16_entry(p, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_F16_MATRIX_ENGINE:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = mul_mat_f16_matrix_engine_entry(p, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_F32:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = mul_mat_f32_entry(p, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_F32_MATRIX_ENGINE:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = mul_mat_f32_matrix_engine_entry(p, env);
                     break;
                 }
@@ -482,6 +680,9 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                 {
                     struct ggml_et_mm_q8_params * p = (struct ggml_et_mm_q8_params *) inst_params;
                     // evict_region_past_l2(p->src0.data, tensor_bytes(&p->src0));
+                    uk_evict(&p->src1);
+                    uk_evict(&p->bias);
+                    UK_SYNC();
                     rc                              = mul_mat_Q8_0_entry(p, env);
                     break;
                 }
@@ -490,6 +691,7 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                     // Independent Q8_0 mul_mats sharing one activation. Running them inside a
                     // single instruction is the point: the loop above executes a chip-wide
                     // barrier per instruction, and these members need none between them.
+                    UK_SYNC();
                     rc = mul_mat_Q8_0_group_entry((struct ggml_et_mul_mat_group_params *) inst_params, env);
                     break;
                 }
@@ -497,48 +699,128 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                 {
                     // T2: the host packs ggml_et_mm_q8_params (bias-capable) for the scalar Q4_0 kernel
                     struct ggml_et_mm_q8_params * p = (struct ggml_et_mm_q8_params *) inst_params;
+                    uk_evict(&p->src1);
+                    uk_evict(&p->bias);
+                    UK_SYNC();
                     rc                              = mul_mat_Q4_0_entry(p, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q4_K:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = mul_mat_Q4_K_entry(p, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q2_K:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = mul_mat_Q2_K_entry(p, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q3_K:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = mul_mat_Q3_K_entry(p, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q5_K:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = mul_mat_Q5_K_entry(p, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q6_K:
                 {
                     struct ggml_et_binary_params * p = (struct ggml_et_binary_params *) inst_params;
+                    uk_evict(&p->src1);
+                    UK_SYNC();
                     rc                               = mul_mat_Q6_K_entry(p, env);
                     break;
                 }
 
+
+            // ---- 052: Qwen3-MoE op set ----
+            case GGML_ET_UBERKERNEL_KERNEL_GET_ROWS_F32:
+                {
+                    // src0 = embedding table (weights), src1 = token ids (host-written): nothing to evict
+                    UK_SYNC();
+                    rc = get_rows_f32_entry((struct ggml_et_get_rows_params *) inst_params, env);
+                    break;
+                }
+            case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_ID_Q4_0:
+            case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_ID_Q4_0_V0:
+                {
+                    struct ggml_et_mul_mat_id_params * p = (struct ggml_et_mul_mat_id_params *) inst_params;
+                    uk_evict(&p->src1);  // activations (ffn_norm / swiglu output)
+                    uk_evict(&p->src2);  // expert ids (moe_router output)
+                    UK_SYNC();
+                    rc = (inst->kernel_id == GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_ID_Q4_0) ? mul_mat_id_Q4_0_entry(p, env)
+                                                                                      : mul_mat_id_Q4_0_v0_entry(p, env);
+                    break;
+                }
+            case GGML_ET_UBERKERNEL_KERNEL_MOE_ROUTER_F32:
+                {
+                    struct uber_moe_router_params * p = (struct uber_moe_router_params *) inst_params;
+                    uk_evict(&p->src0);  // router logits (mul_mat output); ids/dst are written here
+                    UK_SYNC();
+                    rc = moe_router_f32_entry((struct ggml_et_moe_router_params *) inst_params, env);
+                    break;
+                }
+            case GGML_ET_UBERKERNEL_KERNEL_ATTN_QKV_GLUE_F32:
+                {
+                    struct uber_qkv_glue_params * p = (struct uber_qkv_glue_params *) inst_params;
+                    for (int j = 0; j < UBER_GLUE_MAX_JOBS; ++j) {
+                        const struct uber_qkv_job * job = &p->job[j];
+                        if (job->src && job->N > 0 && job->H > 0) {  // the q/k/v projections
+                            const size_t span = (size_t) (job->N - 1) * job->src_nb2 + (size_t) (job->H - 1) * job->src_nb1 +
+                                                (size_t) job->D * sizeof(float);
+                            uk_evict_region(job->src, span);
+                        }
+                    }
+                    UK_SYNC();
+                    rc = attn_qkv_glue_f32_entry((struct ggml_et_qkv_glue_params *) inst_params, env);
+                    break;
+                }
+            case GGML_ET_UBERKERNEL_KERNEL_MOE_SUM_F32:
+                {
+                    struct uber_moe_sum_params * p = (struct uber_moe_sum_params *) inst_params;
+                    uk_evict(&p->src0);  // expert outputs
+                    uk_evict(&p->src1);  // router weights
+                    uk_evict(&p->res);   // residual (attention output + residual)
+                    UK_SYNC();
+                    rc = moe_sum_f32_entry((struct ggml_et_moe_sum_params *) inst_params, env);
+                    break;
+                }
+            case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q4_0_GROUP:
+                {
+                    struct uber_mul_mat_group_params * p = (struct uber_mul_mat_group_params *) inst_params;
+                    uk_evict(&p->src1);
+                    for (int j = 0; j < UBER_MUL_MAT_GROUP_MAX && j < p->n_mats; ++j) {
+                        uk_evict(&p->bias[j]);
+                    }
+                    UK_SYNC();
+                    rc = mul_mat_Q4_0_group_entry((struct ggml_et_mul_mat_group_params *) inst_params, env);
+                    break;
+                }
+
             default:
-                return -1;
+                UK_SYNC();
+                rc = -1;
+                break;
         }
 
         if (rc != 0) {
-            return rc;
+            failed = rc;  // keep looping for the barriers; the launch reports the first failure
         }
     }
 
-    return 0;
+    return failed;
 }
