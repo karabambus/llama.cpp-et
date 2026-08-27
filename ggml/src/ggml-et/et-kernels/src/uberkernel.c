@@ -171,6 +171,7 @@ struct uber_mul_mat_id_params {
     struct ggml_tensor src1;
     struct ggml_tensor src2;
     struct ggml_tensor dst;
+    uint64_t           shire_mask;  // mirrors ggml_et_mul_mat_id_params (0 = kernel_env->shire_mask)
 };
 
 // flash_attn_ext: Q=src0, K=src1, V=src2, mask=src3, dst (mask optional)

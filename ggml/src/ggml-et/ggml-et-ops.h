@@ -301,6 +301,8 @@ struct ggml_et_mul_mat_id_params {
     ggml_tensor src1;  // Activations (F32) [K, n_expert_used, batch]
     ggml_tensor src2;  // Expert indices (I32) [n_expert_used, batch]
     ggml_tensor dst;   // Output (F32) [M, n_expert_used, batch, 1]
+    uint64_t    shire_mask;  // narrowed launch mask (GGML_ET_MMID_SHIRE_MASK) or 0 = kernel uses kernel_env->shire_mask;
+                             // must match et-kernels/src/ggml_tensor.h
 };
 
 struct ggml_et_sqr_params {

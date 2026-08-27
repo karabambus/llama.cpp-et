@@ -25,8 +25,12 @@ int entry_point(struct ggml_et_mul_mat_id_params * params, void * env) {
         return -1;
     }
 
-    int thread_id   = get_relative_thread_id(kernel_env->shire_mask);
-    int num_threads = get_num_threads(kernel_env->shire_mask);
+    // params->shire_mask: narrowed launch mask (GGML_ET_MMID_SHIRE_MASK); platform.h's helpers are chip-wide
+    // stubs, so use ggml_et_mask_threads() for it (see ggml_tensor.h); 0 = the usual chip-wide env mask
+    int thread_id;
+    int num_threads = params->shire_mask ? ggml_et_mask_threads(params->shire_mask, get_hart_id(), &thread_id)
+                                         : (thread_id = get_relative_thread_id(kernel_env->shire_mask),
+                                            get_num_threads(kernel_env->shire_mask));
     if (thread_id < 0) {
         return 0;
     }
