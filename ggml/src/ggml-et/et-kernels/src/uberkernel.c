@@ -120,7 +120,8 @@ static inline size_t tensor_span_bytes(const struct ggml_tensor * t) {
 //   1: every hart first evicts its WHOLE L1 to L2 with the M-mode syscall (cache_ops_priv_evict_l1: dirty outputs
 //      and private SCP scratch land in L2/SCP), then the L2->L3 walk of each region is split across the 64 harts
 //      of the shire (line h, h+64, ... via the 16-line/stride form), so each line is evicted once per shire.
-//      UNTESTED on the board as of 2026-08-27 (board went down before it could run) - keep 0 until verified.
+//      First board run 2026-08-27: N=1 83.8 ms, N=32 760.9 ms, but PPL 10.4845 vs 10.4855 (a race between one hart's
+//      L1 evict and another hart's L2 walk of the same line) -> shire barrier between the two steps added.
 static uint32_t uk_mode;  // set by every hart at entry from params->flags (same value everywhere)
 
 static inline void uk_evict_region(const void * addr, size_t bytes) {
@@ -390,6 +391,11 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
         FENCE;
         if (uk_mode == 1) {
             cache_ops_priv_evict_l1(0, to_L2);  // whole L1 -> L2 (dirty outputs + SCP scratch), M-mode syscall
+            // The L2->L3 walk below is split across the shire's harts, so a hart may push a line another hart of
+            // this shire still holds dirty in L1: wait for every hart's L1 evict to land in L2 first. Without this
+            // shire barrier the 32-chunk PPL moved 10.4855 -> 10.4845 (2026-08-27, first mode-1 board run).
+            WAIT_CACHEOPS;
+            et_barrier(ET_BARRIER_SHIRE);
         }
         if (failed) {
             UK_SYNC();
