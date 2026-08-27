@@ -35,6 +35,12 @@ static size_t ggml_et_next_capacity(size_t current_capacity, size_t required_cap
     return next_capacity;
 }
 
+// 052: GGML_ET_UBERKERNEL_STATS=1 prints per graph_compute how the launches were batched (segments / batched
+// instructions / standalone launches) - the number that decides whether the uberkernel pays.
+struct ggml_et_uk_stats { uint64_t segments = 0, insts = 0, standalone = 0, graphs = 0; };
+static ggml_et_uk_stats g_uk_stats;
+static const bool g_uk_stats_on = [] { const char * e = getenv("GGML_ET_UBERKERNEL_STATS"); return e && *e && strcmp(e, "0") != 0; }();
+
 static ggml_backend_et_uberkernel_slot & ggml_et_uberkernel_current_slot(ggml_backend_et_uberkernel_context * uk_ctx) {
     return uk_ctx->slots[uk_ctx->current_slot];
 }
@@ -433,14 +439,21 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
         runtime->memcpyHostToDevice(dev_ctx->default_stream, slot.params_blob.data(), slot.device_params, params_size,
                                     true);
 
+        static const uint32_t uk_flags = [] {
+            const char * e = getenv("GGML_ET_UK_EVICT_MODE");
+            return (uint32_t) ((e && *e) ? strtoul(e, nullptr, 0) : 0u) & 1u;
+        }();
         ggml_et_uberkernel_params params = {
             static_cast<uint32_t>(slot.insts.size()),
             static_cast<uint32_t>(sizeof(ggml_et_uberkernel_inst)),
             reinterpret_cast<uint64_t>(slot.device_insts),
             reinterpret_cast<uint64_t>(slot.device_params),
+            uk_flags,
+            0u,
         };
 
         rt::EventId launch_event{};
+        g_uk_stats.segments++;
         ok = ggml_et_launch_kernel_internal(dev_ctx, "uberkernel", &params, sizeof(params), shire_mask, false, false,
                                             &launch_event);
         if (ok) {
@@ -522,14 +535,45 @@ static bool ggml_et_launch_uberkernel(ggml_backend_et_device_context * dev_ctx,
                 break;
             }
         }
+        // 052: GGML_ET_UBERKERNEL_ONLY="moe_router_f32,moe_sum_f32": batch only the listed kernels (bisect aid;
+        // the complement of EXCLUDE). Empty/unset = no restriction.
+        static const std::vector<std::string> only = [] {
+            std::vector<std::string> v;
+            const char * e = getenv("GGML_ET_UBERKERNEL_ONLY");
+            if (e) {
+                std::string cur;
+                for (const char * c = e;; ++c) {
+                    if (*c == ',' || *c == '\0') {
+                        if (!cur.empty()) { v.push_back(cur); }
+                        cur.clear();
+                        if (*c == '\0') { break; }
+                    } else if (*c != ' ') {
+                        cur.push_back(*c);
+                    }
+                }
+            }
+            return v;
+        }();
+        if (!only.empty() && uberkernel_id != GGML_ET_UBERKERNEL_KERNEL_INVALID) {
+            bool listed = false;
+            for (const auto & x : only) { if (x == kernel_name) { listed = true; break; } }
+            if (!listed) { uberkernel_id = GGML_ET_UBERKERNEL_KERNEL_INVALID; }
+        }
+    }
+    // The dispatcher's per-instruction barrier is chip-wide (32 shires): a narrowed launch (GGML_ET_MMID_SHIRE_MASK)
+    // must never enter a segment.
+    if (shire_mask != 0xFFFFFFFFULL) {
+        uberkernel_id = GGML_ET_UBERKERNEL_KERNEL_INVALID;
     }
     if (uberkernel_id == GGML_ET_UBERKERNEL_KERNEL_INVALID) {
         if (!ggml_et_launch_uberkernel_segment(dev_ctx, uk_ctx)) {
             return false;
         }
+        g_uk_stats.standalone++;
         return ggml_et_launch_kernel_internal(dev_ctx, kernel_name, params, params_size, shire_mask, enable_print,
                                               sync_error_check);
     }
+    g_uk_stats.insts++;
 
     auto &       slot          = ggml_et_uberkernel_current_slot(uk_ctx);
     const size_t params_offset = ggml_et_align_up(slot.params_blob.size(), GGML_ET_UBERKERNEL_PARAM_ALIGN);
@@ -584,7 +628,15 @@ bool ggml_et_uberkernel_end_graph(ggml_backend_et_device_context * dev_ctx) {
         return true;
     }
 
-    return ggml_et_launch_uberkernel_segment(dev_ctx, &dev_ctx->uberkernel);
+    const bool ok = ggml_et_launch_uberkernel_segment(dev_ctx, &dev_ctx->uberkernel);
+    if (g_uk_stats_on) {
+        g_uk_stats.graphs++;
+        fprintf(stderr, "ET-UK-STATS graph=%llu segments=%llu batched_insts=%llu standalone=%llu\n",
+                (unsigned long long) g_uk_stats.graphs, (unsigned long long) g_uk_stats.segments,
+                (unsigned long long) g_uk_stats.insts, (unsigned long long) g_uk_stats.standalone);
+        g_uk_stats.segments = g_uk_stats.insts = g_uk_stats.standalone = 0;
+    }
+    return ok;
 }
 
 bool ggml_et_wait_stream(ggml_backend_et_device_context * dev_ctx, const char * where) {

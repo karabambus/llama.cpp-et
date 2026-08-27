@@ -102,7 +102,14 @@ set(UBERKERNEL_SUPPORTED_KERNELS
     # unary_f32
     # cpy_f32_f16
     # cont_f32
-    # get_rows_f32
+    get_rows_f32
+    # 052: the Qwen3-MoE op set (per-instruction eviction contract in uberkernel.c)
+    mul_mat_id_Q4_0
+    mul_mat_id_Q4_0_v0
+    moe_router_f32
+    attn_qkv_glue_f32
+    moe_sum_f32
+    mul_mat_Q4_0_group
     concat_f32
     cont_f16
     cumsum_f32
