@@ -1162,12 +1162,24 @@ bool ggml_et_op_mul_mat_id(ggml_backend_et_device_context * dev_ctx, const ggml_
         return false;
     }
 
+    // 039b bring-up: GGML_ET_MMID_SHIRE_MASK overrides the shire mask for MUL_MAT_ID only, so a novel kernel
+    // change can be smoke-tested on a small slice of the chip (narrower blast radius) before going chip-wide.
+    // Debug-only - remove once 039b's SCP-staged path is verified and re-enabled. Hex, e.g. "0x1" = shire 0 only.
+    // The firmware does NOT narrow kernel_env->shire_mask for such a launch (it stays 0xFFFFFFFF, measured 2026-08-27),
+    // so the override is also passed in params.shire_mask for the kernel to partition its work by; 0 = not overridden.
+    static const uint64_t mmid_shire_mask = [] {
+        const char * e = getenv("GGML_ET_MMID_SHIRE_MASK");
+        if (!e || !*e) { return (uint64_t) 0; }
+        return (uint64_t) strtoull(e, nullptr, 0);
+    }();
+
     // Pack parameters - copy full tensor structures
     ggml_et_mul_mat_id_params params;
     params.src0 = *node->src[0];  // Expert weight matrices (Q8_0/F16/F32)
     params.src1 = *node->src[1];  // Activation matrix (F32)
     params.src2 = *node->src[2];  // Expert indices (I32)
     params.dst  = *node;          // Output matrix (F32)
+    params.shire_mask = mmid_shire_mask;
 
     // Phase 1: Initialize CPU comparison context and copy source buffers (before ET kernel)
     ggml_et_cpu_compare_ctx cpu_cmp_ctx;
@@ -1181,7 +1193,8 @@ bool ggml_et_op_mul_mat_id(ggml_backend_et_device_context * dev_ctx, const ggml_
     }
 
     // Launch ET kernel
-    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params),
+                                               mmid_shire_mask ? mmid_shire_mask : 0xFFFFFFFFULL);
 
     // Phase 2: Execute CPU computation and compare with ET result (after ET kernel)
     if (cpu_comparison_active) {

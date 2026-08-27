@@ -17,6 +17,15 @@
 // Numerics: prod = (scale * q) * b is exact for the prescale (q in [-8,7], scale f16 -> f32),
 // so the result differs from v0 only in the f32 summation order.
 // Limits (else v0 runs): n_expert <= 512, S*N <= 4096 pairs. K % 32 == 0 always required.
+//
+// 039b: SCP-staged double buffer (overlap the DRAM->SCP expert-weight stream with compute; W25 found the stream
+// itself DRAM-bound at 20-33 GB/s regardless of fetch instruction, so the only lever left is not serializing it
+// with the ~1 ms/unit of FMA work). Hart 0 of each minion issues `tensor_load_l2scp` for both its own and its
+// partner's next unit's rows (id 0 only - id 1's wait never returns on this firmware), waits, evicts the buffer's
+// lines from its own L1 (the DMA bypasses L1 on write, so a stale cached copy from 2 iterations ago would
+// otherwise survive undetected), then signals ready; both harts compute their own unit from their own SCP buffer
+// while hart 0 issues the next pair's load. Falls back to the original direct-DRAM-read path (unchanged) when the
+// double-buffered rows don't fit the per-hart SCP budget (large K) or a unit has no partner (odd tail).
 //******************************************************************************
 
 #include "ggml_tensor.h"
@@ -41,9 +50,30 @@
 #define MMID_MAX_PAIRS 4096
 #define MMID_ROWS      16   // rows per work unit = one 64-byte dst line per token
 #define MMID_T         4    // tokens per pass
-#define MMID_SCRATCH_B 32768
+// Per-hart SCP budget: 2.5 MiB/shire / 64 harts-per-shire = 40960 B, used exclusively by this hart (grouping
+// scratch below, then - 039b - the SCP row-staging double buffer). 40960 * 64 == the whole shire scratchpad.
+#define MMID_SCRATCH_B  40960
+#define MMID_SCP_CTR_B  128  // 039b: 2 lines reserved for this hart's ready_ctr/consumed_ctr (1 line each)
 #ifndef MMID_DIAG
-#    define MMID_DIAG 0   // 1: no token loads/FMAs  2: no gathers/unpack  3: no B loads  4: grouping only  5: no K loop (diagnostics only)
+#    define MMID_DIAG 0   // 0: production v1 (SCP staging only if MMID_SCP_ENABLE); 9/10/11 = 039b bring-up variants
+                           // 1: no token loads/FMAs  2: no gathers/unpack  3: no B loads  4: grouping only  5: no K loop
+                           // (diagnostics only)  9: 039b SCP staging, no overlap  10: 039b SCP staging, double-buffered
+                           // 11: = 9 plus a per-hart trace record [tid, 2.0, wid, wait_fails, units, scp==dram matches,
+                           //     kernel_env->shire_mask, is_hart0, num_threads, offs[E], pairs[0], active[0], n_active, rows_u,
+                           //     params->shire_mask, hart_id] published into src1 (16 floats at src1[tid*16]) at the end -
+                           //     mmid_check prints them; src1 is clobbered so values are garbage, the dst write map is intact
+#endif
+// 039b DISABLED 2026-08-26: the hart0/hart1 SCP handshake below deadlocked on first board test (mmid_check, gate
+// shape, N=1) and the deadlock propagated into a wedged card that the normal DM_CMD_RESET_ETSOC recovery could not
+// clear ("State not recoverable" from dev_mngt_service - needed root-level intervention). Root cause NOT found by
+// static review (barrier arity, counter sequencing, and buffer indexing all check out on paper; the individual
+// primitives - id-0 tensor_load_l2scp, chip-wide concurrent issuance - were each independently verified safe in
+// Exp 039's one-shot bisection probes). Suspect: combining chip-wide concurrent DMA issuance with a *repeated,
+// iterative* cross-hart software handshake (not the one-shot probes 039 ran) exposes a timing/hardware interaction
+// only visible with board access. Do not flip this to 1 without a single-minion or single-shire reproduction first
+// (narrow the blast radius before the next chip-wide run) - see experiments/039_expert_grouped_mmid/NOTES.md.
+#ifndef MMID_SCP_ENABLE
+#    define MMID_SCP_ENABLE 0  // 039b SCP-staged path: verified correct + hang-free chip-wide 2026-08-27 but slower than the direct path (NOTES); off
 #endif
 
 // ---- the K loop for (2 rows) x (4 tokens): ONE asm block, so no value lives in an f-register across C code
@@ -199,13 +229,156 @@ static inline void mmid_store_line(float * dst, const float * src) {
         : "f0", "f1", "memory");
 }
 
+// 039b: line index (within THIS shire's 2.5 MiB SCP) for a byte offset inside hart `his`'s MMID_SCRATCH_B slice.
+static inline uint64_t mmid_scp_line(uint64_t his, uint64_t byte_off) {
+    return (his * (uint64_t) MMID_SCRATCH_B + byte_off) / 64;
+}
+
+// 039b: stage `bytes` (multiple of 64) from DRAM `src` into this shire's SCP starting at line `dst_line0`, <=16
+// lines per tensor_load_l2scp (id 0 only: id 1's wait never returns on this firmware; never a second load in
+// flight before the first is retired). Retirement is either the hardware wait (MMID_SCP_HW_WAIT=1, the
+// single-outstanding-load pattern verified in 039 NOTES) or - bring-up default - a bounded evict-poll of every
+// staged line against a sentinel (the hang-proof MMID_DIAG==7 probe technique): a stalled load then costs
+// MMID_SCP_WAIT_SPINS polls and a wrong answer instead of an unbounded hardware wait that can wedge the card
+// (the chip-wide 039b deadlock of 2026-08-26 is unexplained; this is the only unbounded wait left in the path).
+// Returns the number of lines whose poll gave up (0 = everything landed).
+#ifndef MMID_SCP_HW_WAIT
+#    define MMID_SCP_HW_WAIT 0
+#endif
+#ifndef MMID_SCP_WAIT_SPINS
+#    define MMID_SCP_WAIT_SPINS 2000000  // bound for every software poll in this kernel (scp_wait + line polls)
+#endif
+#define MMID_SCP_SENT0  0xC0FFEE00u
+#define MMID_SCP_SENT15 0xC0FFEE0Fu
+static inline int mmid_load_rows_scp(uint64_t dst_line0, const void * src, int64_t bytes) {
+    const char * p    = (const char *) src;
+    uint64_t     dl    = dst_line0;
+    int64_t      left  = (bytes + 63) / 64;
+    int          fails = 0;
+    while (left > 0) {
+        const int64_t n = left > 16 ? 16 : left;
+#if !MMID_SCP_HW_WAIT
+        // sentinel word 0 and 15 of every destination line, pushed into the L2 SCP line itself (L1 copy dropped)
+        // BEFORE the load is issued, so the write-back cannot race the tensor unit's write of the same line
+        volatile uint32_t * l0 = (volatile uint32_t *) et_shire_l2scp_local(dl * 64);
+        for (int64_t i = 0; i < n; ++i) {
+            l0[i * 16 + 0]  = MMID_SCP_SENT0;
+            l0[i * 16 + 15] = MMID_SCP_SENT15;
+        }
+        FENCE;
+        evict_to_l2((const void *) l0, (uint64_t) n, 64);
+        WAIT_CACHEOPS;
+#endif
+        et_tensor_load_l2scp_conf_t c = { false, dl, (uint64_t) p, (uint64_t) (n - 1), 64, 0 };
+        et_tensor_load_l2scp(&c);
+#if MMID_SCP_HW_WAIT
+        WAIT_TENSOR_LOAD_L2_0;
+#else
+        for (int64_t i = 0; i < n; ++i) {  // tensor writes bypass L1: evict before every poll read
+            volatile uint32_t * l = l0 + i * 16;
+            int32_t spin = 0;
+            for (; spin < MMID_SCP_WAIT_SPINS; ++spin) {
+                evict_to_l2((const void *) l, 1, 64);
+                WAIT_CACHEOPS;
+                if (l[0] != MMID_SCP_SENT0 || l[15] != MMID_SCP_SENT15) { break; }
+            }
+            fails += (spin == MMID_SCP_WAIT_SPINS);
+        }
+#endif
+        dl += n;
+        p += n * 64;
+        left -= n;
+    }
+    return fails;
+}
+
+// 039b: invalidate `bytes` (multiple of 64) worth of this hart's own L1 lines at `addr` so a subsequent plain load
+// re-fetches from L2 SCP - required because tensor_load_l2scp writes bypass L1, and a hart's own earlier read of
+// the same (reused) buffer slot would otherwise survive as a stale L1 copy.
+static inline void mmid_evict_rows(const void * addr, int64_t bytes) {
+    FENCE;
+    const char * p    = (const char *) addr;
+    int64_t      left = (bytes + 63) / 64;
+    while (left > 0) {
+        const int64_t n = left > 16 ? 16 : left;
+        evict_to_l2(p, (uint64_t) n, 64);
+        p += n * 64;
+        left -= n;
+    }
+    WAIT_CACHEOPS;
+}
+
+// 039b safety net: bounded version of platform.h's scp_wait. The unbounded original deadlocked this kernel on its
+// first board test and the hang propagated into a wedged card (see 039b incident writeup, NOTES.md) - whatever the
+// exact bug is, this hart must never park in a spin loop that can only be broken by the host's launch-level
+// timeout (which failed to save the card last time). Giving up after MMID_SCP_WAIT_SPINS turns a stuck handshake
+// into a wrong-but-bounded answer (caught by the correctness check) instead of an unbounded device hang.
+static inline int mmid_scp_wait_bounded(volatile uint32_t * flag, uint32_t expected) {
+    for (int32_t spin = 0; spin < MMID_SCP_WAIT_SPINS; ++spin) {
+        evict_to_l2((const void *) flag, 1, 64);
+        WAIT_CACHEOPS;
+        if (*flag >= expected) {
+            return 1;
+        }
+    }
+    return 0;  // gave up: caller proceeds anyway rather than hang
+}
+
+// 039b: compute one unit's row-pairs from SCP-resident, tightly-packed rows (buf + r*row_bytes = row r's
+// block_q4_0 data). Same arithmetic as the direct-DRAM-read path's inner loop, just sourced from the SCP buffer
+// the caller already staged and evicted from L1.
+static inline void mmid_compute_unit_scp(const char * buf, int64_t row_bytes, int64_t K_blocks, int64_t nrows,
+                                          int64_t m0, int32_t p0, int32_t p1, const int32_t * pairs,
+                                          const char * b_base, size_t nb11, size_t nb12, char * d_base, size_t nbd1,
+                                          size_t nbd2, int64_t ne11, int line_ok, float out_blk[MMID_T][MMID_ROWS]) {
+    for (int32_t pg = p0; pg < p1; pg += MMID_T) {
+        const int32_t T = (p1 - pg < MMID_T) ? (p1 - pg) : MMID_T;
+        const float * bcol[MMID_T];
+        float *       dcol[MMID_T];
+        for (int32_t i = 0; i < MMID_T; ++i) {
+            const int32_t pi = pg + (i < T ? i : 0);
+            const int64_t t  = pairs[pi] >> 8, s = pairs[pi] & 255;
+            bcol[i] = (const float *) (b_base + (s % ne11) * nb11 + t * nb12);
+            dcol[i] = (float *) (d_base + s * nbd1 + t * nbd2) + m0;
+        }
+        for (int64_t r = 0; r < nrows; r += 2) {
+            const int64_t      r1   = (r + 1 < nrows) ? r + 1 : r;  // odd tail: row1 duplicates row0
+            const block_q4_0 * row0 = (const block_q4_0 *) (buf + r * row_bytes);
+            const block_q4_0 * row1 = (const block_q4_0 *) (buf + r1 * row_bytes);
+            if (T >= 4) {
+                mmid_rows2_tok4(row0->qs, row1->qs, bcol[0], bcol[1], bcol[2], bcol[3], K_blocks, &out_blk[0][r], &out_blk[0][r1]);
+            } else if (T >= 2) {
+                mmid_rows2_tok2(row0->qs, row1->qs, bcol[0], bcol[1], bcol[1], bcol[1], K_blocks, &out_blk[0][r], &out_blk[0][r1]);
+                if (T == 3) {
+                    mmid_rows2_tok1(row0->qs, row1->qs, bcol[2], bcol[2], bcol[2], bcol[2], K_blocks, &out_blk[2][r], &out_blk[2][r1]);
+                }
+            } else {
+                mmid_rows2_tok1(row0->qs, row1->qs, bcol[0], bcol[0], bcol[0], bcol[0], K_blocks, &out_blk[0][r], &out_blk[0][r1]);
+            }
+        }
+        for (int32_t i = 0; i < T; ++i) {
+            if (line_ok && nrows == MMID_ROWS) {
+                mmid_store_line(dcol[i], out_blk[i]);
+            } else {
+                for (int64_t r = 0; r < nrows; ++r) {
+                    atomic_store_f32((volatile float *) (dcol[i] + r), out_blk[i][r]);
+                }
+            }
+        }
+    }
+}
+
 int ET_MMID_ENTRY_NAME(struct ggml_et_mul_mat_id_params * params, void * env) {
     kernel_environment_t * kernel_env = (kernel_environment_t *) env;
     if (!kernel_env || !params) {
         return -1;
     }
-    const int thread_id   = get_relative_thread_id(kernel_env->shire_mask);
-    const int num_threads = get_num_threads(kernel_env->shire_mask);
+    // partition by the launch mask the host actually used when it narrowed it (params->shire_mask, set only via
+    // GGML_ET_MMID_SHIRE_MASK): platform.h's helpers are chip-wide stubs, see ggml_et_mask_threads()
+    int       thread_id;
+    const int num_threads = params->shire_mask ? ggml_et_mask_threads(params->shire_mask, get_hart_id(), &thread_id)
+                                               : (thread_id = get_relative_thread_id(kernel_env->shire_mask),
+                                                  get_num_threads(kernel_env->shire_mask));
     if (thread_id < 0) {
         return 0;
     }
@@ -238,7 +411,9 @@ int ET_MMID_ENTRY_NAME(struct ggml_et_mul_mat_id_params * params, void * env) {
         return -1;
     }
     const int64_t K_blocks = K / QK4_0;
+    const int64_t row_bytes = K_blocks * (int64_t) sizeof(block_q4_0);
     const int     line_ok  = (((uintptr_t) d_base & 63) == 0) && (nbd1 % 64 == 0) && (nbd2 % 64 == 0);
+    const int     rows_tight_packed = (nb01 == (size_t) row_bytes);  // 039b needs a straight contiguous row copy
 
     // ---- group the pairs by expert (every hart, private L2-SCP slice; pseudo-expert E = invalid ids) ----
     const uint64_t hart_in_shire = get_hart_id() & 63;
@@ -288,9 +463,31 @@ int ET_MMID_ENTRY_NAME(struct ggml_et_mul_mat_id_params * params, void * env) {
     while (rows_u > 2 && (int64_t) n_active * ((M + rows_u - 1) / rows_u) < num_threads) {
         rows_u >>= 1;
     }
+    // 039b: shrink rows_u further so a double-buffered pair of (rows_u x row_bytes) fits this hart's SCP budget
+    // left over after the grouping scratch above (counts/offs/pairs/active, sized for the worst case E/S*N this
+    // hart could have grouped, not just n_active/S*N actually seen). scp_ok (set after row_blocks/total_units
+    // below) is what actually gates the staged path - this loop only shrinks rows_u so staging CAN fit.
+    const int64_t grouping_ints  = (E + 1) + (E + 2) + S * N + (E + 1);
+    const int64_t grouping_bytes = ((grouping_ints * (int64_t) sizeof(int32_t) + 63) / 64) * 64;
+    const int64_t scp_buf_avail  = MMID_SCRATCH_B - grouping_bytes - MMID_SCP_CTR_B;
+    while (rows_u > 2 && 2 * rows_u * row_bytes > scp_buf_avail) {
+        rows_u >>= 1;
+    }
     const int64_t row_blocks  = (M + rows_u - 1) / rows_u;
     const int64_t total_units = (int64_t) n_active * row_blocks;
-    const int64_t row_bytes   = K_blocks * (int64_t) sizeof(block_q4_0);
+    // One SCP row-buffer slot for this hart's unit, rounded up to a whole number of 64B lines so buffer 1 always
+    // starts line-aligned after buffer 0 (row_bytes = K_blocks*18 is not itself always a multiple of 64).
+    const int64_t buf_bytes = ((rows_u * row_bytes + 63) / 64) * 64;
+    const int     has_invalid = (n_active > 0 && active[n_active - 1] == (int32_t) E);
+    const int64_t valid_total_units = total_units - (has_invalid ? row_blocks : 0);
+    // tensor_load_l2scp copies whole 64B lines from a line-aligned DRAM address: every unit must start on a line
+    // (a_base, e*nb02 and m0*nb01 all 64B multiples) and span whole lines (no short last unit) - otherwise
+    // test-backend-ops shapes like K=256/rows_u=2 (2 x 144 B) staged garbage/NaN (2026-08-27). Fall back to the
+    // direct path for such shapes; the production shapes (K=2048 M=768, K=768 M=2048, rows_u=16) qualify.
+    const int scp_aligned = (((uintptr_t) a_base & 63) == 0) && ((rows_u * row_bytes) % 64 == 0) && (M % rows_u == 0);
+    const int scp_ok = MMID_SCP_ENABLE && (MMID_DIAG == 0 || MMID_DIAG == 9 || MMID_DIAG == 10 || MMID_DIAG == 11) &&
+                        rows_tight_packed && scp_aligned && rows_u >= 2 && 2 * buf_bytes <= scp_buf_avail &&
+                        (num_threads % 2) == 0 && valid_total_units > 0;
 
     unsigned long saved_mask;
     __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
@@ -434,6 +631,175 @@ int ET_MMID_ENTRY_NAME(struct ggml_et_mul_mat_id_params * params, void * env) {
 #if MMID_DIAG == 4
     if (total_units > 0) { __asm__ volatile("mova.m.x %0" ::"r"(saved_mask)); FENCE; return 0; }  // grouping only
 #endif
+#if MMID_DIAG == 11
+#    define MMID_TRACE(...) __VA_ARGS__
+#else
+#    define MMID_TRACE(...)
+#endif
+#if MMID_DIAG == 0 || MMID_DIAG == 9 || MMID_DIAG == 10 || MMID_DIAG == 11
+    if (scp_ok) {
+        // ---- invalid-expert units: no weights to load, same zeroing as the direct path below, independent per hart ----
+        if (has_invalid) {
+            for (int64_t u = thread_id; u < total_units; u += num_threads) {
+                if (u < valid_total_units) { continue; }
+                const int64_t rb    = u % row_blocks;
+                const int64_t m0    = rb * rows_u;
+                const int64_t nrows = (M - m0 < rows_u) ? (M - m0) : rows_u;
+                const int32_t p0 = offs[E], p1 = offs[E + 1];
+                for (int32_t p = p0; p < p1; ++p) {
+                    const int64_t t = pairs[p] >> 8, s = pairs[p] & 255;
+                    float *       d = (float *) (d_base + s * nbd1 + t * nbd2) + m0;
+                    for (int64_t r = 0; r < nrows; ++r) {
+                        atomic_store_f32((volatile float *) (d + r), 0.0f);
+                    }
+                }
+            }
+        }
+
+        // ---- 039b: SCP-staged double buffer. Hart 0 of each minion is the dedicated streamer (only even harts can
+        // issue tensor_load_l2scp): it stages both units of a pair (its own "a" unit and its partner's "b" unit)
+        // one or two pairs ahead of compute (nbuf slots). Hart 1 is the dedicated computer: it computes both units
+        // of the pair from SCP once staged. The overlap comes from hart 0 and hart 1 being separate physical cores
+        // running concurrently (hart 0 streams pair p+1 while hart 1 computes pair p), not from interleaving
+        // load/compute on a single hart's instruction stream (tensor_load_l2scp allows only one outstanding load
+        // per id, so a single hart cannot itself issue a load and do unrelated compute before waiting on it without
+        // this same restructuring). MMID_DIAG==9 forces nbuf=1 (strict alternation, no overlap - correctness/bring-up
+        // check); default and MMID_DIAG==10 use nbuf=2 (double-buffered, the actual overlap).
+        const int      is_hart0    = !(hart_in_shire & 1);
+        const uint64_t his0        = hart_in_shire & ~1ULL;  // this minion's hart-0 index (unit "a"'s SCP region)
+        const uint64_t his1        = his0 | 1ULL;            // this minion's hart-1 index (unit "b"'s SCP region)
+        char * const   base0       = (char *) et_shire_l2scp_local(his0 * (uint64_t) MMID_SCRATCH_B);
+        char * const   base1       = (char *) et_shire_l2scp_local(his1 * (uint64_t) MMID_SCRATCH_B);
+        char * const   buf_a[2]    = { base0 + grouping_bytes, base0 + grouping_bytes + buf_bytes };
+        char * const   buf_b[2]    = { base1 + grouping_bytes, base1 + grouping_bytes + buf_bytes };
+        volatile uint32_t * const ready_ctr    = (volatile uint32_t *) (base0 + grouping_bytes + 2 * buf_bytes);
+        volatile uint32_t * const consumed_ctr = (volatile uint32_t *) (base0 + grouping_bytes + 2 * buf_bytes + 64);
+        const uint64_t his0_line0 = mmid_scp_line(his0, (uint64_t) grouping_bytes);
+        const uint64_t his1_line0 = mmid_scp_line(his1, (uint64_t) grouping_bytes);
+#if MMID_DIAG == 9 || MMID_DIAG == 11
+        const int nbuf = 1;
+#else
+        const int nbuf = 2;
+#endif
+
+        if (is_hart0) {
+            CLEAR_TENSOR_ERROR;
+            *ready_ctr = 0; *consumed_ctr = 0;
+            FENCE;
+            evict_to_l2((const void *) ready_ctr, 1, 64);
+            evict_to_l2((const void *) consumed_ctr, 1, 64);
+            WAIT_CACHEOPS;
+        }
+        et_barrier(ET_BARRIER_MINION);  // hart 1 must not scp_wait before hart 0's reset above is visible
+
+        const int64_t num_minions = num_threads / 2;
+        const int64_t minion_id   = thread_id / 2;
+        const int64_t total_pairs = (valid_total_units + 1) / 2;
+        MMID_TRACE(uint32_t dg_wid = 0, dg_wfail = 0, dg_units = 0, dg_match = 0;)
+
+        if (is_hart0) {
+            uint32_t wid = 0;
+            for (int64_t p = minion_id; p < total_pairs; p += num_minions) {
+                const int64_t ua    = 2 * p, ub = 2 * p + 1;
+                const int     has_b = ub < valid_total_units;
+                const int     buf   = (int) (wid % (uint32_t) nbuf);
+                if (wid >= (uint32_t) nbuf) {
+                    const int ok = mmid_scp_wait_bounded(consumed_ctr, wid - (uint32_t) nbuf + 1);
+                    (void) ok;
+                    MMID_TRACE(dg_wfail += (ok == 0);)
+                }
+
+                const int32_t e_a  = active[ua / row_blocks];
+                const int64_t m0_a = (ua % row_blocks) * rows_u;
+                const int64_t nr_a = (M - m0_a < rows_u) ? (M - m0_a) : rows_u;
+                const char *  src_a = a_base + (int64_t) e_a * nb02 + m0_a * (int64_t) nb01;
+                {
+                    const int lf = mmid_load_rows_scp(his0_line0 + (uint64_t) buf * (buf_bytes / 64), src_a, nr_a * row_bytes);
+                    (void) lf;
+                    MMID_TRACE(dg_wfail += lf;)
+                }
+                MMID_TRACE({   // did the staged data land? (first word of the unit's first row, re-read from L2 SCP)
+                    evict_to_l2((const void *) buf_a[buf], 1, 64);
+                    WAIT_CACHEOPS;
+                    dg_match += (*(volatile const uint32_t *) buf_a[buf] == *(const uint32_t *) src_a);
+                    dg_units += 1 + has_b;
+                })
+                if (has_b) {
+                    const int32_t e_b  = active[ub / row_blocks];
+                    const int64_t m0_b = (ub % row_blocks) * rows_u;
+                    const int64_t nr_b = (M - m0_b < rows_u) ? (M - m0_b) : rows_u;
+                    const int lf = mmid_load_rows_scp(his1_line0 + (uint64_t) buf * (buf_bytes / 64),
+                                                      a_base + (int64_t) e_b * nb02 + m0_b * (int64_t) nb01, nr_b * row_bytes);
+                    (void) lf;
+                    MMID_TRACE(dg_wfail += lf;)
+                }
+                wid++;
+                scp_signal(ready_ctr, wid);
+            }
+            MMID_TRACE(dg_wid = wid;)
+        } else {
+            uint32_t wid = 0;
+            for (int64_t p = minion_id; p < total_pairs; p += num_minions) {
+                const int64_t ua    = 2 * p, ub = 2 * p + 1;
+                const int     has_b = ub < valid_total_units;
+                const int     buf   = (int) (wid % (uint32_t) nbuf);
+                wid++;
+                {
+                    const int ok = mmid_scp_wait_bounded(ready_ctr, wid);
+                    (void) ok;
+                    MMID_TRACE(dg_wfail += (ok == 0);)
+                }
+
+                const int32_t e_a  = active[ua / row_blocks];
+                const int64_t m0_a = (ua % row_blocks) * rows_u;
+                const int64_t nr_a = (M - m0_a < rows_u) ? (M - m0_a) : rows_u;
+                const int32_t pa0 = offs[e_a], pa1 = offs[e_a + 1];
+                mmid_evict_rows(buf_a[buf], nr_a * row_bytes);
+                MMID_TRACE({
+                    dg_match += (*(volatile const uint32_t *) buf_a[buf] ==
+                                 *(const uint32_t *) (a_base + (int64_t) e_a * nb02 + m0_a * (int64_t) nb01));
+                    dg_units += 1 + has_b;
+                })
+                mmid_compute_unit_scp(buf_a[buf], row_bytes, K_blocks, nr_a, m0_a, pa0, pa1, pairs, b_base, nb11,
+                                       nb12, d_base, nbd1, nbd2, ne11, line_ok, out_blk);
+                if (has_b) {
+                    const int32_t e_b  = active[ub / row_blocks];
+                    const int64_t m0_b = (ub % row_blocks) * rows_u;
+                    const int64_t nr_b = (M - m0_b < rows_u) ? (M - m0_b) : rows_u;
+                    const int32_t pb0 = offs[e_b], pb1 = offs[e_b + 1];
+                    mmid_evict_rows(buf_b[buf], nr_b * row_bytes);
+                    mmid_compute_unit_scp(buf_b[buf], row_bytes, K_blocks, nr_b, m0_b, pb0, pb1, pairs, b_base, nb11,
+                                           nb12, d_base, nbd1, nbd2, ne11, line_ok, out_blk);
+                }
+                scp_signal(consumed_ctr, wid);
+            }
+            MMID_TRACE(dg_wid = wid;)
+        }
+        MMID_TRACE({   // publish this hart's trace record into src1 (clobbers activations - diagnostics only)
+            const int64_t  rec_cap = (K * ne11 * N) / 16;
+            if (rec_cap > 0) {
+                float * rec = (float *) (uintptr_t) b_base + (int64_t) (thread_id % rec_cap) * 16;
+                atomic_store_f32((volatile float *) (rec + 0), (float) thread_id);
+                atomic_store_f32((volatile float *) (rec + 1), 2.0f);
+                atomic_store_f32((volatile float *) (rec + 2), (float) (int32_t) dg_wid);
+                atomic_store_f32((volatile float *) (rec + 3), (float) (int32_t) dg_wfail);
+                atomic_store_f32((volatile float *) (rec + 4), (float) (int32_t) dg_units);
+                atomic_store_f32((volatile float *) (rec + 5), (float) (int32_t) dg_match);
+                atomic_store_f32((volatile float *) (rec + 6), (float) (int32_t) (kernel_env->shire_mask & 0xFFFF));  // (terr was always 0)
+                atomic_store_f32((volatile float *) (rec + 7), (float) is_hart0);
+                atomic_store_f32((volatile float *) (rec + 8), (float) num_threads);
+                atomic_store_f32((volatile float *) (rec + 9), (float) offs[E]);
+                atomic_store_f32((volatile float *) (rec + 10), (float) pairs[0]);
+                atomic_store_f32((volatile float *) (rec + 11), (float) active[0]);
+                atomic_store_f32((volatile float *) (rec + 12), (float) n_active);
+                atomic_store_f32((volatile float *) (rec + 13), (float) (int32_t) rows_u);
+                atomic_store_f32((volatile float *) (rec + 14), (float) (int32_t) (params->shire_mask & 0xFFFF));  // was dg_np (always 1)
+                atomic_store_f32((volatile float *) (rec + 15), (float) (int32_t) (get_hart_id() & 0xFFFF));
+            }
+        })
+    }
+#endif
+    if (!scp_ok)
     for (int64_t u = thread_id; u < total_units; u += num_threads) {
         const int32_t e     = active[u / row_blocks];
         const int64_t rb    = u % row_blocks;
