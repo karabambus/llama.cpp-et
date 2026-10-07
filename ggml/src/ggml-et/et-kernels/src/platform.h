@@ -307,11 +307,18 @@ static inline uint64_t __attribute__((always_inline)) et_barrier_global(uint64_t
         uint32_t prev = et_global_add_w(et_global_barrier_count, 1);
 
         if (prev == num_active_shires - 1) {
-            // Last shire. reset counter and fan out FCC to all shires
+            // Last shire. reset counter and fan out FCC to the participating shires
             last_global = 1;
             et_global_swap_w(et_global_barrier_count, 0);
 
-            for (uint64_t sid = 0; sid < 33; sid++) {
+            // Credit only the shires that take part (shires 0..n-1, the same
+            // contiguous-mask assumption as get_num_threads()). Never credit a
+            // shire outside the launch: the master shire (SHIRE_MASTER) runs the
+            // Master Minion firmware, whose kernel workers wait on FCC credits
+            // for kernel launches, and unlike compute shires it does not clear
+            // its FCCs after a kernel, so a stray credit stays and
+            // desynchronises the launch handshake.
+            for (uint64_t sid = 0; sid < num_active_shires; sid++) {
                 // Send FCC 1 credit to all harts (both threads) in each shire
                 fcc_send(sid, THREAD_0, FCC_1, 0xFFFFFFFF);
                 fcc_send(sid, THREAD_1, FCC_1, 0xFFFFFFFF);
