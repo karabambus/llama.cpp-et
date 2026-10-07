@@ -797,6 +797,42 @@ static bool ggml_et_moe_sum_match(const ggml_cgraph * cgraph, int i, int * last_
     return true;
 }
 
+// moe_sum_f32 reads ex [E,S,N] and w [1,S,N] (and res [E,N]) while it writes out [E,N]. Within one launch each output
+// line is read and then written by one hart at the same (e,t) only, so an overlap is safe for exactly two layouts:
+// out on slot 0 of ex with ex's token stride, and res == out with out's row stride. In the unfused schedule ex and w
+// are dead after the MUL, so the graph allocator may legally place the ADD chain's output anywhere over them.
+static bool et_bytes_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a);
+    const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+static bool et_moe_sum_mem_ok(const ggml_tensor * mul, const ggml_tensor * out, const ggml_tensor * res) {
+    const ggml_tensor * ex = mul->src[0];
+    const ggml_tensor * w  = mul->src[1];
+    if (et_bytes_overlap(out, ex) && !(out->data == ex->data && out->nb[1] == ex->nb[2])) {
+        return false;
+    }
+    if (et_bytes_overlap(out, w)) {
+        return false;
+    }
+    if (res && et_bytes_overlap(out, res) && !(out->data == res->data && out->nb[1] == res->nb[1])) {
+        return false;
+    }
+    return true;
+}
+
+static void et_moe_sum_log_skip(const ggml_tensor * mul, const ggml_tensor * out, int n_fused, int n_skipped) {
+    if (n_skipped > 4) {
+        return;
+    }
+    const ggml_tensor * ex = mul->src[0];
+    const ggml_tensor * w  = mul->src[1];
+    GGML_LOG_WARN("ET: moe_sum fusion skipped, output overlaps an input: out %p+%zu ex %p+%zu w %p+%zu "
+                  "(fused %d, skipped %d so far)\n",
+                  out->data, ggml_nbytes(out), ex->data, ggml_nbytes(ex), w->data, ggml_nbytes(w), n_fused, n_skipped);
+}
+
 // ---- T2 launch-count fusions ------------------------------------------------------------------------------------
 
 static int et_next_compute(const ggml_cgraph * cgraph, int j) {
@@ -1248,22 +1284,32 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
         {
             static const bool no_moe_sum = [] { const char * e = getenv("GGML_ET_NO_MOE_SUM"); return e && *e && strcmp(e, "0") != 0; }();
             int last_idx = -1;
+            static int n_moe_sum_fused = 0, n_moe_sum_skipped = 0;
             if (!no_moe_sum && ggml_et_moe_sum_match(cgraph, i, &last_idx)) {
                 const ggml_tensor * res     = nullptr;
-                const int           res_idx = ggml_et_moe_sum_residual(cgraph, last_idx, &res);  // T2 fusion 4b
+                int                 res_idx = ggml_et_moe_sum_residual(cgraph, last_idx, &res);  // T2 fusion 4b
                 const ggml_tensor * sum_dst = cgraph->nodes[last_idx];
-                const ggml_tensor * out     = res_idx >= 0 ? cgraph->nodes[res_idx] : sum_dst;
-                if (et_fcheck_enabled()) {
-                    std::vector<const ggml_tensor *> ins = { node->src[0], node->src[1] };
-                    if (res) { ins.push_back(res); }
-                    et_fcheck_run(dev_ctx, res ? "moe_sum+res" : "moe_sum", ins, { out },
-                                  [&] { return ggml_et_op_moe_sum(dev_ctx, node, out, res); },
-                                  [&] { bool ok = ggml_et_op_moe_sum(dev_ctx, node, sum_dst, nullptr); if (res_idx >= 0) { ok = ggml_et_op_add(dev_ctx, out) && ok; } return ok; });
-                } else {
-                    ggml_et_op_moe_sum(dev_ctx, node, out, res);
+                if (res_idx >= 0 && !et_moe_sum_mem_ok(node, cgraph->nodes[res_idx], res)) {
+                    res_idx = -1;  // the residual ADD then runs as its own node
+                    res     = nullptr;
                 }
-                i = res_idx >= 0 ? res_idx : last_idx;  // MUL + views + ADD chain (+ residual ADD) done
-                continue;
+                const ggml_tensor * out = res_idx >= 0 ? cgraph->nodes[res_idx] : sum_dst;
+                if (!et_moe_sum_mem_ok(node, out, res)) {
+                    et_moe_sum_log_skip(node, out, n_moe_sum_fused, ++n_moe_sum_skipped);  // MUL + ADDs run unfused
+                } else {
+                    ++n_moe_sum_fused;
+                    if (et_fcheck_enabled()) {
+                        std::vector<const ggml_tensor *> ins = { node->src[0], node->src[1] };
+                        if (res) { ins.push_back(res); }
+                        et_fcheck_run(dev_ctx, res ? "moe_sum+res" : "moe_sum", ins, { out },
+                                      [&] { return ggml_et_op_moe_sum(dev_ctx, node, out, res); },
+                                      [&] { bool ok = ggml_et_op_moe_sum(dev_ctx, node, sum_dst, nullptr); if (res_idx >= 0) { ok = ggml_et_op_add(dev_ctx, out) && ok; } return ok; });
+                    } else {
+                        ggml_et_op_moe_sum(dev_ctx, node, out, res);
+                    }
+                    i = res_idx >= 0 ? res_idx : last_idx;  // MUL + views + ADD chain (+ residual ADD) done
+                    continue;
+                }
             }
         }
         {
