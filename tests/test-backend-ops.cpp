@@ -8015,6 +8015,8 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+static void add_et_env_rms_norm_cases(std::vector<std::unique_ptr<test_case>> & test_cases, bool with_fused);
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -8969,6 +8971,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    add_et_env_rms_norm_cases(test_cases, true);
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1, 2048, 8192, {1,  1}, {1, 1}));
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1, 64, 256, {1,  1}, {1, 1}));
@@ -9711,8 +9714,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 // Test cases for performance evaluation: should be representative of real-world use cases
+// ET: extra RMS_NORM shapes from the environment — GGML_ET_TBO_RMS_SHAPES="ne0,rows;..."
+// Rows below 64 take the intra-row path of rms_norm_f32 / rms_norm_mul_f32 (per-shire L2SCP
+// reduction + shire barrier). In perf mode the RMS_NORM node repeats with no host copies in
+// between, which separates a kernel hang from the copy path that precedes it in a model.
+static void add_et_env_rms_norm_cases(std::vector<std::unique_ptr<test_case>> & test_cases, bool with_fused) {
+    const char * shapes_env = getenv("GGML_ET_TBO_RMS_SHAPES");
+    if (!shapes_env) {
+        return;
+    }
+    std::string shapes(shapes_env);
+    size_t pos = 0;
+    while (pos < shapes.size()) {
+        size_t end = shapes.find(';', pos);
+        if (end == std::string::npos) { end = shapes.size(); }
+        std::string item = shapes.substr(pos, end - pos);
+        pos = end + 1;
+        long long ne0 = 0, rows = 0;
+        if (sscanf(item.c_str(), "%lld,%lld", &ne0, &rows) == 2 && ne0 > 0 && rows > 0) {
+            test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { ne0, rows, 1, 1 }, false, 1e-6f, false));
+            if (with_fused) {
+                test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { ne0, rows, 1, 1 }, 1e-6f, false));
+            }
+        }
+    }
+}
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    add_et_env_rms_norm_cases(test_cases, false);
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
