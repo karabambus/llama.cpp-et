@@ -257,23 +257,40 @@ static inline float et_cosf(float x) {
 // FP16 <-> FP32 Conversion Functions
 //******************************************************************************
 
-// Convert FP16 (IEEE 754 half precision) to FP32 (single precision)
-// Uses ET hardware FCVT.PS.F16 instruction for accurate conversion
+// Convert FP16 (IEEE 754 half precision) to FP32 (single precision), exactly, in integer code.
+//
+// Not FCVT.PS.F16: that instruction flushes subnormal halves (|x| < 2^-14) to zero, and quantised block
+// scales reach that range. A Q8_0 scale is max|w| / 127, so blocks of small weights carry subnormal scales
+// (Qwen3.6-35B-A3B shared-expert tensors: 0.5 % of blocks, up to 3.5 % in one tensor); flushing them zeroes
+// whole weight blocks. Callers in vector code broadcast fp16_to_fp32_bits() with FBCX.PS instead of converting
+// in the lanes. Normal, zero, infinity and NaN inputs convert bit-identically to the hardware instruction.
+static inline uint32_t fp16_to_fp32_bits(uint16_t h) {
+    const uint32_t sign = (uint32_t) (h & 0x8000u) << 16;
+    uint32_t       exp  = (h >> 10) & 0x1Fu;
+    uint32_t       mant = h & 0x3FFu;
+    if (exp == 0x1Fu) {                              // inf / nan
+        return sign | 0x7F800000u | (mant << 13);
+    }
+    if (exp == 0) {
+        if (mant == 0) {                             // +-0
+            return sign;
+        }
+        exp = 127 - 15 + 1;                          // subnormal: normalise
+        while ((mant & 0x400u) == 0) {
+            mant <<= 1;
+            exp--;
+        }
+        mant &= 0x3FFu;
+        return sign | (exp << 23) | (mant << 13);
+    }
+    return sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+}
+
 static inline float fp16_to_fp32(uint16_t h) {
-    float         result;
-    unsigned long temp;
-    uint32_t      raw = (uint32_t) h;
-
-    __asm__ volatile(
-        "mova.x.m  %[temp]              \n\t"    // Save current mask state
-        "mov.m.x   m0, x0, 1            \n\t"    // Set mask register m0 to enable element 0
-        "fbcx.ps   %[result], %[raw]    \n\t"    // Broadcast raw FP16 bits into vector register
-        "fcvt.ps.f16 %[result], %[result] \n\t"  // Convert FP16 to FP32
-        "mova.m.x  %[temp]              \n\t"    // Restore mask state
-        : [temp] "=&r"(temp), [result] "=&f"(result)
-        : [raw] "r"(raw));
-
-    return result;
+    const uint32_t bits = fp16_to_fp32_bits(h);
+    float          out;
+    __builtin_memcpy(&out, &bits, 4);
+    return out;
 }
 
 // Convert FP32 (single precision) to FP16 (IEEE 754 half precision)
