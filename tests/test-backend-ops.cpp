@@ -10507,6 +10507,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ET: GGML_ET_TBO_UNARY_TAIL=1 adds unary cases whose element count is not a multiple of the 8-lane vector or of
+    // the 16-float cache line: single elements (the shared-expert gate of a MoE layer at batch 1 is [1,1]), one-float
+    // rows over many rows, and short odd rows, each contiguous (v=0) and as a strided view (v=1).
+    if (getenv("GGML_ET_TBO_UNARY_TAIL")) {
+        for (int op = 0; op < GGML_UNARY_OP_COUNT; op++) {
+            for (int v : {0, 1}) {
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, {  1,   1, 1, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, {  1, 512, 1, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, {  7,   1, 1, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, {  9,   3, 1, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, { 17,   5, 2, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, { 33,  33, 1, 1 }, v));
+            }
+        }
+    }
+
     // ET: GGML_ET_TBO_QWEN35=1 adds the linear-attention ops at Qwen3.5-family shapes (16 key heads x 128, 32 or 48
     // value heads, conv kernel 4 over 2*16*128 + Hv*128 channels) for 1, 64 and 512 tokens.
     if (getenv("GGML_ET_TBO_QWEN35")) {
