@@ -1012,11 +1012,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
 
     } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
                node->src[1]->type == GGML_TYPE_F32 && node->ne[0] % 16 == 0 && node->src[0]->ne[0] % 16 == 0 &&
-               node->src[0]->ne[1] % 16 == 0 && node->src[1]->ne[0] != 1 &&  // GEMV is faster with the generic path
-               node->src[0]->ne[1] >= 64) {
-        // Fewer than four M-tiles go to the generic kernel: the engine kernel's K-split ring reduce hung twice on the
-        // card at [5120 x 48] x [5120 x 512] under host run-ahead (home box r096, r101) and never under serialised
-        // launches; such matmuls are too small for the engine to pay anyway.
+               node->src[0]->ne[1] % 16 == 0 && node->src[1]->ne[0] != 1) {  // GEMV is faster with the generic path
 
         kernel_name    = "mul_mat_f32_matrix_engine";
         src0_type_name = "F32";
