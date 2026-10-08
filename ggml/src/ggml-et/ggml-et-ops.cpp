@@ -994,6 +994,11 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
         kernel_name    = "mul_mat_Q8_0";  // N < 47, or M % 16 != 0 or K % 32 != 0
         src0_type_name = "Q8_0";
 
+    } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_PQ2_0 &&
+               node->src[1]->type == GGML_TYPE_F32) {
+        kernel_name    = "mul_mat_PQ2_0";  // vector-lane unpack, every N; no matrix-engine variant yet
+        src0_type_name = "PQ2_0";
+
     } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F16 &&
                node->src[1]->type == GGML_TYPE_F16 && node->ne[0] % 16 == 0 && node->src[0]->ne[0] % 16 == 0 &&
                node->src[0]->ne[1] % 16 == 0 && node->src[1]->ne[0] != 1) {
@@ -1052,7 +1057,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
     }
 
     bool kernel_result;
-    if (node->src[0]->type == GGML_TYPE_Q8_0 ||
+    if (node->src[0]->type == GGML_TYPE_Q8_0 || node->src[0]->type == GGML_TYPE_PQ2_0 ||
         (node->src[0]->type == GGML_TYPE_Q4_0 && strcmp(kernel_name, "mul_mat_Q4_0") == 0)) {
         // Q8_0 kernel always takes the extended struct. bias.data is non-NULL
         // only on the fused path; otherwise the kernel skips the add entirely.

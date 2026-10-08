@@ -1813,6 +1813,24 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
 
                 supported = src0_first_dim_contiguous && src1_first_dim_contiguous && dst_first_dim_contiguous &&
                             dst_properly_ordered;
+            } else if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_PQ2_0 && op->src[1] &&
+                       op->src[1]->type == GGML_TYPE_F32) {
+                // PQ2_0 (Prism ternary, group 128): the row-dot kernel walks whole 128-element blocks, so K must be a
+                // multiple of the block; the other constraints are those of the Q8_0 path below.
+                bool src0_first_dim_contiguous = (op->src[0]->nb[0] == ggml_type_size(op->src[0]->type));
+                bool src1_first_dim_contiguous = (op->src[1]->nb[0] == ggml_type_size(op->src[1]->type));
+                bool dst_first_dim_contiguous  = (op->nb[0] == sizeof(float));
+
+                bool dst_properly_ordered = true;
+                for (int d = 0; d < 3; d++) {
+                    if (op->ne[d] > 1 && op->ne[d + 1] > 1 && op->nb[d] > op->nb[d + 1]) {
+                        dst_properly_ordered = false;
+                    }
+                }
+
+                supported = op->src[0]->ne[0] % ggml_blck_size(op->src[0]->type) == 0 && src0_first_dim_contiguous &&
+                            src1_first_dim_contiguous && dst_first_dim_contiguous && dst_properly_ordered;
+
             } else if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[1] &&
                        op->src[1]->type == GGML_TYPE_F32) {
                 // Keep the existing quantized path constraints separate from the
