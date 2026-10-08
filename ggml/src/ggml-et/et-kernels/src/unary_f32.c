@@ -21,56 +21,68 @@ struct ggml_et_unary_params {
 };
 
 //******************************************************************************
-// Vectorized 8-wide block operations
-// All process exactly 8 floats per call using ET vector instructions.
-// ne0 is guaranteed % 16 == 0, so the inner loop always calls with i0 += 8.
+// Vectorized 8-wide block operations, any element count.
+//
+// flw.ps / fsw.ps are gated by the lane mask m0. Full 8-float blocks run with
+// all lanes on; a tail of 1..7 floats runs the same block once more with only
+// the low lanes on, so no load or store touches memory past the element range
+// (the range a hart owns ends at a cache line or at the tensor's last element).
+// Same idiom as el_map_f32.c. m0 is saved and restored around every call.
 //******************************************************************************
+
+#define ET_UNARY_VEC(n, body, ...)                                    \
+    do {                                                              \
+        const int32_t vec_end_ = ((n) / 8) * 8;                       \
+        unsigned long saved_m0_;                                      \
+        __asm__ volatile("mova.x.m %0" : "=r"(saved_m0_));            \
+        __asm__ volatile("mov.m.x m0, x0, 0xFF");                     \
+        int32_t i = 0;                                                \
+        for (; i < vec_end_; i += 8) {                                \
+            __asm__ volatile(body : : __VA_ARGS__);                   \
+        }                                                             \
+        if (i < (n)) {                                                \
+            const unsigned long tail_m0_ = (1ul << ((n) - i)) - 1;    \
+            __asm__ volatile("mov.m.x m0, %0, 0" : : "r"(tail_m0_));  \
+            __asm__ volatile(body : : __VA_ARGS__);                   \
+        }                                                             \
+        __asm__ volatile("mova.m.x %0" : : "r"(saved_m0_));           \
+    } while (0)
 
 // NEG: dst = -x  (zero - x)
 static inline void vec_neg(float * dst, const float * src, int32_t n) {
     float zero = 0.0f;
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "fbc.ps  f10, %[z]\n"
-            "flw.ps  f11, %[x]\n"
-            "fsub.ps f12, f10, f11\n"
-            "fsw.ps  f12, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [z] "m"(zero)
-            : "f10", "f11", "f12");
-    }
+    ET_UNARY_VEC(n,
+        "fbc.ps  f10, %[z]\n"
+        "flw.ps  f11, 0(%[x])\n"
+        "fsub.ps f12, f10, f11\n"
+        "fsw.ps  f12, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [z] "m"(zero)
+        : "f10", "f11", "f12", "memory");
 }
 
-// ABS: dst = |x|  (negate negative values: abs = x * sgn, or max(x, -x))
-// Uses: negate then fmax.ps
+// ABS: dst = |x| = max(x, -x)
 static inline void vec_abs(float * dst, const float * src, int32_t n) {
     float zero = 0.0f;
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "fbc.ps  f10, %[z]\n"
-            "flw.ps  f11, %[x]\n"
-            "fsub.ps f12, f10, f11\n"  // f12 = -x
-            "fmax.ps f13, f11, f12\n"  // f13 = max(x, -x) = |x|
-            "fsw.ps  f13, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [z] "m"(zero)
-            : "f10", "f11", "f12", "f13");
-    }
+    ET_UNARY_VEC(n,
+        "fbc.ps  f10, %[z]\n"
+        "flw.ps  f11, 0(%[x])\n"
+        "fsub.ps f12, f10, f11\n"  // f12 = -x
+        "fmax.ps f13, f11, f12\n"  // f13 = max(x, -x) = |x|
+        "fsw.ps  f13, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [z] "m"(zero)
+        : "f10", "f11", "f12", "f13", "memory");
 }
 
 // RELU: dst = max(0, x)
 static inline void vec_relu(float * dst, const float * src, int32_t n) {
     float zero = 0.0f;
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "fbc.ps  f10, %[z]\n"
-            "flw.ps  f11, %[x]\n"
-            "fmax.ps f12, f10, f11\n"  // max(0, x)
-            "fsw.ps  f12, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [z] "m"(zero)
-            : "f10", "f11", "f12");
-    }
+    ET_UNARY_VEC(n,
+        "fbc.ps  f10, %[z]\n"
+        "flw.ps  f11, 0(%[x])\n"
+        "fmax.ps f12, f10, f11\n"  // max(0, x)
+        "fsw.ps  f12, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [z] "m"(zero)
+        : "f10", "f11", "f12", "memory");
 }
 
 // STEP: dst = x > 0 ? 1 : 0  (clamp to [0,1] via max then min-ish, or use sign bit)
@@ -93,36 +105,30 @@ static inline void vec_sgn(float * dst, const float * src, int32_t n) {
 // fexp.ps computes 2^x, so feed x * log2(e)
 static inline void vec_exp(float * dst, const float * src, int32_t n) {
     float log2e = 1.4426950408889634f;
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f11, %[l2e]\n"
-            "fmul.ps f12, f10, f11\n"  // x * log2(e)
-            "fexp.ps f13, f12\n"       // 2^(x*log2e) = exp(x)
-            "fsw.ps  f13, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [l2e] "m"(log2e)
-            : "f10", "f11", "f12", "f13");
-    }
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f11, %[l2e]\n"
+        "fmul.ps f12, f10, f11\n"  // x * log2(e)
+        "fexp.ps f13, f12\n"       // 2^(x*log2e) = exp(x)
+        "fsw.ps  f13, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [l2e] "m"(log2e)
+        : "f10", "f11", "f12", "f13", "memory");
 }
 
 // EXPM1: dst = exp(x) - 1
 static inline void vec_expm1(float * dst, const float * src, int32_t n) {
     float log2e = 1.4426950408889634f;
     float one   = 1.0f;
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f11, %[l2e]\n"
-            "fbc.ps  f14, %[one]\n"
-            "fmul.ps f12, f10, f11\n"  // x * log2(e)
-            "fexp.ps f13, f12\n"       // exp(x)
-            "fsub.ps f13, f13, f14\n"  // exp(x) - 1
-            "fsw.ps  f13, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [l2e] "m"(log2e), [one] "m"(one)
-            : "f10", "f11", "f12", "f13", "f14");
-    }
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f11, %[l2e]\n"
+        "fbc.ps  f14, %[one]\n"
+        "fmul.ps f12, f10, f11\n"  // x * log2(e)
+        "fexp.ps f13, f12\n"       // exp(x)
+        "fsub.ps f13, f13, f14\n"  // exp(x) - 1
+        "fsw.ps  f13, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [l2e] "m"(log2e), [one] "m"(one)
+        : "f10", "f11", "f12", "f13", "f14", "memory");
 }
 
 // SIGMOID: dst = 1 / (1 + exp(-x))
@@ -131,174 +137,130 @@ static inline void vec_sigmoid(float * dst, const float * src, int32_t n) {
     float zero  = 0.0f;
     float one   = 1.0f;
     float log2e = 1.4426950408889634f;
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f20, %[z]\n"
-            "fbc.ps  f21, %[one]\n"
-            "fbc.ps  f22, %[l2e]\n"
-            "fsub.ps f12, f20, f10\n"  // -x
-            "fmul.ps f13, f12, f22\n"  // -x * log2(e)
-            "fexp.ps f14, f13\n"       // exp(-x)
-            "fadd.ps f15, f14, f21\n"  // 1 + exp(-x)
-            "frcp.ps f16, f15\n"       // 1 / (1 + exp(-x))
-            "fsw.ps  f16, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [z] "m"(zero), [one] "m"(one), [l2e] "m"(log2e)
-            : "f10", "f12", "f13", "f14", "f15", "f16", "f20", "f21", "f22");
-    }
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f20, %[z]\n"
+        "fbc.ps  f21, %[one]\n"
+        "fbc.ps  f22, %[l2e]\n"
+        "fsub.ps f12, f20, f10\n"  // -x
+        "fmul.ps f13, f12, f22\n"  // -x * log2(e)
+        "fexp.ps f14, f13\n"       // exp(-x)
+        "fadd.ps f15, f14, f21\n"  // 1 + exp(-x)
+        "frcp.ps f16, f15\n"       // 1 / (1 + exp(-x))
+        "fsw.ps  f16, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [z] "m"(zero), [one] "m"(one), [l2e] "m"(log2e)
+        : "f10", "f12", "f13", "f14", "f15", "f16", "f20", "f21", "f22", "memory");
 }
 
-// TANH: dst = (exp(2x) - 1) / (exp(2x) + 1)
-// Rewrite as: 1 - 2/(exp(2x) + 1) to use frcp.ps
-// Or equivalently: 2*sigmoid(2x) - 1
+// TANH: dst = (exp(2x) - 1) / (exp(2x) + 1) = 1 - 2/(exp(2x) + 1), using frcp.ps
 static inline void vec_tanh(float * dst, const float * src, int32_t n) {
     float one       = 1.0f;
     float two       = 2.0f;
     float two_log2e = 2.8853900817779268f;  // 2 * log2(e)
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f20, %[one]\n"
-            "fbc.ps  f21, %[two]\n"
-            "fbc.ps  f22, %[tl2e]\n"
-            // exp(2x) via fexp.ps: feed 2x * log2(e)
-            "fmul.ps f12, f10, f22\n"  // 2x * log2(e)
-            "fexp.ps f13, f12\n"       // exp(2x)
-            "fadd.ps f14, f13, f20\n"  // exp(2x) + 1
-            "frcp.ps f15, f14\n"       // 1 / (exp(2x) + 1)
-            "fmul.ps f16, f21, f15\n"  // 2 / (exp(2x) + 1)
-            "fsub.ps f17, f20, f16\n"  // 1 - 2/(exp(2x)+1) = tanh(x)
-            "fsw.ps  f17, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [one] "m"(one), [two] "m"(two), [tl2e] "m"(two_log2e)
-            : "f10", "f12", "f13", "f14", "f15", "f16", "f17", "f20", "f21", "f22");
-    }
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f20, %[one]\n"
+        "fbc.ps  f21, %[two]\n"
+        "fbc.ps  f22, %[tl2e]\n"
+        "fmul.ps f12, f10, f22\n"  // 2x * log2(e)
+        "fexp.ps f13, f12\n"       // exp(2x)
+        "fadd.ps f14, f13, f20\n"  // exp(2x) + 1
+        "frcp.ps f15, f14\n"       // 1 / (exp(2x) + 1)
+        "fmul.ps f16, f21, f15\n"  // 2 / (exp(2x) + 1)
+        "fsub.ps f17, f20, f16\n"  // 1 - 2/(exp(2x)+1) = tanh(x)
+        "fsw.ps  f17, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [one] "m"(one), [two] "m"(two), [tl2e] "m"(two_log2e)
+        : "f10", "f12", "f13", "f14", "f15", "f16", "f17", "f20", "f21", "f22", "memory");
 }
 
 // SILU: dst = x / (1 + exp(-x)) = x * sigmoid(x)
-// Copied from SwiGLU pattern but without the gate multiply
 static inline void vec_silu(float * dst, const float * src, int32_t n) {
     float zero  = 0.0f;
     float one   = 1.0f;
     float log2e = 1.4426950408889634f;
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f20, %[z]\n"
-            "fbc.ps  f21, %[one]\n"
-            "fbc.ps  f22, %[l2e]\n"
-            "fsub.ps f12, f20, f10\n"  // -x
-            "fmul.ps f13, f12, f22\n"  // -x * log2(e)
-            "fexp.ps f14, f13\n"       // exp(-x)
-            "fadd.ps f15, f14, f21\n"  // 1 + exp(-x)
-            "frcp.ps f16, f15\n"       // 1 / (1 + exp(-x))
-            "fmul.ps f17, f10, f16\n"  // x * sigmoid(x)
-            "fsw.ps  f17, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [z] "m"(zero), [one] "m"(one), [l2e] "m"(log2e)
-            : "f10", "f12", "f13", "f14", "f15", "f16", "f17", "f20", "f21", "f22");
-    }
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f20, %[z]\n"
+        "fbc.ps  f21, %[one]\n"
+        "fbc.ps  f22, %[l2e]\n"
+        "fsub.ps f12, f20, f10\n"  // -x
+        "fmul.ps f13, f12, f22\n"  // -x * log2(e)
+        "fexp.ps f14, f13\n"       // exp(-x)
+        "fadd.ps f15, f14, f21\n"  // 1 + exp(-x)
+        "frcp.ps f16, f15\n"       // 1 / (1 + exp(-x))
+        "fmul.ps f17, f10, f16\n"  // x * sigmoid(x)
+        "fsw.ps  f17, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [z] "m"(zero), [one] "m"(one), [l2e] "m"(log2e)
+        : "f10", "f12", "f13", "f14", "f15", "f16", "f17", "f20", "f21", "f22", "memory");
 }
 
 // ELU: dst = x > 0 ? x : exp(x) - 1
-// Vector: compute exp(x)-1 for all lanes, then fmax(x, exp(x)-1)
-// Works because for x>0: x > exp(x)-1 is not always true...
-// Actually for x>0, exp(x)-1 > x (since exp(x) > x+1 for x>0).
-// So fmax won't work. Use: compute both, blend via comparison.
-// Simpler: exp(x)-1 for all, then for x>0 overwrite with x.
-// Without per-lane masking, do scalar for ELU.
+// No per-lane blend: store exp(x)-1 for every lane, then overwrite the positive lanes with x.
 static inline void vec_elu(float * dst, const float * src, int32_t n) {
     float log2e = 1.4426950408889634f;
     float one   = 1.0f;
-    // Compute exp(x)-1 vectorized, then fixup positive elements
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f11, %[l2e]\n"
-            "fbc.ps  f14, %[one]\n"
-            "fmul.ps f12, f10, f11\n"  // x * log2(e)
-            "fexp.ps f13, f12\n"       // exp(x)
-            "fsub.ps f13, f13, f14\n"  // exp(x) - 1
-            "fsw.ps  f13, %[r]\n"      // store exp(x)-1
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [l2e] "m"(log2e), [one] "m"(one)
-            : "f10", "f11", "f12", "f13", "f14");
-        // Fixup: for x > 0, dst = x
-        for (int32_t j = 0; j < 8 && (i + j) < n; j++) {
-            if (src[i + j] > 0.0f) {
-                dst[i + j] = src[i + j];
-            }
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f11, %[l2e]\n"
+        "fbc.ps  f14, %[one]\n"
+        "fmul.ps f12, f10, f11\n"  // x * log2(e)
+        "fexp.ps f13, f12\n"       // exp(x)
+        "fsub.ps f13, f13, f14\n"  // exp(x) - 1
+        "fsw.ps  f13, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [l2e] "m"(log2e), [one] "m"(one)
+        : "f10", "f11", "f12", "f13", "f14", "memory");
+    for (int32_t j = 0; j < n; j++) {
+        if (src[j] > 0.0f) {
+            dst[j] = src[j];
         }
     }
 }
 
-// GELU: 0.5*x*(1 + tanh(sqrt(2/pi) * x * (1 + 0.044715*x^2)))
-// Reformulated as: x * (1 - 1/(exp(2z)+1)) where z = sqrt(2/pi)*x*(1+0.044715*x^2)
-// NaN-safe: avoids inf*0.  Copied from GeGLU block pattern.
+// GELU: 0.5*x*(1 + tanh(z)), z = sqrt(2/pi)*x*(1 + 0.044715*x^2)
+// 0.5*(1 + tanh(z)) = 1 - 1/(exp(2z)+1), so gelu = x * (1 - 1/(exp(2z)+1)); NaN-safe (no inf*0).
 static inline void vec_gelu(float * dst, const float * src, int32_t n) {
     float one       = 1.0f;
-    float half      = 0.5f;
     float coef_a    = 0.044715f;
     float sqrt2pi   = 0.79788456080286535587989211986876f;
     float two_log2e = 2.8853900817779268f;  // 2 * log2(e)
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f20, %[one]\n"
-            "fbc.ps  f21, %[half]\n"
-            "fbc.ps  f22, %[coef]\n"
-            "fbc.ps  f23, %[s2pi]\n"
-            "fbc.ps  f24, %[tl2e]\n"
-            // inner = 1 + 0.044715 * x^2
-            "fmul.ps f12, f10, f10\n"        // x^2
-            "fmadd.ps f13, f22, f12, f20\n"  // 1 + 0.044715*x^2
-            // z = sqrt(2/pi) * x * inner
-            "fmul.ps f14, f23, f10\n"  // sqrt(2/pi) * x
-            "fmul.ps f14, f14, f13\n"  // z
-            // exp(2z) via fexp.ps
-            "fmul.ps f15, f14, f24\n"  // 2z * log2(e)
-            "fexp.ps f15, f15\n"       // exp(2z)
-            // gelu(x) = 0.5 * x * (1 + tanh(z))
-            //         = 0.5 * x * (1 + 1 - 2/(exp(2z)+1))
-            //         = x * (1 - 1/(exp(2z)+1))  ... wait, that's tanh-based
-            // Actually: 0.5*x*(1 + tanh) = 0.5*x*(1 + 1 - 2/(e2z+1)) = x*(1 - 1/(e2z+1))
-            // Hmm: tanh = (e2z-1)/(e2z+1) = 1 - 2/(e2z+1)
-            // So 0.5*(1+tanh) = 0.5*(2 - 2/(e2z+1)) = 1 - 1/(e2z+1)
-            // gelu = x * (1 - 1/(e2z+1))  -- matches GeGLU pattern exactly
-            "fadd.ps f16, f15, f20\n"  // exp(2z) + 1
-            "frcp.ps f16, f16\n"       // 1/(exp(2z) + 1)
-            "fsub.ps f16, f20, f16\n"  // 1 - 1/(exp(2z)+1) = sigmoid(2z)
-            "fmul.ps f17, f10, f16\n"  // x * sigmoid(2z) = gelu(x)
-            "fsw.ps  f17, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [one] "m"(one), [half] "m"(half), [coef] "m"(coef_a),
-              [s2pi] "m"(sqrt2pi), [tl2e] "m"(two_log2e)
-            : "f10", "f12", "f13", "f14", "f15", "f16", "f17", "f20", "f21", "f22", "f23", "f24");
-    }
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f20, %[one]\n"
+        "fbc.ps  f22, %[coef]\n"
+        "fbc.ps  f23, %[s2pi]\n"
+        "fbc.ps  f24, %[tl2e]\n"
+        "fmul.ps f12, f10, f10\n"        // x^2
+        "fmadd.ps f13, f22, f12, f20\n"  // 1 + 0.044715*x^2
+        "fmul.ps f14, f23, f10\n"        // sqrt(2/pi) * x
+        "fmul.ps f14, f14, f13\n"        // z
+        "fmul.ps f15, f14, f24\n"        // 2z * log2(e)
+        "fexp.ps f15, f15\n"             // exp(2z)
+        "fadd.ps f16, f15, f20\n"        // exp(2z) + 1
+        "frcp.ps f16, f16\n"             // 1/(exp(2z) + 1)
+        "fsub.ps f16, f20, f16\n"        // 1 - 1/(exp(2z)+1)
+        "fmul.ps f17, f10, f16\n"        // gelu(x)
+        "fsw.ps  f17, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [one] "m"(one), [coef] "m"(coef_a), [s2pi] "m"(sqrt2pi),
+        [tl2e] "m"(two_log2e)
+        : "f10", "f12", "f13", "f14", "f15", "f16", "f17", "f20", "f22", "f23", "f24", "memory");
 }
 
 // GELU_QUICK: x * sigmoid(1.702 * x) = x / (1 + exp(-1.702*x))
 static inline void vec_gelu_quick(float * dst, const float * src, int32_t n) {
     float one            = 1.0f;
-    // -1.702 * log2(e) precomputed
-    float neg_coef_log2e = -1.702f * 1.4426950408889634f;  // ~ -2.4542
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f20, %[one]\n"
-            "fbc.ps  f21, %[ncl2e]\n"
-            // exp(-1.702*x): feed -1.702*x*log2(e) = x * (-1.702*log2(e))
-            "fmul.ps f12, f10, f21\n"  // x * (-1.702*log2(e))
-            "fexp.ps f13, f12\n"       // exp(-1.702*x)
-            "fadd.ps f14, f13, f20\n"  // 1 + exp(-1.702*x)
-            "frcp.ps f15, f14\n"       // sigmoid(1.702*x)
-            "fmul.ps f16, f10, f15\n"  // x * sigmoid(1.702*x)
-            "fsw.ps  f16, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [one] "m"(one), [ncl2e] "m"(neg_coef_log2e)
-            : "f10", "f12", "f13", "f14", "f15", "f16", "f20", "f21");
-    }
+    float neg_coef_log2e = -1.702f * 1.4426950408889634f;  // -1.702 * log2(e)
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f20, %[one]\n"
+        "fbc.ps  f21, %[ncl2e]\n"
+        "fmul.ps f12, f10, f21\n"  // -1.702*x*log2(e)
+        "fexp.ps f13, f12\n"       // exp(-1.702*x)
+        "fadd.ps f14, f13, f20\n"  // 1 + exp(-1.702*x)
+        "frcp.ps f15, f14\n"       // sigmoid(1.702*x)
+        "fmul.ps f16, f10, f15\n"  // x * sigmoid(1.702*x)
+        "fsw.ps  f16, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [one] "m"(one), [ncl2e] "m"(neg_coef_log2e)
+        : "f10", "f12", "f13", "f14", "f15", "f16", "f20", "f21", "memory");
 }
 
 // GELU_ERF: 0.5 * x * (1 + erf(x / sqrt(2)))
@@ -326,28 +288,24 @@ static inline void vec_gelu_erf(float * dst, const float * src, int32_t n) {
 }
 
 // HARDSIGMOID: min(1, max(0, (x + 3) / 6))
-// Vector: compute (x+3)/6 via frcp, then clamp with fmax(0) and fmin(1)
 static inline void vec_hardsigmoid(float * dst, const float * src, int32_t n) {
     float zero  = 0.0f;
     float one   = 1.0f;
     float three = 3.0f;
     float inv6  = 0.16666666666666666f;  // 1/6
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f20, %[z]\n"
-            "fbc.ps  f21, %[one]\n"
-            "fbc.ps  f22, %[thr]\n"
-            "fbc.ps  f23, %[inv]\n"
-            "fadd.ps f12, f10, f22\n"  // x + 3
-            "fmul.ps f13, f12, f23\n"  // (x + 3) / 6
-            "fmax.ps f14, f13, f20\n"  // max(0, ...)
-            "fmin.ps f15, f14, f21\n"  // min(1, ...)
-            "fsw.ps  f15, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [z] "m"(zero), [one] "m"(one), [thr] "m"(three), [inv] "m"(inv6)
-            : "f10", "f12", "f13", "f14", "f15", "f20", "f21", "f22", "f23");
-    }
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f20, %[z]\n"
+        "fbc.ps  f21, %[one]\n"
+        "fbc.ps  f22, %[thr]\n"
+        "fbc.ps  f23, %[inv]\n"
+        "fadd.ps f12, f10, f22\n"  // x + 3
+        "fmul.ps f13, f12, f23\n"  // (x + 3) / 6
+        "fmax.ps f14, f13, f20\n"  // max(0, ...)
+        "fmin.ps f15, f14, f21\n"  // min(1, ...)
+        "fsw.ps  f15, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [z] "m"(zero), [one] "m"(one), [thr] "m"(three), [inv] "m"(inv6)
+        : "f10", "f12", "f13", "f14", "f15", "f20", "f21", "f22", "f23", "memory");
 }
 
 // HARDSWISH: x * hardsigmoid(x) = x * min(1, max(0, (x+3)/6))
@@ -356,23 +314,20 @@ static inline void vec_hardswish(float * dst, const float * src, int32_t n) {
     float one   = 1.0f;
     float three = 3.0f;
     float inv6  = 0.16666666666666666f;
-    for (int32_t i = 0; i < n; i += 8) {
-        __asm__ volatile(
-            "flw.ps  f10, %[x]\n"
-            "fbc.ps  f20, %[z]\n"
-            "fbc.ps  f21, %[one]\n"
-            "fbc.ps  f22, %[thr]\n"
-            "fbc.ps  f23, %[inv]\n"
-            "fadd.ps f12, f10, f22\n"  // x + 3
-            "fmul.ps f13, f12, f23\n"  // (x + 3) / 6
-            "fmax.ps f14, f13, f20\n"  // max(0, ...)
-            "fmin.ps f15, f14, f21\n"  // min(1, ...)
-            "fmul.ps f16, f10, f15\n"  // x * hardsigmoid(x)
-            "fsw.ps  f16, %[r]\n"
-            : [r] "=m"(*(float (*)[8]) & dst[i])
-            : [x] "m"(*(const float (*)[8]) & src[i]), [z] "m"(zero), [one] "m"(one), [thr] "m"(three), [inv] "m"(inv6)
-            : "f10", "f12", "f13", "f14", "f15", "f16", "f20", "f21", "f22", "f23");
-    }
+    ET_UNARY_VEC(n,
+        "flw.ps  f10, 0(%[x])\n"
+        "fbc.ps  f20, %[z]\n"
+        "fbc.ps  f21, %[one]\n"
+        "fbc.ps  f22, %[thr]\n"
+        "fbc.ps  f23, %[inv]\n"
+        "fadd.ps f12, f10, f22\n"  // x + 3
+        "fmul.ps f13, f12, f23\n"  // (x + 3) / 6
+        "fmax.ps f14, f13, f20\n"  // max(0, ...)
+        "fmin.ps f15, f14, f21\n"  // min(1, ...)
+        "fmul.ps f16, f10, f15\n"  // x * hardsigmoid(x)
+        "fsw.ps  f16, 0(%[r])\n",
+        [x] "r"(src + i), [r] "r"(dst + i), [z] "m"(zero), [one] "m"(one), [thr] "m"(three), [inv] "m"(inv6)
+        : "f10", "f12", "f13", "f14", "f15", "f16", "f20", "f21", "f22", "f23", "memory");
 }
 
 // FLOOR: largest integer <= x
