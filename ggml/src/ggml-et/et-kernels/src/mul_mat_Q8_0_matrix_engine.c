@@ -104,13 +104,12 @@ dequant_q8_0_panel(float *panel, const char *src0_batch,
     for (int j = 0; j < TILE_M; ++j) {
         const block_q8_0 *blk =
             (const block_q8_0 *)(src0_batch + (mb + j) * nb1_0) + kb_block;
-        uint32_t scale_raw = (uint32_t) blk->d;
+        const uint32_t scale_bits = fp16_to_fp32_bits(blk->d);   // integer conversion: subnormal scales (math_fp.h)
         const int8_t *qs = blk->qs;
         char *col = pbase + j * 4;           // column m=j of the panel
 
         __asm__ volatile(
-            "fbcx.ps     f3, %[sb]      \n\t"   // broadcast fp16 scale bits
-            "fcvt.ps.f16 f3, f3         \n\t"   // -> d in all 8 lanes (fp32)
+            "fbcx.ps     f3, %[sb]      \n\t"   // broadcast d (fp32 bits) to all 8 lanes
 
             "fgb.ps      f4, f2(%[qs0]) \n\t"   // gather qs[0..7], sign-extend
             "fcvt.ps.pw  f5, f4, rne    \n\t"
@@ -132,7 +131,7 @@ dequant_q8_0_panel(float *panel, const char *src0_batch,
             "fmul.ps     f5, f5, f3     \n\t"
             "fscw.ps     f5, f1(%[c24]) \n\t"   // k=24..31 -> lines 24..31
             :
-            : [sb] "r"(scale_raw),
+            : [sb] "r"(scale_bits),
               [qs0] "r"(qs), [qs8] "r"(qs + 8),
               [qs16] "r"(qs + 16), [qs24] "r"(qs + 24),
               [c0] "r"(col), [c8] "r"(col + 8 * 64),

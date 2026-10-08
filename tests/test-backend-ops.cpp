@@ -4237,6 +4237,21 @@ struct test_mul_mat : public test_case {
         return VARS_TO_STR10(type_a, type_b, m, n, k, bs, nr, per, k_v, o);
     }
 
+    // ET: GGML_ET_TBO_MM_RANGE=<r> draws the weight values from [-r, r] instead of [-1, 1], which puts the
+    // block scales (max|w| / 127 for Q8_0, max|w| / 8 for Q4_0) into the fp16 subnormal range (< 2^-14) that
+    // real models reach and the default range never does.
+    void initialize_tensors(ggml_context * ctx) override {
+        const char * range_env = getenv("GGML_ET_TBO_MM_RANGE");
+        const float  range     = range_env ? strtof(range_env, nullptr) : 0.0f;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (range > 0.0f && strcmp(ggml_get_name(t), "a") == 0) {
+                init_tensor_uniform(t, -range, range);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
     double max_nmse_err() override {
         return 5e-4;
     }

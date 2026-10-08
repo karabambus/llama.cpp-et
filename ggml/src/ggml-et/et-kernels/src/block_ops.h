@@ -275,14 +275,13 @@ static inline void __attribute__((always_inline)) q8_dot_tile(const block_q8_0 *
                 : "f10", "f11", "f12");
         }
 
-        // f20 += f10 * broadcast(scale) — hardware fp16→fp32 via FCVT.PS.F16
-        uint32_t scale_raw = (uint32_t) blk->d;
+        // f20 += f10 * broadcast(scale); the scale is converted in integer code (subnormal scales, math_fp.h)
+        const uint32_t scale_bits = fp16_to_fp32_bits(blk->d);
         __asm__ volatile(
             "fbcx.ps f15, %[sb]\n"
-            "fcvt.ps.f16 f15, f15\n"
             "fmadd.ps f20, f10, f15, f20\n"
             :
-            : [sb] "r"(scale_raw)
+            : [sb] "r"(scale_bits)
             : "f15", "f20");
     }
 }
@@ -553,17 +552,15 @@ static inline void q8_dot_compute_x2_aligned(const block_q8_0 * q_row0,
                 : "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f17");
         }
 
-        const uint32_t scale_raw0 = (uint32_t) blk0->d;
-        const uint32_t scale_raw1 = (uint32_t) blk1->d;
+        const uint32_t scale_bits0 = fp16_to_fp32_bits(blk0->d);
+        const uint32_t scale_bits1 = fp16_to_fp32_bits(blk1->d);
         __asm__ volatile(
             "fbcx.ps     f24, %[s0]\n"
-            "fcvt.ps.f16 f24, f24\n"
             "fmadd.ps    f20, f10, f24, f20\n"
             "fbcx.ps     f25, %[s1]\n"
-            "fcvt.ps.f16 f25, f25\n"
             "fmadd.ps    f21, f11, f25, f21\n"
             :
-            : [s0] "r"(scale_raw0), [s1] "r"(scale_raw1)
+            : [s0] "r"(scale_bits0), [s1] "r"(scale_bits1)
             : "f20", "f21", "f24", "f25");
     }
 
@@ -819,13 +816,12 @@ static inline void __attribute__((always_inline)) q4_dot_tile(const block_q4_0 *
               [b_low1] "m"(*(const float (*)[8]) & b_ptr[8]), [b_high1] "m"(*(const float (*)[8]) & b_ptr[24])
             : "f10", "f11", "f12", "f13", "f14", "f15");
 
-        uint32_t scale_raw = (uint32_t) blk->d;
+        const uint32_t scale_bits = fp16_to_fp32_bits(blk->d);
         __asm__ volatile(
             "fbcx.ps f15, %[sb]\n"
-            "fcvt.ps.f16 f15, f15\n"
             "fmadd.ps f20, f10, f15, f20\n"
             :
-            : [sb] "r"(scale_raw)
+            : [sb] "r"(scale_bits)
             : "f15", "f20");
     }
 }
@@ -959,17 +955,15 @@ static inline void q4_dot_compute_x2_aligned(const block_q4_0 * q_row0,
               [b_high1] "m"(*(const float (*)[8]) & b_ptr[24])
             : "f10", "f11", "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19");
 
-        const uint32_t scale_raw0 = (uint32_t) blk0->d;
-        const uint32_t scale_raw1 = (uint32_t) blk1->d;
+        const uint32_t scale_bits0 = fp16_to_fp32_bits(blk0->d);
+        const uint32_t scale_bits1 = fp16_to_fp32_bits(blk1->d);
         __asm__ volatile(
             "fbcx.ps     f24, %[s0]\n"
-            "fcvt.ps.f16 f24, f24\n"
             "fmadd.ps    f20, f10, f24, f20\n"
             "fbcx.ps     f25, %[s1]\n"
-            "fcvt.ps.f16 f25, f25\n"
             "fmadd.ps    f21, f16, f25, f21\n"
             :
-            : [s0] "r"(scale_raw0), [s1] "r"(scale_raw1)
+            : [s0] "r"(scale_bits0), [s1] "r"(scale_bits1)
             : "f20", "f21", "f24", "f25");
     }
 
