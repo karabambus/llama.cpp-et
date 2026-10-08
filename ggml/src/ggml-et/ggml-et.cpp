@@ -481,6 +481,10 @@ static void ggml_backend_et_free(ggml_backend_t backend) {
             // Drain any in-flight uberkernel launches before freeing the
             // device buffers they read from.
             ggml_et_wait_stream(dev_ctx, "synchronize");
+            if (dev_ctx->moe_w_scratch) {
+                runtime->freeDevice(dev_ctx->rtid, dev_ctx->moe_w_scratch);
+                dev_ctx->moe_w_scratch = nullptr;
+            }
             for (auto & slot : dev_ctx->uberkernel.slots) {
                 if (slot.device_insts) {
                     runtime->freeDevice(dev_ctx->rtid, slot.device_insts);
@@ -801,6 +805,7 @@ static bool ggml_et_moe_sum_match(const ggml_cgraph * cgraph, int i, int * last_
 // line is read and then written by one hart at the same (e,t) only, so an overlap is safe for exactly two layouts:
 // out on slot 0 of ex with ex's token stride, and res == out with out's row stride. In the unfused schedule ex and w
 // are dead after the MUL, so the graph allocator may legally place the ADD chain's output anywhere over them.
+// w is small (S*N floats), so an overlap with w is resolved by a private copy; any other overlap runs unfused.
 static bool et_bytes_overlap(const ggml_tensor * a, const ggml_tensor * b) {
     const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a);
     const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
@@ -809,17 +814,47 @@ static bool et_bytes_overlap(const ggml_tensor * a, const ggml_tensor * b) {
 
 static bool et_moe_sum_mem_ok(const ggml_tensor * mul, const ggml_tensor * out, const ggml_tensor * res) {
     const ggml_tensor * ex = mul->src[0];
-    const ggml_tensor * w  = mul->src[1];
     if (et_bytes_overlap(out, ex) && !(out->data == ex->data && out->nb[1] == ex->nb[2])) {
-        return false;
-    }
-    if (et_bytes_overlap(out, w)) {
         return false;
     }
     if (res && et_bytes_overlap(out, res) && !(out->data == res->data && out->nb[1] == res->nb[1])) {
         return false;
     }
     return true;
+}
+
+static constexpr size_t ET_MOE_W_SCRATCH_BYTES = 64 * 1024;  // S*N floats: 8 experts x 2048 tokens
+
+// Queues a cont_f32 copy of w into the device's private buffer and describes the copy in *w_copy. The copy launch
+// waits for the producer of w and the moe_sum launch waits for the copy (both use the default stream barrier).
+static bool et_moe_sum_private_w(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * w, ggml_tensor * w_copy) {
+    if (w->type != GGML_TYPE_F32 || ggml_nelements(w) * sizeof(float) > ET_MOE_W_SCRATCH_BYTES) {
+        return false;
+    }
+    if (!dev_ctx->moe_w_scratch) {
+        std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+        if (!runtime) {
+            return false;
+        }
+        dev_ctx->moe_w_scratch = runtime->mallocDevice(dev_ctx->rtid, ET_MOE_W_SCRATCH_BYTES);
+        if (!dev_ctx->moe_w_scratch) {
+            return false;
+        }
+    }
+    *w_copy           = *w;
+    w_copy->op        = GGML_OP_CONT;
+    w_copy->data      = dev_ctx->moe_w_scratch;
+    w_copy->view_src  = nullptr;
+    w_copy->view_offs = 0;
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        w_copy->src[k] = nullptr;
+    }
+    w_copy->src[0] = const_cast<ggml_tensor *>(w);
+    w_copy->nb[0]  = sizeof(float);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        w_copy->nb[d] = w_copy->nb[d - 1] * w_copy->ne[d - 1];
+    }
+    return ggml_et_op_cont(dev_ctx, w_copy);
 }
 
 static void et_moe_sum_log_skip(const ggml_tensor * mul, const ggml_tensor * out, int n_fused, int n_skipped) {
@@ -1284,7 +1319,7 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
         {
             static const bool no_moe_sum = [] { const char * e = getenv("GGML_ET_NO_MOE_SUM"); return e && *e && strcmp(e, "0") != 0; }();
             int last_idx = -1;
-            static int n_moe_sum_fused = 0, n_moe_sum_skipped = 0;
+            static int n_moe_sum_fused = 0, n_moe_sum_skipped = 0, n_moe_sum_wcopy = 0;
             if (!no_moe_sum && ggml_et_moe_sum_match(cgraph, i, &last_idx)) {
                 const ggml_tensor * res     = nullptr;
                 int                 res_idx = ggml_et_moe_sum_residual(cgraph, last_idx, &res);  // T2 fusion 4b
@@ -1294,18 +1329,31 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
                     res     = nullptr;
                 }
                 const ggml_tensor * out = res_idx >= 0 ? cgraph->nodes[res_idx] : sum_dst;
-                if (!et_moe_sum_mem_ok(node, out, res)) {
+                ggml_tensor         mul_eff = *node;  // node with w replaced by its private copy when out overlaps w
+                ggml_tensor         w_copy;
+                bool                fuse = et_moe_sum_mem_ok(node, out, res);
+                if (fuse && et_bytes_overlap(out, node->src[1])) {
+                    fuse = et_moe_sum_private_w(dev_ctx, node->src[1], &w_copy);
+                    if (fuse) {
+                        mul_eff.src[1] = &w_copy;
+                        if (++n_moe_sum_wcopy <= 2) {
+                            GGML_LOG_INFO("ET: moe_sum output overlaps the routing weights; using a private copy (%d so far)\n",
+                                          n_moe_sum_wcopy);
+                        }
+                    }
+                }
+                if (!fuse) {
                     et_moe_sum_log_skip(node, out, n_moe_sum_fused, ++n_moe_sum_skipped);  // MUL + ADDs run unfused
                 } else {
                     ++n_moe_sum_fused;
                     if (et_fcheck_enabled()) {
-                        std::vector<const ggml_tensor *> ins = { node->src[0], node->src[1] };
+                        std::vector<const ggml_tensor *> ins = { mul_eff.src[0], mul_eff.src[1] };
                         if (res) { ins.push_back(res); }
                         et_fcheck_run(dev_ctx, res ? "moe_sum+res" : "moe_sum", ins, { out },
-                                      [&] { return ggml_et_op_moe_sum(dev_ctx, node, out, res); },
-                                      [&] { bool ok = ggml_et_op_moe_sum(dev_ctx, node, sum_dst, nullptr); if (res_idx >= 0) { ok = ggml_et_op_add(dev_ctx, out) && ok; } return ok; });
+                                      [&] { return ggml_et_op_moe_sum(dev_ctx, &mul_eff, out, res); },
+                                      [&] { bool ok = ggml_et_op_moe_sum(dev_ctx, &mul_eff, sum_dst, nullptr); if (res_idx >= 0) { ok = ggml_et_op_add(dev_ctx, out) && ok; } return ok; });
                     } else {
-                        ggml_et_op_moe_sum(dev_ctx, node, out, res);
+                        ggml_et_op_moe_sum(dev_ctx, &mul_eff, out, res);
                     }
                     i = res_idx >= 0 ? res_idx : last_idx;  // MUL + views + ADD chain (+ residual ADD) done
                     continue;
