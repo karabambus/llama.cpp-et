@@ -264,26 +264,35 @@ static inline float et_cosf(float x) {
 // (Qwen3.6-35B-A3B shared-expert tensors: 0.5 % of blocks, up to 3.5 % in one tensor); flushing them zeroes
 // whole weight blocks. Callers in vector code broadcast fp16_to_fp32_bits() with FBCX.PS instead of converting
 // in the lanes. Normal, zero, infinity and NaN inputs convert bit-identically to the hardware instruction.
-static inline uint32_t fp16_to_fp32_bits(uint16_t h) {
+static inline uint32_t fp16_to_fp32_bits_slow(uint16_t h) {
     const uint32_t sign = (uint32_t) (h & 0x8000u) << 16;
     uint32_t       exp  = (h >> 10) & 0x1Fu;
     uint32_t       mant = h & 0x3FFu;
     if (exp == 0x1Fu) {                              // inf / nan
         return sign | 0x7F800000u | (mant << 13);
     }
-    if (exp == 0) {
-        if (mant == 0) {                             // +-0
-            return sign;
-        }
-        exp = 127 - 15 + 1;                          // subnormal: normalise
-        while ((mant & 0x400u) == 0) {
-            mant <<= 1;
-            exp--;
-        }
-        mant &= 0x3FFu;
-        return sign | (exp << 23) | (mant << 13);
+    if (mant == 0) {                                 // +-0
+        return sign;
     }
-    return sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    exp = 127 - 15 + 1;                              // subnormal: normalise
+    while ((mant & 0x400u) == 0) {
+        mant <<= 1;
+        exp--;
+    }
+    mant &= 0x3FFu;
+    return sign | (exp << 23) | (mant << 13);
+}
+
+// Normal halves (exponent field 1..30) are a shift and an exponent rebias: ((h & 0x7fff) + (112 << 10)) << 13 moves
+// sign-less exponent+mantissa into place and adds 127 - 15 to the exponent; the sign bit moves separately. Only
+// zeros, subnormals, infinities and NaNs take the branchy path. This is the hot path of the matrix-engine dequant
+// panels (one scale per weight row per 32-wide block).
+static inline uint32_t __attribute__((always_inline)) fp16_to_fp32_bits(uint16_t h) {
+    const uint32_t e = h & 0x7C00u;
+    if (__builtin_expect(e != 0 && e != 0x7C00u, 1)) {
+        return ((uint32_t) (h & 0x8000u) << 16) | (((uint32_t) (h & 0x7FFFu) + (112u << 10)) << 13);
+    }
+    return fp16_to_fp32_bits_slow(h);
 }
 
 static inline float fp16_to_fp32(uint16_t h) {
