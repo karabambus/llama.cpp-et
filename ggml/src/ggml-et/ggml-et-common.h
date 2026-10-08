@@ -77,6 +77,9 @@ struct ggml_backend_et_device_context {
     // trace buffer - for printing support
     std::byte * trace_buffer;
 
+    // private copy of moe_sum routing weights when the graph allocator placed the fused output over them
+    std::byte * moe_w_scratch = nullptr;
+
     bool                               uberkernel_enabled = false;
     ggml_backend_et_uberkernel_context uberkernel;
 };
