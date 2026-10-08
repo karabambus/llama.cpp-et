@@ -40,24 +40,25 @@ static const int32_t __attribute__((aligned(64))) pat_w2[8] = { 8, 12, 24, 28, 4
 static const int32_t __attribute__((aligned(64))) pat_u4[8] = { 0, 4, 8, 12, 32, 36, 40, 44 };
 static const int32_t __attribute__((aligned(64))) pat_w4[8] = { 16, 20, 24, 28, 48, 52, 56, 60 };
 
-// One in-vector stage over the whole row: patterns in f28 (u) and f29 (w).
+// One in-vector stage over the whole row: patterns in f18 (u) and f19 (w) — callee-saved registers, so the compiler
+// preserves them around the stage and never allocates them between the asm blocks (KB 04 G2).
 static inline void __attribute__((always_inline)) stage_gather(float * row, int64_t n, const int32_t * pu,
                                                                  const int32_t * pw) {
     __asm__ volatile(
-        "flw.ps f28, %[u]\n\t"
-        "flw.ps f29, %[w]\n\t"
+        "flw.ps f18, %[u]\n\t"
+        "flw.ps f19, %[w]\n\t"
         :
         : [u] "m"(*(const int32_t (*)[8]) pu), [w] "m"(*(const int32_t (*)[8]) pw)
-        : "f28", "f29");
+        : "f18", "f19");
     for (int64_t g = 0; g < n; g += 16) {
         float * base = row + g;
         __asm__ volatile(
-            "fgw.ps  f10, f28(%[b])\n\t"
-            "fgw.ps  f11, f29(%[b])\n\t"
+            "fgw.ps  f10, f18(%[b])\n\t"
+            "fgw.ps  f11, f19(%[b])\n\t"
             "fadd.ps f12, f10, f11, rne\n\t"
             "fsub.ps f13, f10, f11, rne\n\t"
-            "fscw.ps f12, f28(%[b])\n\t"
-            "fscw.ps f13, f29(%[b])\n\t"
+            "fscw.ps f12, f18(%[b])\n\t"
+            "fscw.ps f13, f19(%[b])\n\t"
             :
             : [b] "r"(base)
             : "f10", "f11", "f12", "f13", "memory");
@@ -120,7 +121,7 @@ int entry_point(struct ggml_et_hadamard_params * params, void * env) {
     unsigned long saved_mask;
     __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
     __asm__ volatile("mov.m.x m0, x0, 0xFF");
-    __asm__ volatile("fbc.ps f30, %[s]\n" : : [s] "m"(scale) : "f30");
+    __asm__ volatile("fbc.ps f20, %[s]\n" : : [s] "m"(scale) : "f20");  // f20 (fs4): callee-saved, held across the row loop
 
     for (int64_t j = thread_id; j < R; j += num_threads) {
         // destination row
@@ -147,7 +148,7 @@ int entry_point(struct ggml_et_hadamard_params * params, void * env) {
                     "flw.ps  f10, %[x]\n\t"
                     "flw.ps  f11, %[sg]\n\t"
                     "fmul.ps f10, f10, f11, rne\n\t"
-                    "fmul.ps f10, f10, f30, rne\n\t"
+                    "fmul.ps f10, f10, f20, rne\n\t"
                     "fsw.ps  f10, %[d]\n\t"
                     : [d] "=m"(*(float (*)[8]) (row + c))
                     : [x] "m"(*(const float (*)[8]) (xp + c)), [sg] "m"(*(const float (*)[8]) (sp + c))
@@ -157,7 +158,7 @@ int entry_point(struct ggml_et_hadamard_params * params, void * env) {
             for (int64_t c = 0; c < n; c += 8) {
                 __asm__ volatile(
                     "flw.ps  f10, %[x]\n\t"
-                    "fmul.ps f10, f10, f30, rne\n\t"
+                    "fmul.ps f10, f10, f20, rne\n\t"
                     "fsw.ps  f10, %[d]\n\t"
                     : [d] "=m"(*(float (*)[8]) (row + c))
                     : [x] "m"(*(const float (*)[8]) (xp + c))

@@ -1328,15 +1328,21 @@ static bool et_hadamard_match_signed(const ggml_cgraph * cgraph, int i, const gg
         !ggml_node_has_n_uses(cgraph, i, 1)) {
         return false;
     }
+    // The sign vector is the 1-D operand. ggml_mul(x, signs) puts it in src[1]; try that slot first, because at one
+    // token the activation is 1-D as well and a shape-only test would take x for the signs (the overlap rule would
+    // then fire on the wrong operand and the fusion would silently drop out exactly at decode).
+    auto is_sign_vec = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t);
+    };
+    auto is_act = [M](const ggml_tensor * t, const ggml_tensor * sv) {
+        return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->ne[0] == sv->ne[0] && ggml_are_same_shape(M, t);
+    };
     const ggml_tensor * x = nullptr; const ggml_tensor * s = nullptr;
-    for (int k = 0; k < 2; k++) {
-        const ggml_tensor * a = M->src[k]; const ggml_tensor * b = M->src[1 - k];
-        if (a->ne[1] == 1 && a->ne[2] == 1 && a->ne[3] == 1 && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) &&
-            b->type == GGML_TYPE_F32 && b->nb[0] == sizeof(float) && b->ne[0] == a->ne[0] && ggml_are_same_shape(M, b)) {
-            s = a; x = b; break;
-        }
-    }
-    if (!x) {
+    if (is_sign_vec(M->src[1]) && is_act(M->src[0], M->src[1])) {
+        s = M->src[1]; x = M->src[0];
+    } else if (is_sign_vec(M->src[0]) && is_act(M->src[1], M->src[0]) && ggml_nelements(M->src[1]) > ggml_nelements(M->src[0])) {
+        s = M->src[0]; x = M->src[1];
+    } else {
         return false;
     }
     const int m = et_next_compute(cgraph, i);
