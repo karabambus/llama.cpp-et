@@ -9704,6 +9704,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ET: GGML_ET_TBO_QWEN35=1 adds the linear-attention ops at Qwen3.5-family shapes (16 key heads x 128, 32 or 48
+    // value heads, conv kernel 4 over 2*16*128 + Hv*128 channels) for 1, 64 and 512 tokens.
+    if (getenv("GGML_ET_TBO_QWEN35")) {
+        for (int64_t n : {1, 64, 512}) {
+            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {128, 16, n, 1}, 1e-6f));
+            for (int64_t hv : {32, 48}) {
+                const int64_t ch = 2 * 16 * 128 + hv * 128;
+                test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {3 + n, ch, 1, 1}, {4, ch, 1, 1}));
+                test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, (int) (hv / 16)));
+            }
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
