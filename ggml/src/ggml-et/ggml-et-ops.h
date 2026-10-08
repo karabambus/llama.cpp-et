@@ -343,6 +343,17 @@ struct ggml_et_cumsum_params {
     ggml_tensor dst;   // F32 output tensor [ne00, ne01, ne02, ne03]
 };
 
+// hadamard_f32: dst[n, R] = blockwise FWHT of scale * signs * src; signs.data == NULL means no sign flip.
+// Device-side twin in et-kernels/src/hadamard_f32.c.
+struct ggml_et_hadamard_params {
+    ggml_tensor src;
+    ggml_tensor signs;
+    ggml_tensor dst;
+    int64_t     width;
+    int64_t     blk;
+    float       scale;
+};
+
 struct ggml_et_scale_params {
     ggml_tensor src0;   // F32 input tensor
     ggml_tensor dst;    // F32 output tensor
@@ -436,6 +447,10 @@ bool ggml_et_op_qkv_glue(ggml_backend_et_device_context * dev_ctx, const ggml_et
 void ggml_et_fill_rope_settings(const ggml_tensor * rope_node, ggml_et_rope_settings * out);
 bool ggml_et_op_mean(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_clamp(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
+// Fused Hadamard activation transform: `mm` is the hinted MUL_MAT (dst), `x` the activation before the sign flip
+// (mm->src[1] itself when there is none), `signs` the 1-D sign vector or nullptr.
+bool ggml_et_op_hadamard(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * x, const ggml_tensor * signs,
+                         const ggml_tensor * mm);
 bool ggml_et_op_scale(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_mul(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_add(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);

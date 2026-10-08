@@ -1276,6 +1276,82 @@ void et_fcheck_report() {
 }
 }  // namespace
 
+// ---- Hadamard activation transform (Prism folded weights) ----------------------------------------------------
+// The runtime rotates the input of every folded weight as MUL(x, signs) -> RESHAPE [n, R] -> MUL_MAT(rot [n x n], hint
+// GGML_HINT_SRC0_IS_HADAMARD) -> RESHAPE. One hadamard_f32 launch computes the whole chain (sign flip, 1/sqrt(n), the
+// FWHT) and writes the MUL_MAT's output, so the MUL and the rotation matmul are never dispatched. The rotation matrix
+// data is not read: the hint promises the Sylvester-Hadamard matrix (the CPU backend makes the same substitution).
+// Memory (05 §9 rule 7): the fused kernel reads x and signs while it writes mm's output; x is dead after the MUL in the
+// unfused schedule, so the allocator may place mm's output over it. Each hart reads a whole block before writing it,
+// so dst == x with identical layout is safe; any other overlap runs unfused. GGML_ET_NO_HADAMARD=1 disables the path.
+static bool et_hadamard_hint_mm(const ggml_tensor * mm) {
+    if (mm->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD || mm->type != GGML_TYPE_F32 ||
+        !mm->src[0] || !mm->src[1] || mm->src[0]->type != GGML_TYPE_F32 || mm->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t n = mm->src[0]->ne[1];
+    if (n < 16 || n > 4096 || (n & (n - 1)) != 0 || mm->src[0]->ne[0] != n || mm->src[0]->ne[2] != 1 || mm->src[0]->ne[3] != 1 ||
+        mm->src[1]->ne[0] != n || mm->src[1]->nb[0] != sizeof(float) || mm->ne[0] != n || mm->nb[0] != sizeof(float) ||
+        !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    return true;
+}
+
+static bool et_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+    const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+// dst may alias x only as the identical byte range of a contiguous tensor (in-place, block by block)
+static bool et_hadamard_mem_ok(const ggml_tensor * x, const ggml_tensor * signs, const ggml_tensor * mm) {
+    if (signs && et_ranges_overlap(signs, mm)) {
+        return false;
+    }
+    if (!et_ranges_overlap(x, mm)) {
+        return true;
+    }
+    return x->data == mm->data && ggml_is_contiguous(x) && ggml_nbytes(x) == ggml_nbytes(mm);
+}
+
+static bool et_hadamard_enabled() {
+    static const bool off = [] { const char * e = getenv("GGML_ET_NO_HADAMARD"); return e && *e && strcmp(e, "0") != 0; }();
+    return !off;
+}
+
+// Case A, at a MUL node: MUL(x, signs [W]) whose only use is the RESHAPE feeding the next compute node, a hinted MUL_MAT.
+static bool et_hadamard_match_signed(const ggml_cgraph * cgraph, int i, const ggml_tensor ** x_out,
+                                     const ggml_tensor ** signs_out, int * mm_idx) {
+    const ggml_tensor * M = cgraph->nodes[i];
+    if (M->op != GGML_OP_MUL || M->type != GGML_TYPE_F32 || !M->src[0] || !M->src[1] || !ggml_is_contiguous(M) ||
+        !ggml_node_has_n_uses(cgraph, i, 1)) {
+        return false;
+    }
+    const ggml_tensor * x = nullptr; const ggml_tensor * s = nullptr;
+    for (int k = 0; k < 2; k++) {
+        const ggml_tensor * a = M->src[k]; const ggml_tensor * b = M->src[1 - k];
+        if (a->ne[1] == 1 && a->ne[2] == 1 && a->ne[3] == 1 && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) &&
+            b->type == GGML_TYPE_F32 && b->nb[0] == sizeof(float) && b->ne[0] == a->ne[0] && ggml_are_same_shape(M, b)) {
+            s = a; x = b; break;
+        }
+    }
+    if (!x) {
+        return false;
+    }
+    const int m = et_next_compute(cgraph, i);
+    if (m >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[m];
+    if (!et_hadamard_hint_mm(mm) || mm->src[1]->view_src != M || !ggml_is_contiguous(mm->src[1]) ||
+        x->ne[0] % mm->src[0]->ne[1] != 0 || !et_hadamard_mem_ok(x, s, mm)) {
+        return false;
+    }
+    *x_out = x; *signs_out = s; *mm_idx = m;
+    return true;
+}
+
 static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
     ggml_et_uberkernel_begin_graph(&dev_ctx->uberkernel);
@@ -1406,6 +1482,34 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
                     ggml_et_op_qkv_glue(dev_ctx, plan);
                 }
                 i = plan.last_idx;
+                continue;
+            }
+        }
+        if (et_hadamard_enabled()) {
+            const ggml_tensor * hx = nullptr; const ggml_tensor * hs = nullptr; int hmm = -1;
+            if (node->op == GGML_OP_MUL && et_hadamard_match_signed(cgraph, i, &hx, &hs, &hmm)) {
+                const ggml_tensor * mm = cgraph->nodes[hmm];
+                auto fused = [&] { return ggml_et_op_hadamard(dev_ctx, hx, hs, mm); };
+                if (et_fcheck_enabled()) {
+                    et_fcheck_run(dev_ctx, "hadamard", { hx, hs }, { mm }, fused,
+                                  [&] { return ggml_et_op_mul(dev_ctx, node) && ggml_et_op_mul_mat(dev_ctx, mm); });
+                } else {
+                    fused();
+                }
+                fused_groups++;
+                fused_dispatches_saved += 1;
+                i = hmm;
+                continue;
+            }
+            // Case B: a hinted MUL_MAT whose input is not a fusable sign flip — transform mm->src[1] directly.
+            if (et_hadamard_hint_mm(node) && et_hadamard_mem_ok(node->src[1], nullptr, node)) {
+                auto fused = [&] { return ggml_et_op_hadamard(dev_ctx, node->src[1], nullptr, node); };
+                if (et_fcheck_enabled()) {
+                    et_fcheck_run(dev_ctx, "hadamard_plain", { node->src[1] }, { node }, fused,
+                                  [&] { return ggml_et_op_mul_mat(dev_ctx, node); });
+                } else {
+                    fused();
+                }
                 continue;
             }
         }

@@ -1,4 +1,6 @@
 #include "ggml-et-ops.h"
+
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -256,6 +258,44 @@ bool ggml_et_op_rms_norm_mul(ggml_backend_et_device_context * dev_ctx,
 
     ET_PERF_END_EXT("RMS_NORM_MUL", "rms_norm_mul_f32", mul_node, "eps=%.6f", (double) eps);
     return kernel_result;
+}
+
+bool ggml_et_op_hadamard(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * x, const ggml_tensor * signs,
+                         const ggml_tensor * mm) {
+    ET_PERF_START();
+
+    if (!dev_ctx || !x || !mm || !mm->src[0]) {
+        GGML_LOG_ERROR("ET: Invalid parameters for the Hadamard transform\n");
+        return false;
+    }
+    const int64_t n = mm->src[0]->ne[1];
+    const int64_t W = x->ne[0];
+    if (x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || mm->nb[0] != sizeof(float) ||
+        n < 16 || n > 4096 || (n & (n - 1)) != 0 || W % n != 0 || mm->ne[0] != n ||
+        (signs && (signs->type != GGML_TYPE_F32 || signs->ne[0] != W || !ggml_is_contiguous(signs)))) {
+        GGML_LOG_ERROR("ET: Hadamard transform with unsupported operands: n=%lld W=%lld x=%s mm=%s\n", (long long) n,
+                       (long long) W, ggml_type_name(x->type), ggml_type_name(mm->type));
+        return false;
+    }
+
+    ggml_et_hadamard_params params = {};
+    params.src   = *x;
+    if (signs) {
+        params.signs = *signs;
+    } else {
+        params.signs.data = nullptr;
+    }
+    params.dst   = *mm;
+    params.width = W;
+    params.blk   = n;
+    params.scale = 1.0f / sqrtf((float) n);
+
+    const bool ok = ggml_et_launch_kernel(dev_ctx, "hadamard_f32", &params, sizeof(params), 0xFFFFFFFF);
+    if (!ok) {
+        GGML_LOG_ERROR("ET: Failed to launch hadamard_f32 kernel\n");
+    }
+    ET_PERF_END("HADAMARD", "hadamard_f32", mm);
+    return ok;
 }
 
 bool ggml_et_op_scale(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node) {
