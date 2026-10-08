@@ -9729,6 +9729,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ET: GGML_ET_TBO_UNARY_TAIL=1 adds unary cases whose element count is not a multiple of the 8-lane vector or of
+    // the 16-float cache line: single elements (the shared-expert gate of a MoE layer at batch 1 is [1,1]), one-float
+    // rows over many rows, and short odd rows, each contiguous (v=0) and as a strided view (v=1).
+    if (getenv("GGML_ET_TBO_UNARY_TAIL")) {
+        for (int op = 0; op < GGML_UNARY_OP_COUNT; op++) {
+            for (int v : {0, 1}) {
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, {  1,   1, 1, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, {  1, 512, 1, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, {  7,   1, 1, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, {  9,   3, 1, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, { 17,   5, 2, 1 }, v));
+                test_cases.emplace_back(new test_unary((ggml_unary_op) op, GGML_TYPE_F32, { 33,  33, 1, 1 }, v));
+            }
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
