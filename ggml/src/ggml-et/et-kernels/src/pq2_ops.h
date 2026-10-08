@@ -43,7 +43,7 @@ static inline void __attribute__((always_inline)) pq2_dot_reset(void) {
         "fmadd.ps   f10, f12, f13, f10, rne\n\t"                                            \
         :                                                                                   \
         : [q] "r"(a), [bv] "m"(*(const float (*)[8]) (b))                                   \
-        : "f11", "f12", "f13")
+        : "f10", "f11", "f12", "f13")
 
 // Accumulate n_blocks PQ2_0 blocks of q_row against b_col into f20.
 static inline void __attribute__((always_inline)) pq2_dot_tile(const block_pq2_0 * q_row,
