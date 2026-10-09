@@ -2570,6 +2570,13 @@ bool ggml_et_op_gated_delta_net(ggml_backend_et_device_context * dev_ctx, const 
     const ggml_tensor * src_g     = node->src[3];
     const ggml_tensor * src_beta  = node->src[4];
     const ggml_tensor * src_state = node->src[5];
+    const ggml_tensor * src_rows  = node->src[6];  // rows mode (ggml_gated_delta_net_rows), else nullptr
+    const bool          raw_gates = ggml_get_op_params_i32(node, 1) != 0;  // ggml_gated_delta_net_set_raw_gates
+
+    if (raw_gates && (!node->src[7] || !node->src[8])) {
+        GGML_LOG_ERROR("ET: GATED_DELTA_NET raw gates without dt_bias / a tensors\n");
+        return false;
+    }
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -2588,6 +2595,10 @@ bool ggml_et_op_gated_delta_net(ggml_backend_et_device_context * dev_ctx, const 
     params.beta     = *src_beta;
     params.state_in = *src_state;
     params.dst      = *node;
+    // Optional tensors: the kernel tests data == NULL, so the copies must be zeroed when a form is off.
+    params.rows     = src_rows ? *src_rows : ggml_tensor{};
+    params.dt_bias  = raw_gates ? *node->src[7] : ggml_tensor{};
+    params.a        = raw_gates ? *node->src[8] : ggml_tensor{};
     params.S_v      = (int32_t) S_v;
     params.H        = (int32_t) H;
     params.H_q      = (int32_t) H_q;
@@ -2597,8 +2608,9 @@ bool ggml_et_op_gated_delta_net(ggml_backend_et_device_context * dev_ctx, const 
     params.n_seqs_q = (int32_t) n_seqs_q;
     params.n_seqs_k = (int32_t) n_seqs_k;
     params.kda      = (src_g->ne[0] == S_v) ? 1 : 0;
-    params.K        = ggml_get_op_params_i32(node, 0);
-    params.scale    = 1.0f / sqrtf((float) S_v);
+    params.K         = ggml_get_op_params_i32(node, 0);
+    params.raw_gates = raw_gates ? 1 : 0;
+    params.scale     = 1.0f / sqrtf((float) S_v);
 
     // CPU comparison for debugging
     ggml_et_cpu_compare_ctx cpu_cmp_ctx;
@@ -2620,8 +2632,8 @@ bool ggml_et_op_gated_delta_net(ggml_backend_et_device_context * dev_ctx, const 
         ggml_et_cpu_compare_free(&cpu_cmp_ctx);
     }
 
-    ET_PERF_END_EXT("GATED_DELTA_NET", kernel_name, node, "S_v=%d H=%d n_tokens=%d n_seqs=%d kda=%d", (int) S_v,
-                    (int) H, (int) n_tokens, (int) n_seqs, params.kda);
+    ET_PERF_END_EXT("GATED_DELTA_NET", kernel_name, node, "S_v=%d H=%d n_tokens=%d n_seqs=%d kda=%d rows=%d raw=%d",
+                    (int) S_v, (int) H, (int) n_tokens, (int) n_seqs, params.kda, src_rows ? 1 : 0, params.raw_gates);
     return kernel_result;
 }
 

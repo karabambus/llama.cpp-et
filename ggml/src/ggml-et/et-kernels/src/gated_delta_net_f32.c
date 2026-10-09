@@ -9,6 +9,14 @@
 //     4. Attention:    attn[j] = dot(S_row_j, q) * scale
 //
 // State is stored transposed: s_out[j*S_v + i] = S[i][j]
+//
+// Two optional forms, selected by the host (ggml_tensor.data == NULL means off):
+//   raw gates (rows.data irrelevant, dt_bias/a set, scalar gate only): beta and g arrive
+//     before their activations; per token and head beta = sigmoid(beta_raw),
+//     g = a[h] * softplus(g_raw + dt_bias[h]), then the plain recurrence.
+//   rows mode (rows set): state_in is a 2-D cache view [S_v*S_v*H, n_rows]; sequence s
+//     reads its state at row rows[s] (stride state_in.nb[1]) instead of seq s of a 4-D tensor.
+//     The output layout is unchanged.
 //******************************************************************************
 
 #include "ggml_tensor.h"
@@ -23,8 +31,11 @@ struct ggml_et_gated_delta_net_params {
     struct ggml_tensor v;         // [S_v, H, n_tokens, n_seqs]
     struct ggml_tensor g;         // [1 or S_v, H, n_tokens, n_seqs]
     struct ggml_tensor beta;      // [1, H, n_tokens, n_seqs]
-    struct ggml_tensor state_in;  // [S_v*S_v*H, K, n_seqs]
+    struct ggml_tensor state_in;  // [S_v, S_v, H, n_seqs], or [S_v*S_v*H, n_rows] in rows mode
     struct ggml_tensor dst;       // [S_v*H, n_tokens*n_seqs + S_v*n_seqs*K]
+    struct ggml_tensor rows;      // I32 [n_seqs], rows mode only (data == NULL otherwise)
+    struct ggml_tensor dt_bias;   // F32 [H], raw gates only
+    struct ggml_tensor a;         // F32 [H], raw gates only
     int32_t            S_v;       // head dimension
     int32_t            H;         // number of value heads
     int32_t            H_q;       // number of Q heads
@@ -35,8 +46,20 @@ struct ggml_et_gated_delta_net_params {
     int32_t            n_seqs_k;  // K sequence count
     int32_t            kda;       // 1 if per-element gate, 0 if scalar
     int32_t            K;         // snapshot slot count
+    int32_t            raw_gates; // 1: apply sigmoid / a*softplus(g + dt_bias) to beta / g first
     float              scale;     // 1/sqrt(S_v)
 };
+
+// softplus(x) = log(1 + exp(x)); x itself above 20, where 1 + exp(x) loses the 1 in fp32 anyway
+// (same cut as the CPU reference and unary_f32). Scalar: one value per token and head.
+static inline float softplus_f32(float x) {
+    return (x > 20.0f) ? x : et_logf(1.0f + et_expf(x));
+}
+
+// sigmoid(x) = 1 / (1 + exp(-x)) through frcp.ps (a scalar fdiv.s would trap on the minion).
+static inline float sigmoid_f32(float x) {
+    return et_fdiv(1.0f, 1.0f + et_expf(-x));
+}
 
 static inline float hsum_f10(void) {
     float result;
@@ -98,7 +121,20 @@ int entry_point(struct ggml_et_gated_delta_net_params * params, void * env) {
     const int32_t K        = params->K;
     const float   scale    = params->scale;
 
+    const int32_t * rows      = (const int32_t *) params->rows.data;  // NULL: 4-D state form
+    const int32_t   raw_gates = params->raw_gates;
+    const float *   dt_bias   = (const float *) params->dt_bias.data;
+    const float *   a_gate    = (const float *) params->a.data;
+
     if (!q || !k || !v || !g || !beta || !state_in || !dst_data) {
+        return -1;
+    }
+    if (raw_gates && (!dt_bias || !a_gate || kda)) {
+        return -1;
+    }
+    // Rows mode: one state row per sequence, S_v*S_v*H floats wide (the view's nb[1]).
+    const size_t state_row_floats = rows ? state_tsr->nb[1] / sizeof(float) : 0;
+    if (rows && (params->rows.nb[0] != sizeof(int32_t) || state_row_floats < (size_t) S_v * S_v * H)) {
         return -1;
     }
 
@@ -174,8 +210,10 @@ int entry_point(struct ggml_et_gated_delta_net_params * params, void * env) {
         const int32_t head_state_off = (seq * H + head) * S_v * S_v;
         // Live RMW buffer = first snapshot plane (slot 0).
         float *       s_out          = state_out_base + head_state_off;
-        // Input state: seq `seq`, head `head`.
-        const float * s_in           = state_in + head_state_off;
+        // Input state: seq `seq`, head `head` -- from the cache row rows[seq] in rows mode, else the
+        // contiguous 4-D tensor (seq stride S_v*S_v*H).
+        const float * s_in           = rows ? state_in + (size_t) rows[seq] * state_row_floats + head * S_v * S_v
+                                            : state_in + head_state_off;
 
         // Skip the explicit s_in -> s_out copy. At t=0 pass A/B read through
         // src_state = s_in; pass B writes the first new row to s_out. From
@@ -192,13 +230,18 @@ int entry_point(struct ggml_et_gated_delta_net_params * params, void * env) {
             const float * k_t      = (const float *) ((const char *) k + seq_k * k_nb3 + t * k_nb2 + h_k * k_nb1);
             const float * v_t      = (const float *) ((const char *) v + seq * v_nb3 + t * v_nb2 + head * v_nb1);
             const float * g_t      = g + seq * g_stride_s + t * g_stride_t + head * g_stride_h;
-            const float   beta_val = beta[seq * b_stride_s + t * b_stride_t + head];
+            float         beta_val = beta[seq * b_stride_s + t * b_stride_t + head];
 
             // Precompute per-element gate for the kda path; scalar decay
             // otherwise. Decay is fused into per-j pass A/B below, not
             // applied to state in a separate pre-pass.
             float decay = 0.0f;  // only used when !kda
-            if (kda) {
+            if (raw_gates) {
+                // Scalar gate only (asserted on the host); the activations the graph would otherwise
+                // apply as four elementwise ops per layer.
+                beta_val = sigmoid_f32(beta_val);
+                decay    = et_expf(a_gate[head] * softplus_f32(g_t[0] + dt_bias[head]));
+            } else if (kda) {
                 const float log2e = 1.4426950408889634f;
                 __asm__ volatile("mov.m.x m0, x0, 255\n" :::);
                 __asm__ volatile("fbc.ps f20, %[l2e]\n" : : [l2e] "m"(log2e) : "f20");

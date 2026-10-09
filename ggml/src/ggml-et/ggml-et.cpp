@@ -2529,12 +2529,20 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
             // F32, S_v must be multiple of 8 for vectorization
             // q, k, v may be row-contiguous with strided higher dimensions.
             // g, beta, state stay contiguous.
-            // op_params[1] == 1 marks "raw gates" (ggml_gated_delta_net_set_raw_gates: alpha/beta arrive before
-            // softplus/exp and the op applies them with dt_bias and A); the kernel computes the plain form only, so
-            // such nodes go to the CPU instead of running wrong math (sys-emu 10-09: ERR ~1 on every raw-gate case).
-            // src[6] set means ggml_gated_delta_net_rows (the state is read from a 2-D cache view at row index
-            // src[6][seq]); the kernel and its host launch know only the 4-D state form, so those nodes go to the CPU.
-            if (op->type == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 1) == 0 && op->src[6] == nullptr &&
+            // Two optional forms the kernel handles: src[6] = I32 row index per sequence
+            // (ggml_gated_delta_net_rows: the state is read from a 2-D cache view at row src[6][seq]), and
+            // op_params[1] == 1 = raw gates (ggml_gated_delta_net_set_raw_gates: src[7] dt_bias, src[8] a, both
+            // F32 [H]; beta/g arrive pre-activation and the kernel applies sigmoid / a*softplus(g + dt_bias)).
+            if (op->type == GGML_TYPE_F32 &&
+                (op->src[6] == nullptr ||
+                 (op->src[6]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[6]) &&
+                  op->src[6]->ne[0] == op->src[2]->ne[3])) &&                                    // rows [n_seqs]
+                (ggml_get_op_params_i32(op, 1) == 0 ||
+                 (op->src[7] && op->src[7]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[7]) &&
+                  ggml_nelements(op->src[7]) == op->src[2]->ne[1] &&                             // dt_bias [H]
+                  op->src[8] && op->src[8]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[8]) &&
+                  ggml_nelements(op->src[8]) == op->src[2]->ne[1] &&                             // a [H]
+                  op->src[3] && op->src[3]->ne[0] == 1)) &&                                      // scalar gate
                 op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&                               // q
                 op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&                               // k
                 op->src[2] && op->src[2]->type == GGML_TYPE_F32 &&                               // v

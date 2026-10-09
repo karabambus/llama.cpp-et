@@ -333,7 +333,8 @@ struct uber_ssm_scan_params {
     struct ggml_tensor dst;
 };
 
-// gated_delta_net: q,k,v,g,beta,state_in,dst
+// gated_delta_net: q,k,v,g,beta,state_in,dst,rows,dt_bias,a (rows / dt_bias / a have data == NULL when
+// the rows-mode / raw-gates form is off; dt_bias and a are weights)
 struct uber_gated_delta_net_params {
     struct ggml_tensor q;
     struct ggml_tensor k;
@@ -342,6 +343,9 @@ struct uber_gated_delta_net_params {
     struct ggml_tensor beta;
     struct ggml_tensor state_in;
     struct ggml_tensor dst;
+    struct ggml_tensor rows;
+    struct ggml_tensor dt_bias;
+    struct ggml_tensor a;
 };
 
 static void copy_f32_to_f16_row(uint16_t * dst, const float * src, int64_t num_elements) {
@@ -700,6 +704,7 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                     uk_evict(&p->g);
                     uk_evict(&p->beta);
                     uk_evict(&p->state_in);
+                    uk_evict(&p->rows);  // host-written row indices (no-op when data == NULL)
                     UK_SYNC();
                     rc = gated_delta_net_f32_entry((struct ggml_et_gated_delta_net_params *) inst_params, env);
                     break;

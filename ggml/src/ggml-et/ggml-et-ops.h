@@ -259,8 +259,13 @@ struct ggml_et_gated_delta_net_params {
     ggml_tensor v;         // [S_v, H, n_tokens, n_seqs]
     ggml_tensor g;         // [1 or S_v, H, n_tokens, n_seqs]
     ggml_tensor beta;      // [1, H, n_tokens, n_seqs]
-    ggml_tensor state_in;  // [S_v*S_v*H, K, n_seqs]
+    ggml_tensor state_in;  // [S_v, S_v, H, n_seqs], or the 2-D cache view [S_v*S_v*H, n_rows] in rows mode
     ggml_tensor dst;       // [S_v*H, n_tokens*n_seqs + S_v*n_seqs*K]
+    // Optional tensors: data == NULL when the variant is off. The uberkernel dispatcher mirrors the tensor
+    // prefix q .. a (uber_gated_delta_net_params) to evict the writable inputs; keep the order.
+    ggml_tensor rows;      // I32 [n_seqs]: rows mode (ggml_gated_delta_net_rows), state of seq s at row rows[s]
+    ggml_tensor dt_bias;   // F32 [H]: raw gates (ggml_gated_delta_net_set_raw_gates)
+    ggml_tensor a;         // F32 [H]: raw gates
     int32_t     S_v;       // head dimension (value size)
     int32_t     H;         // number of value heads
     int32_t     H_q;       // number of Q heads
@@ -271,6 +276,7 @@ struct ggml_et_gated_delta_net_params {
     int32_t     n_seqs_k;  // K sequence count
     int32_t     kda;       // 1 if per-element gate (g_ne0 == S_v), 0 if scalar
     int32_t     K;         // snapshot slot count
+    int32_t     raw_gates; // 1: beta = sigmoid(beta), g = a[h] * softplus(g + dt_bias[h]) (scalar gate only)
     float       scale;     // 1/sqrt(S_v)
 };
 
