@@ -594,11 +594,8 @@ int entry_point(struct ggml_et_get_rows_params * params, void * env) {
     void *    src0_data = src0->data;
     int32_t * src1_data = (int32_t *) src1->data;
     float *   dst_data  = (float *) dst->data;
-#ifdef ET_UBERKERNEL
-    evict_region_past_l2(src0_data, tensor_bytes(src0));
-    evict_region_past_l2(src1_data, tensor_bytes(src1));
-    evict_region_past_l2(dst_data, tensor_bytes(dst));
-#endif
+    // Under the uberkernel the dispatcher evicts the inputs on every hart before the kernel runs; a per-hart walk
+    // of the whole table here cost thousands of cache ops per gather.
 
     if (!src0_data || !src1_data || !dst_data) {
         return -1;  // Null data pointer

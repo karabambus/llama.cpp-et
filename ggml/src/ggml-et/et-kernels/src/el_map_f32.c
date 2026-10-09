@@ -202,21 +202,9 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
         return -1;  // Null data pointer
     }
 
-#ifdef ET_UBERKERNEL
-    // Consumer-side input eviction. Required because ET caches are
-    // incoherent across minions: if a previous kernel in this UK batch
-    // left stale lines for these addresses in this hart's L1, drop them
-    // so we read fresh from L3/DRAM (where the producer flushed its
-    // results). Standalone launches don't need this -- the host-side
-    // runtime boundary between kernel launches handles it.
-    const size_t src0_bytes = (size_t) src0->ne[0] * src0->ne[1] * src0->ne[2] * src0->ne[3] * src0->nb[0];
-    const size_t src1_bytes = (size_t) src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3] * src1->nb[0];
-    evict_region_past_l2(src0_data, src0_bytes);
-    evict_region_past_l2(src1_data, src1_bytes);
-    WAIT_CACHEOPS;
-    FENCE;
-    et_barrier(ET_BARRIER_GLOBAL);
-#endif
+// Under the uberkernel the dispatcher evicts every instruction's inputs on every hart and takes the chip-wide
+// barrier before the kernel runs (052 contract, consumer side), so the kernel's own input evicts and barrier and
+// its producer-side flushes are redundant and cost a second barrier plus full-span walks per launch.
 
     enum ggml_op operation = dst->op;
 
@@ -278,18 +266,6 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
             default:
                 return 1;
         }
-#ifdef ET_UBERKERNEL
-        // Producer-side flush: ET caches are incoherent across minions, so
-        // a consumer kernel running on a different minion can't see our
-        // dirty L1 lines via its own evict_region_past_l2. Push our writes
-        // all the way to DRAM so the next batched kernel reads fresh.
-        // Standalone launches don't need this -- the host runtime boundary
-        // between kernel launches handles cache writeback.
-        FENCE;
-        evict_region_past_l2(dst_data + elem_start, (size_t) count * sizeof(float));
-        WAIT_CACHEOPS;
-        FENCE;
-#endif
         return 0;
     }
 
@@ -319,13 +295,6 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                 group_row_end = total_rows;
             }
 
-#ifdef ET_UBERKERNEL
-            // First row written by this group (used for producer-side evict).
-            const int64_t first_i03      = group_row_start / (ne2 * ne1);
-            const int64_t first_i02      = (group_row_start - first_i03 * ne2 * ne1) / ne1;
-            const int64_t first_i01      = (group_row_start - first_i03 * ne2 * ne1 - first_i02 * ne1);
-            char *        group_dst_base = (char *) dst_data + first_i03 * nb3 + first_i02 * nb2 + first_i01 * nb1;
-#endif
 
             for (int64_t ir = group_row_start; ir < group_row_end; ir++) {
                 const int64_t i03 = ir / (ne2 * ne1);
@@ -354,18 +323,6 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
                 }
             }
 
-#ifdef ET_UBERKERNEL
-            // Producer-side flush for this group's rows. Group rows are
-            // contiguous because nb1 = ne0*4 in the cacheline-group layout.
-            // Only needed inside a UK batch; see comment in fast path.
-            const int64_t nrows = group_row_end - group_row_start;
-            if (nrows > 0) {
-                FENCE;
-                evict_region_past_l2(group_dst_base, (size_t) nrows * nb1);
-                WAIT_CACHEOPS;
-                FENCE;
-            }
-#endif
         }
 
         return 0;
@@ -438,16 +395,5 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
         }
     }
 
-#ifdef ET_UBERKERNEL
-    // Producer-side flush for the cache-aligned slow path. Rows
-    // [start_row, end_row) are contiguous in dst because nb1 = ne0 * 4.
-    // Only needed inside a UK batch; see comment in fast path.
-    if (end_row > start_row) {
-        FENCE;
-        evict_region_past_l2((char *) dst_data + start_row * nb1, (size_t) (end_row - start_row) * nb1);
-        WAIT_CACHEOPS;
-        FENCE;
-    }
-#endif
     return 0;
 }

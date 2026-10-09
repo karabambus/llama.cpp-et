@@ -62,10 +62,12 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
+#ifndef ET_UBERKERNEL
     evict_region_past_l2(params->src1.data, tensor_bytes(&params->src1));
     if (params->bias.data) {
         evict_region_past_l2(params->bias.data, tensor_bytes(&params->bias));
     }
+#endif
 
     unsigned long saved_mask;
     __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
@@ -121,11 +123,6 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
 
     __asm__ volatile("mova.m.x %0" ::"r"(saved_mask));
 
-#ifdef ET_UBERKERNEL
-    FENCE;
-    evict_region_past_l2(params->dst.data, tensor_bytes(&params->dst));
-    WAIT_CACHEOPS;
-    FENCE;
-#endif
+    // Under the uberkernel the next instruction's consumer-side evict publishes dst; nothing to do here.
     return 0;
 }
