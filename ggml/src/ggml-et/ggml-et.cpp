@@ -2803,7 +2803,7 @@ ggml_backend_reg_t ggml_backend_et_reg(void) {
                 dev_ctx->uberkernel_enabled = !(env && strcmp(env, "0") == 0);
                 // Graphs with more tokens than this launch unbatched; see uberkernel_active.
                 const char * mt               = getenv("GGML_ET_UK_MAX_TOKENS");
-                dev_ctx->uberkernel_max_tokens = (mt && *mt) ? atoi(mt) : 32;
+                dev_ctx->uberkernel_max_tokens = (mt && *mt) ? atoi(mt) : 8;
             }
             // Add buffer type for device to device context.
             ggml_backend_et_buffer_type_context * bufty_ctx = new ggml_backend_et_buffer_type_context;
