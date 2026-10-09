@@ -55,34 +55,37 @@ static void copy_f16_row(float * dst, const uint16_t * src, int64_t num_elements
 // Copy a row of F32 data from source to destination, aligned to cache line boundaries
 // using FP32 load/store instructions. They don't perform data conversion so is fine.
 // Requirement: n_bytes is a multiple of CACHE_LINE_SIZE (64 bytes)
+// Two lines are loaded before either is stored: a line load is a DRAM round trip, and the core keeps two
+// outstanding misses per hart (one line in flight was the whole cost of the recurrent-state gathers).
 static void copy_row_cache_align(float * dst, const float * src, int64_t n_bytes) {
-    int num_f32_elem = n_bytes / sizeof(float);
+    int64_t n_lines = n_bytes / CACHE_LINE_SIZE_BYTES;
 
-    // Unrolled to do an entire cache line at a time
-    __asm__ volatile(
-        "1: \n\t"
-        // --- Process 64 Bytes (1 Cache Line) ---
-        // Load 256 bits (32 bytes) into f0 and the other into f1
-        "flq2 f0, 0(%[src]) \n\t"
-        "flq2 f1, 32(%[src]) \n\t"
-
-        // Store 256 bits (32 bytes) from f0 and f1
-        "fsq2 f0, 0(%[dst]) \n\t"
-        "fsq2 f1, 32(%[dst]) \n\t"
-
-        // Increment Pointers by 64 bytes
-        "addi %[src], %[src], 64 \n\t"
-        "addi %[dst], %[dst], 64 \n\t"
-
-        // Decrement count by 16 elements
-        "addi %[n], %[n], -16 \n\t"
-
-        // Loop if at least 16 elements remain
-        "bge %[n], %[stride_count], 1b \n\t"
-
-        : [dst] "+r"(dst), [src] "+r"(src), [n] "+r"(num_f32_elem)
-        : [stride_count] "r"(16L)
-        : "f0", "f1", "memory");
+    for (; n_lines >= 2; n_lines -= 2) {
+        __asm__ volatile(
+            "flq2 f0, 0(%[src]) \n\t"
+            "flq2 f1, 32(%[src]) \n\t"
+            "flq2 f2, 64(%[src]) \n\t"
+            "flq2 f3, 96(%[src]) \n\t"
+            "fsq2 f0, 0(%[dst]) \n\t"
+            "fsq2 f1, 32(%[dst]) \n\t"
+            "fsq2 f2, 64(%[dst]) \n\t"
+            "fsq2 f3, 96(%[dst]) \n\t"
+            "addi %[src], %[src], 128 \n\t"
+            "addi %[dst], %[dst], 128 \n\t"
+            : [dst] "+r"(dst), [src] "+r"(src)
+            :
+            : "f0", "f1", "f2", "f3", "memory");
+    }
+    if (n_lines > 0) {
+        __asm__ volatile(
+            "flq2 f0, 0(%[src]) \n\t"
+            "flq2 f1, 32(%[src]) \n\t"
+            "fsq2 f0, 0(%[dst]) \n\t"
+            "fsq2 f1, 32(%[dst]) \n\t"
+            : [dst] "+r"(dst), [src] "+r"(src)
+            :
+            : "f0", "f1", "memory");
+    }
 }
 
 // Copied from GGML: copy a row of Q4_0 data to F32 destination (with dequantization)

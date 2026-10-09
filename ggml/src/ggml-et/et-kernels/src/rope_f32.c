@@ -540,7 +540,9 @@ int entry_point(struct ggml_et_rope_params * params, void * env) {
     float corr_dims[2];
     rope_yarn_corr_dims(n_dims, rope_params->n_ctx_orig, freq_base, rope_params->beta_fast, rope_params->beta_slow,
                         corr_dims);
+#ifndef ET_UBERKERNEL
     et_barrier(ET_BARRIER_GLOBAL);
+#endif
 
     // Distribute by individual heads: total = batch * seq_len * heads.
     const int64_t total_heads = batch * seq_len * heads;

@@ -508,6 +508,12 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
                                                                                            slot.insts[i].params_offset);
                         key += "[" + std::to_string(mp->src0.ne[1]) + "," + std::to_string(mp->src0.ne[0]) + "," +
                                std::to_string(mp->src1.ne[1]) + "]";
+                    } else if (key == "get_rows_f32" && slot.insts[i].params_size >= sizeof(ggml_et_get_rows_params)) {
+                        // key the row by [table rows x row width, rows gathered]
+                        const auto * gp = reinterpret_cast<const ggml_et_get_rows_params *>(slot.params_blob.data() +
+                                                                                             slot.insts[i].params_offset);
+                        key += "[" + std::to_string(gp->src0.ne[1]) + "x" + std::to_string(gp->src0.ne[0]) + "," +
+                               std::to_string(gp->src1.ne[0] * gp->src1.ne[1] * gp->src1.ne[2]) + "]";
                     }
                     auto & acc = g_uk_prof[key];
                     acc.first++;

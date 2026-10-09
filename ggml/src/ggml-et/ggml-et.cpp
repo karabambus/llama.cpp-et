@@ -1404,6 +1404,12 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
             continue;
         }
+        // A node with no elements has nothing to compute (the recurrent-state "extra" gather and its copy are
+        // zero-sized at one sequence), but as an uberkernel instruction it still costs the dispatcher's evict walk
+        // of its inputs and a chip-wide barrier.
+        if (ggml_is_empty(node)) {
+            continue;
+        }
 
         // --- Fusion checks (before regular dispatch) ---
         {
