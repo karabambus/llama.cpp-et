@@ -202,6 +202,16 @@ static inline void __attribute__((always_inline)) col_stage(float * row, int64_t
     }
 }
 
+// Publish lines this hart wrote to the shire's L2 (a FENCE alone leaves them in L1): nlines at stride bytes apart,
+// 16 per CSR write. Caller issues WAIT_CACHEOPS before the barrier.
+static inline void __attribute__((always_inline)) publish_l2(const void * addr, int64_t nlines, int64_t stride) {
+    FENCE;
+    for (int64_t i = 0; i < nlines; i += 16) {
+        const int64_t cnt = nlines - i < 16 ? nlines - i : 16;
+        evict_to_l2((const char *) addr + i * stride, (uint64_t) cnt, (uint64_t) stride);
+    }
+}
+
 int entry_point(struct ggml_et_hadamard_params * params, void * env) {
     kernel_environment_t * kernel_env = (kernel_environment_t *) env;
     if (!kernel_env || params == 0 || ((uint64_t) params & 0x7) != 0) {
@@ -271,12 +281,15 @@ int entry_point(struct ggml_et_hadamard_params * params, void * env) {
                 if (n >= 32) {
                     pass_a32(row + g * 32, xp + g * 32, sp ? sp + g * 32 : (const float *) 0, &scale);
                     stage_gather(row + g * 32, 32, pat_u4, pat_w4);
+                    publish_l2(row + g * 32, 2, 64);
                 } else {
                     pass_a16(row, xp, sp, &scale);
                     stage_gather(row, 16, pat_u4, pat_w4);
+                    publish_l2(row, 1, 64);
                 }
             }
         }
+        WAIT_CACHEOPS;
         FENCE;
         et_barrier(ET_BARRIER_SHIRE);
 
@@ -298,7 +311,9 @@ int entry_point(struct ggml_et_hadamard_params * params, void * env) {
                     col_stage(row, n, len, cl);
                 }
             }
+            publish_l2(row + cl * 16, rows32, 128);
         }
+        WAIT_CACHEOPS;
         FENCE;
         et_barrier(ET_BARRIER_SHIRE);
     }
