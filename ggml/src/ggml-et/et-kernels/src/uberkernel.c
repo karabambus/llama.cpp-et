@@ -126,9 +126,13 @@ static inline size_t tensor_span_bytes(const struct ggml_tensor * t) {
 //      First board run 2026-08-27: N=1 83.8 ms, N=32 760.9 ms, but PPL 10.4845 vs 10.4855 (a race between one hart's
 //      L1 evict and another hart's L2 walk of the same line) -> shire barrier between the two steps added.
 static uint32_t uk_mode;  // set by every hart at entry from params->flags (same value everywhere)
+// Timing-attribution knobs (host env GGML_ET_UK_TIMING_FLAGS, never set by default): bit 1 skips every per-instruction
+// evict (results are then wrong across shires - bench timing only), bit 2 takes the chip-wide barrier twice per
+// instruction (safe: every hart does it) so the delta against a plain run is the barrier's cost.
+static uint32_t uk_flags_all;
 
 static inline void uk_evict_region(const void * addr, size_t bytes) {
-    if (!addr || bytes == 0) {
+    if (!addr || bytes == 0 || (uk_flags_all & 2u)) {
         return;
     }
     if (uk_mode == 0) {
@@ -395,13 +399,17 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
     // evictions; the barrier count is 32 = every launch is chip-wide (the host refuses to batch a narrowed one).
     // A hart whose instruction failed keeps taking the barriers (it must never leave the loop while the others
     // still wait for it) and reports the first error at the end.
-#define UK_SYNC()                 \
-    do {                          \
-        WAIT_CACHEOPS;            \
-        et_barrier_global(32ULL); \
+#define UK_SYNC()                       \
+    do {                                \
+        WAIT_CACHEOPS;                  \
+        et_barrier_global(32ULL);       \
+        if (uk_flags_all & 4u) {        \
+            et_barrier_global(32ULL);   \
+        }                               \
     } while (0)
-    int failed = 0;
-    uk_mode    = params->flags & 1u;
+    int failed   = 0;
+    uk_mode      = params->flags & 1u;
+    uk_flags_all = params->flags;
     for (uint32_t i = 0; i < params->num_insts; ++i) {
         struct ggml_et_uberkernel_inst * inst =
             (struct ggml_et_uberkernel_inst *) ((uint8_t *) insts + (i * params->inst_stride));
@@ -409,7 +417,7 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
         int    rc          = -1;
 
         FENCE;
-        if (uk_mode == 1) {
+        if (uk_mode == 1 && !(uk_flags_all & 2u)) {
             cache_ops_priv_evict_l1(0, to_L2);  // whole L1 -> L2 (dirty outputs + SCP scratch), M-mode syscall
             // The L2->L3 walk below is split across the shire's harts, so a hart may push a line another hart of
             // this shire still holds dirty in L1: wait for every hart's L1 evict to land in L2 first. Without this

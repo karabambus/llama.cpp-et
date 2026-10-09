@@ -443,7 +443,9 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
             // Default mode 1 (whole-L1 evict, then the L2->L3 walk split across the shire): with every consumer case
             // evicting its inputs, mode 0 has every hart walk every input span and is slower than no uberkernel.
             const char * e = getenv("GGML_ET_UK_EVICT_MODE");
-            return (uint32_t) ((e && *e) ? strtoul(e, nullptr, 0) : 1u) & 1u;
+            const char * t = getenv("GGML_ET_UK_TIMING_FLAGS");  // bits 1-2, attribution runs only (uberkernel.c)
+            return ((uint32_t) ((e && *e) ? strtoul(e, nullptr, 0) : 1u) & 1u) |
+                   ((uint32_t) ((t && *t) ? strtoul(t, nullptr, 0) : 0u) & 6u);
         }();
         ggml_et_uberkernel_params params = {
             static_cast<uint32_t>(slot.insts.size()),
