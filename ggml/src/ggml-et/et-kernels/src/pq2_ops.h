@@ -106,4 +106,91 @@ static inline float pq2_dot_compute(const block_pq2_0 * q_row, const float * b_c
     return pq2_dot_reduce();
 }
 
+// Two rows interleaved: the chip-wide stream of this kernel is latency-bound at one 64-byte line in flight per hart
+// (home box r144-r146: 700 us per decode matmul, ~25 GB/s against a 62-70 GB/s band), so a hart works two rows at
+// once and keeps two lines in flight. Register contract: row 0 as above (f10 block acc, f11/f12 scratch, f20 row
+// acc), row 1 in f16 (block acc), f17/f18 (scratch), f21 (row acc); the activation vector f13 and the scale f15 are
+// shared per chunk / per block; f30/f31 are the patterns.
+#define PQ2V_CHUNK2(a0, a1, b)                                                              \
+    __asm__ volatile(                                                                       \
+        "fgb.ps     f11, f31(%[q0])\n\t"                                                    \
+        "fgb.ps     f17, f31(%[q1])\n\t"                                                    \
+        "flw.ps     f13, %[bv]\n\t"                                                         \
+        "fsrl.pi    f12, f11, f30\n\t"                                                      \
+        "fsrl.pi    f18, f17, f30\n\t"                                                      \
+        "fandi.pi   f12, f12, 3\n\t"                                                        \
+        "fandi.pi   f18, f18, 3\n\t"                                                        \
+        "faddi.pi   f12, f12, -1\n\t"                                                       \
+        "faddi.pi   f18, f18, -1\n\t"                                                       \
+        "fcvt.ps.pw f12, f12, rne\n\t"                                                      \
+        "fcvt.ps.pw f18, f18, rne\n\t"                                                      \
+        "fmadd.ps   f10, f12, f13, f10, rne\n\t"                                            \
+        "fmadd.ps   f16, f18, f13, f16, rne\n\t"                                            \
+        :                                                                                   \
+        : [q0] "r"(a0), [q1] "r"(a1), [bv] "m"(*(const float (*)[8]) (b))                  \
+        : "f10", "f11", "f12", "f13", "f16", "f17", "f18")
+
+static inline void __attribute__((always_inline)) pq2_dot_reset2(void) {
+    __asm__ volatile("fbci.pi f20, 0\n\tfbci.pi f21, 0" ::: "f20", "f21");
+}
+
+static inline void __attribute__((always_inline)) pq2_dot_tile2(const block_pq2_0 * q_row0,
+                                                                const block_pq2_0 * q_row1,
+                                                                const float *       b_col,
+                                                                int64_t             n_blocks) {
+    static const int32_t __attribute__((aligned(64))) gather_pattern[8] = { 0, 0, 0, 0, 1, 1, 1, 1 };
+    static const int32_t __attribute__((aligned(64))) shift_pattern[8]  = { 0, 2, 4, 6, 0, 2, 4, 6 };
+    __asm__ volatile(
+        "flw.ps f31, %[g]\n\t"
+        "flw.ps f30, %[s]\n\t"
+        :
+        : [g] "m"(*(const int32_t (*)[8]) gather_pattern), [s] "m"(*(const int32_t (*)[8]) shift_pattern)
+        : "f30", "f31");
+    for (int64_t kb = 0; kb < n_blocks; kb++) {
+        const uint8_t * qs0 = q_row0[kb].qs;
+        const uint8_t * qs1 = q_row1[kb].qs;
+        const float *   b   = b_col + kb * QK_PQ2_0;
+        __asm__ volatile("fbci.pi f10, 0\n\tfbci.pi f16, 0" ::: "f10", "f16");
+        for (int c = 0; c < 16; c += 4) {
+            PQ2V_CHUNK2(qs0 + 2 * c + 0, qs1 + 2 * c + 0, b + 8 * c + 0);
+            PQ2V_CHUNK2(qs0 + 2 * c + 2, qs1 + 2 * c + 2, b + 8 * c + 8);
+            PQ2V_CHUNK2(qs0 + 2 * c + 4, qs1 + 2 * c + 4, b + 8 * c + 16);
+            PQ2V_CHUNK2(qs0 + 2 * c + 6, qs1 + 2 * c + 6, b + 8 * c + 24);
+        }
+        const uint32_t sb0 = fp16_to_fp32_bits(q_row0[kb].d);
+        const uint32_t sb1 = fp16_to_fp32_bits(q_row1[kb].d);
+        __asm__ volatile(
+            "fbcx.ps  f15, %[s0]\n\t"
+            "fmadd.ps f20, f10, f15, f20, rne\n\t"
+            "fbcx.ps  f15, %[s1]\n\t"
+            "fmadd.ps f21, f16, f15, f21, rne\n\t"
+            :
+            : [s0] "r"(sb0), [s1] "r"(sb1)
+            : "f15", "f20", "f21");
+    }
+}
+
+// Horizontal sums of the two row accumulators (same tree as pq2_dot_reduce, on f20 then f21).
+static inline void __attribute__((always_inline)) pq2_dot_reduce2(float * r0, float * r1) {
+    float a, b;
+    __asm__ __volatile__(
+        "fswizz.ps f1, f20, 0xB1 \n\t"
+        "fadd.ps   f2, f20, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[v0], f4, f5, rne \n\t"
+        "fswizz.ps f1, f21, 0xB1 \n\t"
+        "fadd.ps   f2, f21, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[v1], f4, f5, rne \n\t"
+        : [v0] "=f"(a), [v1] "=f"(b)::"t0", "f1", "f2", "f3", "f4", "f5");
+    *r0 = a;
+    *r1 = b;
+}
+
 #endif  // PQ2_OPS_H

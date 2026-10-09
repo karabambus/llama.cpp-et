@@ -3,7 +3,8 @@
 // C[M,N] = A[M,K] * B[K,N], F32 activations and output.
 //
 // Rows are striped over all launched harts (m = hart_id, hart_id + 2048, ...); every hart computes whole dot
-// products, so no partial sums cross harts and each output element is published with one global atomic store.
+// products, two rows interleaved so two weight lines are in flight per hart (the stream is latency-bound at one),
+// so no partial sums cross harts and each output element is published with one global atomic store.
 // The dot product unpacks the 2-bit codes in the vector lanes (pq2_ops.h). K must be a multiple of 128
 // (supports_op guarantees it; the kernel refuses otherwise instead of reading past the row).
 //******************************************************************************
@@ -89,7 +90,23 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                 const float * bias_n = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
                 float *       c_col  = (float *) (dst_ptr2 + n * nbd1);
 
-                for (int64_t m = (int64_t) hart_id; m < M; m += STRIDE_M) {
+                // Two of this hart's rows at a time (two lines in flight per hart), then the odd row if any.
+                int64_t m = (int64_t) hart_id;
+                for (; m + STRIDE_M < M; m += 2 * STRIDE_M) {
+                    const block_pq2_0 * q_row0 = (const block_pq2_0 *) (src0_ptr2 + m * nb01);
+                    const block_pq2_0 * q_row1 = (const block_pq2_0 *) (src0_ptr2 + (m + STRIDE_M) * nb01);
+                    float               s0, s1;
+                    pq2_dot_reset2();
+                    pq2_dot_tile2(q_row0, q_row1, b_col, K_blocks);
+                    pq2_dot_reduce2(&s0, &s1);
+                    if (bias_n) {
+                        s0 += bias_n[m];
+                        s1 += bias_n[m + STRIDE_M];
+                    }
+                    atomic_store_f32((volatile float *) (c_col + m), s0);
+                    atomic_store_f32((volatile float *) (c_col + m + STRIDE_M), s1);
+                }
+                for (; m < M; m += STRIDE_M) {
                     const block_pq2_0 * q_row = (const block_pq2_0 *) (src0_ptr2 + m * nb01);
 
                     float sum = pq2_dot_compute(q_row, b_col, K_blocks);
