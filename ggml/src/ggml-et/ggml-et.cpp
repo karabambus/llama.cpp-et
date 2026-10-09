@@ -1363,6 +1363,7 @@ static bool et_hadamard_match_signed(const ggml_cgraph * cgraph, int i, const gg
 // (src[1]->ne[1]); that axis is not the token count for the fused Hadamard matmul, whose activation is reshaped to
 // [n_rot, nelements/n_rot], so hinted matmuls are skipped. MUL_MAT_ID carries tokens on ne[2] and is skipped.
 static int64_t et_graph_n_tokens(const ggml_cgraph * cgraph) {
+    static const bool stats_on = [] { const char * e = getenv("GGML_ET_UBERKERNEL_STATS"); return e && *e && strcmp(e, "0") != 0; }();
     int64_t n_rope = 0;
     int64_t n_mm   = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -1375,6 +1376,9 @@ static int64_t et_graph_n_tokens(const ggml_cgraph * cgraph) {
                    node->src[1]->ne[1] > n_mm) {
             n_mm = node->src[1]->ne[1];
         }
+    }
+    if (stats_on) {
+        fprintf(stderr, "ET-UK-TOKENS nodes=%d rope=%lld mm=%lld\n", cgraph->n_nodes, (long long) n_rope, (long long) n_mm);
     }
     return n_rope > 0 ? n_rope : n_mm;
 }
