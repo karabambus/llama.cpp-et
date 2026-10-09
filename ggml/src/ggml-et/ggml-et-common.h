@@ -81,6 +81,11 @@ struct ggml_backend_et_device_context {
     std::byte * moe_w_scratch = nullptr;
 
     bool                               uberkernel_enabled = false;
+    // Set per graph by graph_compute: batching is enabled AND the graph is decode-sized (token count at or under
+    // GGML_ET_UK_MAX_TOKENS). Every instruction pays a chip-wide barrier plus the consumer-side evicts, which on long
+    // prefill instructions outweigh the launch savings (home box r116-r118: decode +37 %, pp512 -10 %).
+    bool                               uberkernel_active  = false;
+    int                                uberkernel_max_tokens = 0;
     ggml_backend_et_uberkernel_context uberkernel;
 };
 

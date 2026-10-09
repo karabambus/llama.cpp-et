@@ -626,7 +626,7 @@ static bool ggml_et_launch_uberkernel(ggml_backend_et_device_context * dev_ctx,
 }
 
 bool ggml_et_uberkernel_end_graph(ggml_backend_et_device_context * dev_ctx) {
-    if (!dev_ctx || !dev_ctx->uberkernel_enabled) {
+    if (!dev_ctx || !dev_ctx->uberkernel_active) {
         return true;
     }
 
@@ -693,7 +693,7 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context * dev_ctx,
         sync_error_check = sync_error_check || force_sync;
     }
 
-    if (!dev_ctx->uberkernel_enabled) {
+    if (!dev_ctx->uberkernel_active) {
         return ggml_et_launch_kernel_internal(dev_ctx, kernel_name, params, params_size, shire_mask, enable_print,
                                               sync_error_check);
     }

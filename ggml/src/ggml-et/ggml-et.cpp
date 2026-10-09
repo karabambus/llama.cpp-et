@@ -1358,8 +1358,24 @@ static bool et_hadamard_match_signed(const ggml_cgraph * cgraph, int i, const gg
     return true;
 }
 
+// Token count of a graph: the widest activation operand of a plain MUL_MAT (src[1]->ne[1] is the token axis for
+// the dense projections and for QK^T; MUL_MAT_ID carries tokens on ne[2] and is skipped). 0 for a graph without one.
+static int64_t et_graph_n_tokens(const ggml_cgraph * cgraph) {
+    int64_t n = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] > n) {
+            n = node->src[1]->ne[1];
+        }
+    }
+    return n;
+}
+
 static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
+    dev_ctx->uberkernel_active = dev_ctx->uberkernel_enabled &&
+                                 (dev_ctx->uberkernel_max_tokens <= 0 ||
+                                  et_graph_n_tokens(cgraph) <= dev_ctx->uberkernel_max_tokens);
     ggml_et_uberkernel_begin_graph(&dev_ctx->uberkernel);
 
     int fused_groups           = 0;
@@ -2785,6 +2801,9 @@ ggml_backend_reg_t ggml_backend_et_reg(void) {
                 // so the uberkernel is only reachable if it is opt-out rather than opt-in.
                 const char * env            = getenv("GGML_ET_UBERKERNEL");
                 dev_ctx->uberkernel_enabled = !(env && strcmp(env, "0") == 0);
+                // Graphs with more tokens than this launch unbatched; see uberkernel_active.
+                const char * mt               = getenv("GGML_ET_UK_MAX_TOKENS");
+                dev_ctx->uberkernel_max_tokens = (mt && *mt) ? atoi(mt) : 32;
             }
             // Add buffer type for device to device context.
             ggml_backend_et_buffer_type_context * bufty_ctx = new ggml_backend_et_buffer_type_context;
