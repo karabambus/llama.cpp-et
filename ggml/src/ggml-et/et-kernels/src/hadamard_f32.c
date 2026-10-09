@@ -8,14 +8,14 @@
 //
 // Mapping: dst is [n, R] (R rows, each one block). Row j takes block b = j % (W/n) of activation row r = j / (W/n),
 // where W = x->ne[0] is the activation width (W % n == 0); signs, when present, are indexed by position in the width.
-// Each hart transforms whole rows, in place on dst: pass 0 writes scale * signs * x into the dst row, then the
-// log2(n) butterfly stages run on that row. The row lives in the hart's L1D, so no scratchpad and no cross-hart
-// traffic; the final values leave through plain fsw.ps / fscw.ps stores like every elementwise kernel here.
-//
-// Stages with distance >= 8 are contiguous 8-lane butterflies. Stages with distance 1, 2 and 4 pair elements inside
-// one 8-lane vector, so they run on 16-element groups through word gathers/scatters whose lane patterns pick the
-// "u" and "w" halves of each pair: e.g. distance 1 gathers elements {0,2,4,...,14} and {1,3,5,...,15}. n must be a
-// power of two with 16 <= n <= 4096 (the host checks).
+// Each hart transforms whole rows, in place on dst, in four memory passes instead of one per stage (the row is as
+// large as the hart's L1D, so every pass streams through L2): pass A loads each 32-float group into four vector
+// registers, applies scale and signs, runs the distance-1 and distance-2 butterflies with lane swizzles (0xB1,
+// 0x4E: the board-proven pair/adjacent swaps, replicated per 4-lane half) and the distance-8 and -16 ones across
+// the four registers, and stores; the distance-4 stage pairs lanes across the two halves of a vector, which no
+// register swizzle reaches, so it stays a word gather/scatter pass; the stages of distance 512 and above are plain
+// vector passes; the stages 32..256 run on 16-row chunks (rows of 32 floats, one column vector at a time) held in
+// registers. Stages commute, so the order is free. n must be a power of two with 16 <= n <= 4096 (the host checks).
 //******************************************************************************
 
 #include "ggml_tensor.h"
@@ -33,10 +33,6 @@ struct ggml_et_hadamard_params {
 };
 
 // Byte-offset lane patterns for the three in-vector stages, over a 16-element group.
-static const int32_t __attribute__((aligned(64))) pat_u1[8] = { 0, 8, 16, 24, 32, 40, 48, 56 };
-static const int32_t __attribute__((aligned(64))) pat_w1[8] = { 4, 12, 20, 28, 36, 44, 52, 60 };
-static const int32_t __attribute__((aligned(64))) pat_u2[8] = { 0, 4, 16, 20, 32, 36, 48, 52 };
-static const int32_t __attribute__((aligned(64))) pat_w2[8] = { 8, 12, 24, 28, 40, 44, 56, 60 };
 static const int32_t __attribute__((aligned(64))) pat_u4[8] = { 0, 4, 8, 12, 32, 36, 40, 44 };
 static const int32_t __attribute__((aligned(64))) pat_w4[8] = { 16, 20, 24, 28, 48, 52, 56, 60 };
 
@@ -85,6 +81,120 @@ static inline void __attribute__((always_inline)) stage_vector(float * row, int6
     }
 }
 
+// Lane sign vectors of the two swizzle stages: new = a * sign + swizzle(a) gives a_u + a_w on the "u" lane and
+// a_u - a_w on the "w" lane of each pair.
+static const float __attribute__((aligned(64))) sgn1[8] = { 1.f, -1.f, 1.f, -1.f, 1.f, -1.f, 1.f, -1.f };
+static const float __attribute__((aligned(64))) sgn2[8] = { 1.f, 1.f, -1.f, -1.f, 1.f, 1.f, -1.f, -1.f };
+
+#define HAD_SWZ_STAGE(v, imm, sg)                      \
+    "fswizz.ps f11, " v ", " imm "\n\t"                 \
+    "fmadd.ps  " v ", " v ", " sg ", f11, rne\n\t"
+// (a, b) <- (a + b, a - b); the copy back into b is an identity swizzle (0xE4), exact.
+#define HAD_BF(a, b, t)                                \
+    "fsub.ps   " t ", " a ", " b ", rne\n\t"            \
+    "fadd.ps   " a ", " a ", " b ", rne\n\t"            \
+    "fswizz.ps " b ", " t ", 0xE4\n\t"
+
+// Pass A on one 32-float group: dst[0..31] = butterflies of distance 1, 2, 8, 16 over scale * signs * x[0..31].
+static inline void __attribute__((always_inline)) pass_a32(float * d, const float * x, const float * sg,
+                                                             const float * scale) {
+    if (sg) {
+        __asm__ volatile(
+            "flw.ps  f0, 0(%[x])\n\t"  "flw.ps  f1, 32(%[x])\n\t"  "flw.ps  f2, 64(%[x])\n\t"  "flw.ps  f3, 96(%[x])\n\t"
+            "flw.ps  f4, 0(%[s])\n\t"  "flw.ps  f5, 32(%[s])\n\t"  "flw.ps  f6, 64(%[s])\n\t"  "flw.ps  f7, 96(%[s])\n\t"
+            "fmul.ps f0, f0, f4, rne\n\t" "fmul.ps f1, f1, f5, rne\n\t" "fmul.ps f2, f2, f6, rne\n\t" "fmul.ps f3, f3, f7, rne\n\t"
+            "fbc.ps  f8, %[sc]\n\t"
+            "fmul.ps f0, f0, f8, rne\n\t" "fmul.ps f1, f1, f8, rne\n\t" "fmul.ps f2, f2, f8, rne\n\t" "fmul.ps f3, f3, f8, rne\n\t"
+            "flw.ps  f9, %[g1]\n\t"  "flw.ps  f10, %[g2]\n\t"
+            HAD_SWZ_STAGE("f0", "0xB1", "f9") HAD_SWZ_STAGE("f1", "0xB1", "f9") HAD_SWZ_STAGE("f2", "0xB1", "f9") HAD_SWZ_STAGE("f3", "0xB1", "f9")
+            HAD_SWZ_STAGE("f0", "0x4E", "f10") HAD_SWZ_STAGE("f1", "0x4E", "f10") HAD_SWZ_STAGE("f2", "0x4E", "f10") HAD_SWZ_STAGE("f3", "0x4E", "f10")
+            HAD_BF("f0", "f1", "f11") HAD_BF("f2", "f3", "f11")
+            HAD_BF("f0", "f2", "f11") HAD_BF("f1", "f3", "f11")
+            "fsw.ps  f0, 0(%[d])\n\t"  "fsw.ps  f1, 32(%[d])\n\t"  "fsw.ps  f2, 64(%[d])\n\t"  "fsw.ps  f3, 96(%[d])\n\t"
+            :
+            : [x] "r"(x), [s] "r"(sg), [d] "r"(d), [sc] "m"(*scale), [g1] "m"(*(const float (*)[8]) sgn1),
+              [g2] "m"(*(const float (*)[8]) sgn2)
+            : "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "memory");
+    } else {
+        __asm__ volatile(
+            "flw.ps  f0, 0(%[x])\n\t"  "flw.ps  f1, 32(%[x])\n\t"  "flw.ps  f2, 64(%[x])\n\t"  "flw.ps  f3, 96(%[x])\n\t"
+            "fbc.ps  f8, %[sc]\n\t"
+            "fmul.ps f0, f0, f8, rne\n\t" "fmul.ps f1, f1, f8, rne\n\t" "fmul.ps f2, f2, f8, rne\n\t" "fmul.ps f3, f3, f8, rne\n\t"
+            "flw.ps  f9, %[g1]\n\t"  "flw.ps  f10, %[g2]\n\t"
+            HAD_SWZ_STAGE("f0", "0xB1", "f9") HAD_SWZ_STAGE("f1", "0xB1", "f9") HAD_SWZ_STAGE("f2", "0xB1", "f9") HAD_SWZ_STAGE("f3", "0xB1", "f9")
+            HAD_SWZ_STAGE("f0", "0x4E", "f10") HAD_SWZ_STAGE("f1", "0x4E", "f10") HAD_SWZ_STAGE("f2", "0x4E", "f10") HAD_SWZ_STAGE("f3", "0x4E", "f10")
+            HAD_BF("f0", "f1", "f11") HAD_BF("f2", "f3", "f11")
+            HAD_BF("f0", "f2", "f11") HAD_BF("f1", "f3", "f11")
+            "fsw.ps  f0, 0(%[d])\n\t"  "fsw.ps  f1, 32(%[d])\n\t"  "fsw.ps  f2, 64(%[d])\n\t"  "fsw.ps  f3, 96(%[d])\n\t"
+            :
+            : [x] "r"(x), [d] "r"(d), [sc] "m"(*scale), [g1] "m"(*(const float (*)[8]) sgn1),
+              [g2] "m"(*(const float (*)[8]) sgn2)
+            : "f0", "f1", "f2", "f3", "f8", "f9", "f10", "f11", "memory");
+    }
+}
+
+// Pass A on one 16-float group (n == 16 only): distances 1, 2 by swizzle, 8 across the two registers.
+static inline void __attribute__((always_inline)) pass_a16(float * d, const float * x, const float * sg,
+                                                             const float * scale) {
+    __asm__ volatile(
+        "flw.ps  f0, 0(%[x])\n\t"  "flw.ps  f1, 32(%[x])\n\t"
+        "fbc.ps  f8, %[sc]\n\t"
+        "fmul.ps f0, f0, f8, rne\n\t" "fmul.ps f1, f1, f8, rne\n\t"
+        "flw.ps  f9, %[g1]\n\t"  "flw.ps  f10, %[g2]\n\t"
+        HAD_SWZ_STAGE("f0", "0xB1", "f9") HAD_SWZ_STAGE("f1", "0xB1", "f9")
+        HAD_SWZ_STAGE("f0", "0x4E", "f10") HAD_SWZ_STAGE("f1", "0x4E", "f10")
+        HAD_BF("f0", "f1", "f11")
+        "fsw.ps  f0, 0(%[d])\n\t"  "fsw.ps  f1, 32(%[d])\n\t"
+        :
+        : [x] "r"(x), [d] "r"(d), [sc] "m"(*scale), [g1] "m"(*(const float (*)[8]) sgn1),
+          [g2] "m"(*(const float (*)[8]) sgn2)
+        : "f0", "f1", "f8", "f9", "f10", "f11", "memory");
+    if (sg) {
+        // signs applied before the transform: redo with the sign multiply (n == 16 is a test shape only)
+        __asm__ volatile(
+            "flw.ps  f0, 0(%[x])\n\t"  "flw.ps  f1, 32(%[x])\n\t"
+            "flw.ps  f4, 0(%[s])\n\t"  "flw.ps  f5, 32(%[s])\n\t"
+            "fmul.ps f0, f0, f4, rne\n\t" "fmul.ps f1, f1, f5, rne\n\t"
+            "fbc.ps  f8, %[sc]\n\t"
+            "fmul.ps f0, f0, f8, rne\n\t" "fmul.ps f1, f1, f8, rne\n\t"
+            "flw.ps  f9, %[g1]\n\t"  "flw.ps  f10, %[g2]\n\t"
+            HAD_SWZ_STAGE("f0", "0xB1", "f9") HAD_SWZ_STAGE("f1", "0xB1", "f9")
+            HAD_SWZ_STAGE("f0", "0x4E", "f10") HAD_SWZ_STAGE("f1", "0x4E", "f10")
+            HAD_BF("f0", "f1", "f11")
+            "fsw.ps  f0, 0(%[d])\n\t"  "fsw.ps  f1, 32(%[d])\n\t"
+            :
+            : [x] "r"(x), [s] "r"(sg), [d] "r"(d), [sc] "m"(*scale), [g1] "m"(*(const float (*)[8]) sgn1),
+              [g2] "m"(*(const float (*)[8]) sgn2)
+            : "f0", "f1", "f4", "f5", "f8", "f9", "f10", "f11", "memory");
+    }
+}
+
+// Pass B on 16 rows of 32 floats, one column vector (8 floats) each: butterflies of row distance 1, 2, 4, 8
+// (= element distance 32, 64, 128, 256) in registers. p points at row 0's column vector; rows are 128 bytes apart.
+static inline void __attribute__((always_inline)) pass_b16(float * p) {
+    __asm__ volatile(
+        "flw.ps f0, 0(%[p])\n\t"     "flw.ps f1, 128(%[p])\n\t"   "flw.ps f2, 256(%[p])\n\t"   "flw.ps f3, 384(%[p])\n\t"
+        "flw.ps f4, 512(%[p])\n\t"   "flw.ps f5, 640(%[p])\n\t"   "flw.ps f6, 768(%[p])\n\t"   "flw.ps f7, 896(%[p])\n\t"
+        "flw.ps f8, 1024(%[p])\n\t"  "flw.ps f9, 1152(%[p])\n\t"  "flw.ps f10, 1280(%[p])\n\t" "flw.ps f11, 1408(%[p])\n\t"
+        "flw.ps f12, 1536(%[p])\n\t" "flw.ps f13, 1664(%[p])\n\t" "flw.ps f14, 1792(%[p])\n\t" "flw.ps f15, 1920(%[p])\n\t"
+        HAD_BF("f0", "f1", "f16")  HAD_BF("f2", "f3", "f16")  HAD_BF("f4", "f5", "f16")  HAD_BF("f6", "f7", "f16")
+        HAD_BF("f8", "f9", "f16")  HAD_BF("f10", "f11", "f16") HAD_BF("f12", "f13", "f16") HAD_BF("f14", "f15", "f16")
+        HAD_BF("f0", "f2", "f16")  HAD_BF("f1", "f3", "f16")  HAD_BF("f4", "f6", "f16")  HAD_BF("f5", "f7", "f16")
+        HAD_BF("f8", "f10", "f16") HAD_BF("f9", "f11", "f16") HAD_BF("f12", "f14", "f16") HAD_BF("f13", "f15", "f16")
+        HAD_BF("f0", "f4", "f16")  HAD_BF("f1", "f5", "f16")  HAD_BF("f2", "f6", "f16")  HAD_BF("f3", "f7", "f16")
+        HAD_BF("f8", "f12", "f16") HAD_BF("f9", "f13", "f16") HAD_BF("f10", "f14", "f16") HAD_BF("f11", "f15", "f16")
+        HAD_BF("f0", "f8", "f16")  HAD_BF("f1", "f9", "f16")  HAD_BF("f2", "f10", "f16") HAD_BF("f3", "f11", "f16")
+        HAD_BF("f4", "f12", "f16") HAD_BF("f5", "f13", "f16") HAD_BF("f6", "f14", "f16") HAD_BF("f7", "f15", "f16")
+        "fsw.ps f0, 0(%[p])\n\t"     "fsw.ps f1, 128(%[p])\n\t"   "fsw.ps f2, 256(%[p])\n\t"   "fsw.ps f3, 384(%[p])\n\t"
+        "fsw.ps f4, 512(%[p])\n\t"   "fsw.ps f5, 640(%[p])\n\t"   "fsw.ps f6, 768(%[p])\n\t"   "fsw.ps f7, 896(%[p])\n\t"
+        "fsw.ps f8, 1024(%[p])\n\t"  "fsw.ps f9, 1152(%[p])\n\t"  "fsw.ps f10, 1280(%[p])\n\t" "fsw.ps f11, 1408(%[p])\n\t"
+        "fsw.ps f12, 1536(%[p])\n\t" "fsw.ps f13, 1664(%[p])\n\t" "fsw.ps f14, 1792(%[p])\n\t" "fsw.ps f15, 1920(%[p])\n\t"
+        :
+        : [p] "r"(p)
+        : "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15", "f16",
+          "memory");
+}
+
 int entry_point(struct ggml_et_hadamard_params * params, void * env) {
     kernel_environment_t * kernel_env = (kernel_environment_t *) env;
     if (!kernel_env || params == 0 || ((uint64_t) params & 0x7) != 0) {
@@ -121,7 +231,6 @@ int entry_point(struct ggml_et_hadamard_params * params, void * env) {
     unsigned long saved_mask;
     __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
     __asm__ volatile("mov.m.x m0, x0, 0xFF");
-    __asm__ volatile("fbc.ps f20, %[s]\n" : : [s] "m"(scale) : "f20");  // f20 (fs4): callee-saved, held across the row loop
 
     for (int64_t j = thread_id; j < R; j += num_threads) {
         // destination row
@@ -140,38 +249,33 @@ int entry_point(struct ggml_et_hadamard_params * params, void * env) {
         const int64_t i3  = r23 / src->ne[2];
         const float * xp  = (const float *) (x_base + i1 * src->nb[1] + i2 * src->nb[2] + i3 * src->nb[3]) + b * n;
 
-        // pass 0: row = scale * signs * x
-        if (s_base) {
-            const float * sp = (const float *) s_base + b * n;
-            for (int64_t c = 0; c < n; c += 8) {
-                __asm__ volatile(
-                    "flw.ps  f10, %[x]\n\t"
-                    "flw.ps  f11, %[sg]\n\t"
-                    "fmul.ps f10, f10, f11, rne\n\t"
-                    "fmul.ps f10, f10, f20, rne\n\t"
-                    "fsw.ps  f10, %[d]\n\t"
-                    : [d] "=m"(*(float (*)[8]) (row + c))
-                    : [x] "m"(*(const float (*)[8]) (xp + c)), [sg] "m"(*(const float (*)[8]) (sp + c))
-                    : "f10", "f11");
+        const float * sp = s_base ? (const float *) s_base + b * n : (const float *) 0;
+
+        // pass A: scale * signs * x with the distance 1, 2, 8, 16 butterflies, per 32-float group
+        if (n >= 32) {
+            for (int64_t c = 0; c < n; c += 32) {
+                pass_a32(row + c, xp + c, sp ? sp + c : (const float *) 0, &scale);
             }
         } else {
-            for (int64_t c = 0; c < n; c += 8) {
-                __asm__ volatile(
-                    "flw.ps  f10, %[x]\n\t"
-                    "fmul.ps f10, f10, f20, rne\n\t"
-                    "fsw.ps  f10, %[d]\n\t"
-                    : [d] "=m"(*(float (*)[8]) (row + c))
-                    : [x] "m"(*(const float (*)[8]) (xp + c))
-                    : "f10");
-            }
+            pass_a16(row, xp, sp, &scale);
         }
-
-        // butterflies, distance 1, 2, 4 inside the vector, then 8 .. n/2 across vectors
-        stage_gather(row, n, pat_u1, pat_w1);
-        stage_gather(row, n, pat_u2, pat_w2);
+        // distance 4: lanes of the two halves of a vector - a gather/scatter pass
         stage_gather(row, n, pat_u4, pat_w4);
-        for (int64_t len = 8; len < n; len <<= 1) {
-            stage_vector(row, n, len);
+        // distances 32 .. n/2 over rows of 32 floats
+        const int64_t rows32 = n / 32;
+        if (rows32 >= 16) {
+            for (int64_t len = 512; len < n; len <<= 1) {
+                stage_vector(row, n, len);
+            }
+            for (int64_t r0 = 0; r0 < rows32; r0 += 16) {
+                for (int64_t c = 0; c < 4; c++) {
+                    pass_b16(row + r0 * 32 + c * 8);
+                }
+            }
+        } else {
+            for (int64_t len = 32; len < n; len <<= 1) {
+                stage_vector(row, n, len);
+            }
         }
     }
 
