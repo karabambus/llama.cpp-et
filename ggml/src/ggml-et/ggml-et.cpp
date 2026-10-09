@@ -2529,7 +2529,11 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
             // F32, S_v must be multiple of 8 for vectorization
             // q, k, v may be row-contiguous with strided higher dimensions.
             // g, beta, state stay contiguous.
-            if (op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&  // q
+            // op_params[1] == 1 marks "raw gates" (ggml_gated_delta_net_set_raw_gates: alpha/beta arrive before
+            // softplus/exp and the op applies them with dt_bias and A); the kernel computes the plain form only, so
+            // such nodes go to the CPU instead of running wrong math (sys-emu 10-09: ERR ~1 on every raw-gate case).
+            if (op->type == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 1) == 0 &&
+                op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&                               // q
                 op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&                               // k
                 op->src[2] && op->src[2]->type == GGML_TYPE_F32 &&                               // v
                 op->src[3] && op->src[3]->type == GGML_TYPE_F32 &&                               // g

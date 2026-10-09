@@ -440,8 +440,10 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
                                     true);
 
         static const uint32_t uk_flags = [] {
+            // Default mode 1 (whole-L1 evict, then the L2->L3 walk split across the shire): with every consumer case
+            // evicting its inputs, mode 0 has every hart walk every input span and is slower than no uberkernel.
             const char * e = getenv("GGML_ET_UK_EVICT_MODE");
-            return (uint32_t) ((e && *e) ? strtoul(e, nullptr, 0) : 0u) & 1u;
+            return (uint32_t) ((e && *e) ? strtoul(e, nullptr, 0) : 1u) & 1u;
         }();
         ggml_et_uberkernel_params params = {
             static_cast<uint32_t>(slot.insts.size()),

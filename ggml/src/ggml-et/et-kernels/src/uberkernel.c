@@ -273,6 +273,13 @@ struct uber_hadamard_params {
     struct ggml_tensor signs;
     struct ggml_tensor dst;
 };
+// Generic prefixes for kernels whose params start with their tensors (device-side layouts checked per kernel):
+// src0+dst: l2_norm, scale, cumsum, tri, sum_rows, sqr, norm, pad, repeat, group_norm, diag; src0+src1+dst: solve_tri, set_rows,
+// get_rows, concat; src0+src1+src2+dst: softmax, rope.
+struct uber_src_dst { struct ggml_tensor src0; struct ggml_tensor dst; };
+struct uber_src2_dst { struct ggml_tensor src0; struct ggml_tensor src1; struct ggml_tensor dst; };
+struct uber_src3_dst { struct ggml_tensor src0; struct ggml_tensor src1; struct ggml_tensor src2; struct ggml_tensor dst; };
+struct uber_set_params { struct ggml_tensor src1; struct ggml_tensor dst; };  // SET writes into dst in place
 struct uber_cont_params {
     struct ggml_tensor src0;
     struct ggml_tensor dst;
@@ -457,14 +464,18 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                 }
             case GGML_ET_UBERKERNEL_KERNEL_ROPE_F32:
                 {
+                    struct uber_rope_params * p = (struct uber_rope_params *) inst_params;
+                    uk_evict(&p->src0);
+                    uk_evict(&p->src1);
+                    uk_evict(&p->src2);
                     UK_SYNC();
                     rc = rope_f32_entry((struct ggml_et_rope_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_RMS_NORM_F32:
                 {
-                    // struct ggml_et_rms_norm_params *p = (struct ggml_et_rms_norm_params *) inst_params;
-                    // evict_region_past_l2(p->src0.data, tensor_bytes(&p->src0));
+                    struct uber_rms_norm_params * p = (struct uber_rms_norm_params *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = rms_norm_f32_entry((struct ggml_et_rms_norm_params *) inst_params, env);
                     break;
@@ -480,12 +491,19 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SOFTMAX_F32:
                 {
+                    struct uber_softmax_params * p = (struct uber_softmax_params *) inst_params;
+                    uk_evict(&p->src0);
+                    uk_evict(&p->src1);
+                    uk_evict(&p->src2);
                     UK_SYNC();
                     rc = softmax_f32_entry((struct ggml_et_softmax_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SET_ROWS_F32:
                 {
+                    struct uber_set_rows_params * p = (struct uber_set_rows_params *) inst_params;
+                    uk_evict(&p->src0);
+                    uk_evict(&p->src1);
                     UK_SYNC();
                     rc = set_rows_f32_entry((struct ggml_et_set_rows_params *) inst_params, env);
                     break;
@@ -494,72 +512,96 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             // Single-source ops (src0 → dst)
             case GGML_ET_UBERKERNEL_KERNEL_SQR_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = sqr_f32_entry((struct ggml_et_sqr_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SCALE_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = scale_f32_entry((struct ggml_et_scale_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SUM_ROWS_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = sum_rows_f32_entry((struct ggml_et_sum_rows_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_CUMSUM_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = cumsum_f32_entry((struct ggml_et_cumsum_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_NORM_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = norm_f32_entry((struct ggml_et_norm_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_L2_NORM_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = l2_norm_f32_entry((struct ggml_et_l2_norm_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_GROUP_NORM_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = group_norm_f32_entry((struct ggml_et_group_norm_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_REPEAT_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = repeat_f32_entry((struct ggml_et_repeat_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_DIAG_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = diag_f32_entry((struct ggml_et_diag_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_TRI_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = tri_f32_entry((struct ggml_et_tri_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_PAD_F32:
                 {
+                    struct uber_src_dst * p = (struct uber_src_dst *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = pad_f32_entry((struct ggml_et_pad_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_CONT_F16:
                 {
+                    struct uber_cont_params * p = (struct uber_cont_params *) inst_params;
+                    uk_evict(&p->src0);
                     UK_SYNC();
                     rc = cont_f16_entry((struct ggml_et_cont_params *) inst_params, env);
                     break;
@@ -572,6 +614,9 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SET_F32:
                 {
+                    struct uber_set_params * p = (struct uber_set_params *) inst_params;
+                    uk_evict(&p->src1);
+                    uk_evict(&p->dst);
                     UK_SYNC();
                     rc = set_f32_entry((struct ggml_et_set_params *) inst_params, env);
                     break;
@@ -580,6 +625,9 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             // Two-source ops
             case GGML_ET_UBERKERNEL_KERNEL_CONCAT_F32:
                 {
+                    struct uber_concat_params * p = (struct uber_concat_params *) inst_params;
+                    uk_evict(&p->src0);
+                    uk_evict(&p->src1);
                     UK_SYNC();
                     rc = concat_f32_entry((struct ggml_et_concat_params *) inst_params, env);
                     break;
@@ -594,6 +642,9 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SOLVE_TRI_F32:
                 {
+                    struct uber_solve_tri_params * p = (struct uber_solve_tri_params *) inst_params;
+                    uk_evict(&p->src0);
+                    uk_evict(&p->src1);
                     UK_SYNC();
                     rc = solve_tri_f32_entry((struct ggml_et_solve_tri_params *) inst_params, env);
                     break;
@@ -608,6 +659,9 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             // Three-source ops
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_ID_F32:
                 {
+                    struct uber_mul_mat_id_params * p = (struct uber_mul_mat_id_params *) inst_params;
+                    uk_evict(&p->src1);
+                    uk_evict(&p->src2);
                     UK_SYNC();
                     rc = mul_mat_id_f32_entry((struct ggml_et_mul_mat_id_params *) inst_params, env);
                     break;
@@ -639,12 +693,27 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
 
             case GGML_ET_UBERKERNEL_KERNEL_GATED_DELTA_NET_F32:
                 {
+                    struct uber_gated_delta_net_params * p = (struct uber_gated_delta_net_params *) inst_params;
+                    uk_evict(&p->q);
+                    uk_evict(&p->k);
+                    uk_evict(&p->v);
+                    uk_evict(&p->g);
+                    uk_evict(&p->beta);
+                    uk_evict(&p->state_in);
                     UK_SYNC();
                     rc = gated_delta_net_f32_entry((struct ggml_et_gated_delta_net_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_SSM_SCAN_F32:
                 {
+                    struct uber_ssm_scan_params * p = (struct uber_ssm_scan_params *) inst_params;
+                    uk_evict(&p->src0);
+                    uk_evict(&p->src1);
+                    uk_evict(&p->src2);
+                    uk_evict(&p->src3);
+                    uk_evict(&p->src4);
+                    uk_evict(&p->src5);
+                    uk_evict(&p->src6);
                     UK_SYNC();
                     rc = ssm_scan_f32_entry((struct ggml_et_ssm_scan_params *) inst_params, env);
                     break;
@@ -730,6 +799,11 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                     // Independent Q8_0 mul_mats sharing one activation. Running them inside a
                     // single instruction is the point: the loop above executes a chip-wide
                     // barrier per instruction, and these members need none between them.
+                    struct uber_mul_mat_group_params * p = (struct uber_mul_mat_group_params *) inst_params;
+                    uk_evict(&p->src1);
+                    for (int32_t g = 0; g < p->n_mats && g < UBER_MUL_MAT_GROUP_MAX; g++) {
+                        uk_evict(&p->bias[g]);
+                    }
                     UK_SYNC();
                     rc = mul_mat_Q8_0_group_entry((struct ggml_et_mul_mat_group_params *) inst_params, env);
                     break;
@@ -789,7 +863,15 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             // ---- 052: Qwen3-MoE op set ----
             case GGML_ET_UBERKERNEL_KERNEL_GET_ROWS_F32:
                 {
-                    // src0 = embedding table (weights), src1 = token ids (host-written): nothing to evict
+                    // src0 is not always a weight: the linear-attention models gather the device-written recurrent
+                    // state with GET_ROWS (build_rs), so the table span and the ids are evicted like any input
+                    struct uber_get_rows_params * p = (struct uber_get_rows_params *) inst_params;
+                    // Only a float table can be device-written; a block-quantised table is a weight, and its span
+                    // computed from ne0*nb0 overshoots the allocation (nb0 is the block size), so it is not evicted.
+                    if (p->src0.type == GGML_TYPE_F32 || p->src0.type == GGML_TYPE_F16) {
+                        uk_evict(&p->src0);
+                    }
+                    uk_evict(&p->src1);
                     UK_SYNC();
                     rc = get_rows_f32_entry((struct ggml_et_get_rows_params *) inst_params, env);
                     break;
