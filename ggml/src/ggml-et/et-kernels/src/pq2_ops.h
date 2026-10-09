@@ -18,6 +18,7 @@
 //   f31       - byte gather pattern, f30 - per-lane shift amounts (both loaded by pq2_dot_tile)
 //   f10-f15   - scratch inside the tile
 //   f1-f5, t0 - scratch inside the reduce
+//   two-row tile: row 1 uses f16 (block acc), f17/f18 (scratch), f21 (row acc); f13 and f15 are shared
 
 #ifndef PQ2_OPS_H
 #define PQ2_OPS_H
@@ -95,7 +96,7 @@ static inline float __attribute__((always_inline)) pq2_dot_reduce(void) {
         "fmvz.x.ps t0, f4, 4 \n\t"
         "fbcx.ps   f5, t0 \n\t"
         "fadd.ps   %[vout], f4, f5, rne \n\t"
-        : [vout] "=f"(result)::"t0", "f1", "f2", "f3", "f4", "f5");
+        : [vout] "=f"(result)::"t0", "f1", "f2", "f3", "f4", "f5", "f20");
     return result;
 }
 
@@ -107,8 +108,7 @@ static inline float pq2_dot_compute(const block_pq2_0 * q_row, const float * b_c
 }
 
 // Two rows interleaved: the chip-wide stream of this kernel is latency-bound at one 64-byte line in flight per hart
-// (home box r144-r146: 700 us per decode matmul, ~25 GB/s against a 62-70 GB/s band), so a hart works two rows at
-// once and keeps two lines in flight. Register contract: row 0 as above (f10 block acc, f11/f12 scratch, f20 row
+// (~25 GB/s against a 62-70 GB/s band), so a hart works two rows at once and keeps two lines in flight. Register contract: row 0 as above (f10 block acc, f11/f12 scratch, f20 row
 // acc), row 1 in f16 (block acc), f17/f18 (scratch), f21 (row acc); the activation vector f13 and the scale f15 are
 // shared per chunk / per block; f30/f31 are the patterns.
 #define PQ2V_CHUNK2(a0, a1, b)                                                              \
@@ -170,7 +170,9 @@ static inline void __attribute__((always_inline)) pq2_dot_tile2(const block_pq2_
     }
 }
 
-// Horizontal sums of the two row accumulators (same tree as pq2_dot_reduce, on f20 then f21).
+// Horizontal sums of the two row accumulators (same tree as pq2_dot_reduce, on f20 then f21). The accumulators
+// are read implicitly from the tile, so they are declared clobbered: otherwise an output may be allocated onto
+// f21 and overwrite row 1 before it is read.
 static inline void __attribute__((always_inline)) pq2_dot_reduce2(float * r0, float * r1) {
     float a, b;
     __asm__ __volatile__(
@@ -188,7 +190,7 @@ static inline void __attribute__((always_inline)) pq2_dot_reduce2(float * r0, fl
         "fmvz.x.ps t0, f4, 4 \n\t"
         "fbcx.ps   f5, t0 \n\t"
         "fadd.ps   %[v1], f4, f5, rne \n\t"
-        : [v0] "=f"(a), [v1] "=f"(b)::"t0", "f1", "f2", "f3", "f4", "f5");
+        : [v0] "=f"(a), [v1] "=f"(b)::"t0", "f1", "f2", "f3", "f4", "f5", "f20", "f21");
     *r0 = a;
     *r1 = b;
 }
