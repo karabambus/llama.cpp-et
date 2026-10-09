@@ -69,6 +69,10 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     }
 #endif
 
+    // The windowed gather (fg32b.ps) is bit-identical to fgb.ps only at even chunk addresses: blocks are 34 bytes,
+    // so every chunk address is even exactly when the weight base and the row/batch strides are even (pq2_ops.h).
+    const int windowed = ((((uintptr_t) params->src0.data) | nb01 | nb02 | nb03) & 1) == 0;
+
     unsigned long saved_mask;
     __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
     __asm__ volatile("mov.m.x m0, x0, 0xFF");
@@ -99,7 +103,11 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                     const block_pq2_0 * q_row1 = (const block_pq2_0 *) (src0_ptr2 + (m + STRIDE_M) * nb01);
                     float               s0, s1;
                     pq2_dot_reset2();
-                    pq2_dot_tile2(q_row0, q_row1, b_col, K_blocks);
+                    if (windowed) {
+                        pq2_dot_tile2_w(q_row0, q_row1, b_col, K_blocks);
+                    } else {
+                        pq2_dot_tile2(q_row0, q_row1, b_col, K_blocks);
+                    }
                     pq2_dot_reduce2(&s0, &s1);
                     if (bias_n) {
                         s0 += bias_n[m];
@@ -111,7 +119,8 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                 for (; m < M; m += STRIDE_M) {
                     const block_pq2_0 * q_row = (const block_pq2_0 *) (src0_ptr2 + m * nb01);
 
-                    float sum = pq2_dot_compute(q_row, b_col, K_blocks);
+                    float sum = windowed ? pq2_dot_compute_w(q_row, b_col, K_blocks)
+                                         : pq2_dot_compute(q_row, b_col, K_blocks);
                     if (bias_n) {
                         sum += bias_n[m];
                     }

@@ -7,8 +7,11 @@
 // Unpacking 8 consecutive elements into 8 lanes: a byte gather with the pattern {0,0,0,0,1,1,1,1} places byte 2c
 // in lanes 0..3 and byte 2c+1 in lanes 4..7; a per-lane logical shift by {0,2,4,6,0,2,4,6} and a mask of 3 then
 // leave the lane's own 2-bit code. The gather sign-extends bytes >= 0x80, which the logical shift and mask make
-// irrelevant. Only fgb.ps is used for the bytes: blocks are 34 bytes long, so qs is never 32-byte aligned and the
-// windowed fg32b.ps precondition (address & 31 <= 24) would not hold for every block.
+// irrelevant. Two gather forms: fgb.ps (index vector in f31, any address) and the windowed fg32b.ps (index pattern
+// in an integer register, lane e reads (a & ~31) + ((a + idx_e) & 31)), which costs a fraction of fgb.ps's issue
+// time. With idx <= 1 the window wraps only when (a & 31) == 31, so the two are bit-identical at every even chunk
+// address; the kernel checks once per launch that the weight base and strides are even (blocks are 34 bytes, so
+// every chunk address is then even) and otherwise keeps the fgb.ps tiles.
 //
 // The fp16 block scale is converted in integer code (fp16_to_fp32_bits) and broadcast with fbcx.ps; fcvt.ps.f16
 // flushes subnormal halves and must not touch block scales (KB 02 section 5.1).
@@ -44,6 +47,23 @@ static inline void __attribute__((always_inline)) pq2_dot_reset(void) {
         "fmadd.ps   f10, f12, f13, f10, rne\n\t"                                            \
         :                                                                                   \
         : [q] "r"(a), [bv] "m"(*(const float (*)[8]) (b))                                   \
+        : "f10", "f11", "f12", "f13")
+
+// fg32b.ps index pattern {0,0,0,0,1,1,1,1}: 5 bits per lane, lane e at bits 5e..5e+4.
+#define PQ2_GATHER_WINDOW_IDX 0x842100000ULL
+
+// PQ2V_CHUNK with the windowed gather; gi holds PQ2_GATHER_WINDOW_IDX, a must be even.
+#define PQ2V_CHUNK_W(a, b, gi)                                                              \
+    __asm__ volatile(                                                                       \
+        "fg32b.ps   f11, %[gi](%[q])\n\t"                                                   \
+        "fsrl.pi    f12, f11, f30\n\t"                                                      \
+        "fandi.pi   f12, f12, 3\n\t"                                                        \
+        "faddi.pi   f12, f12, -1\n\t"                                                       \
+        "fcvt.ps.pw f12, f12, rne\n\t"                                                      \
+        "flw.ps     f13, %[bv]\n\t"                                                         \
+        "fmadd.ps   f10, f12, f13, f10, rne\n\t"                                            \
+        :                                                                                   \
+        : [q] "r"(a), [gi] "r"(gi), [bv] "m"(*(const float (*)[8]) (b))                     \
         : "f10", "f11", "f12", "f13")
 
 // Accumulate n_blocks PQ2_0 blocks of q_row against b_col into f20.
@@ -85,6 +105,39 @@ static inline void __attribute__((always_inline)) pq2_dot_tile(const block_pq2_0
     }
 }
 
+// pq2_dot_tile with the windowed gather (even chunk addresses only).
+static inline void __attribute__((always_inline)) pq2_dot_tile_w(const block_pq2_0 * q_row,
+                                                                 const float *       b_col,
+                                                                 int64_t             n_blocks) {
+    static const int32_t __attribute__((aligned(64))) shift_pattern[8] = { 0, 2, 4, 6, 0, 2, 4, 6 };
+    const uint64_t                                    gi               = PQ2_GATHER_WINDOW_IDX;
+
+    __asm__ volatile("flw.ps f30, %[s]\n\t" : : [s] "m"(*(const int32_t (*)[8]) shift_pattern) : "f30");
+
+    for (int64_t kb = 0; kb < n_blocks; kb++) {
+        const block_pq2_0 * blk = q_row + kb;
+        const uint8_t *     qs  = blk->qs;
+        const float *       b   = b_col + kb * QK_PQ2_0;
+
+        __asm__ volatile("fbci.pi f10, 0" ::: "f10");
+
+        for (int c = 0; c < 16; c += 4) {
+            PQ2V_CHUNK_W(qs + 2 * c + 0, b + 8 * c + 0, gi);
+            PQ2V_CHUNK_W(qs + 2 * c + 2, b + 8 * c + 8, gi);
+            PQ2V_CHUNK_W(qs + 2 * c + 4, b + 8 * c + 16, gi);
+            PQ2V_CHUNK_W(qs + 2 * c + 6, b + 8 * c + 24, gi);
+        }
+
+        const uint32_t scale_bits = fp16_to_fp32_bits(blk->d);
+        __asm__ volatile(
+            "fbcx.ps  f15, %[sb]\n\t"
+            "fmadd.ps f20, f10, f15, f20, rne\n\t"
+            :
+            : [sb] "r"(scale_bits)
+            : "f15", "f20");
+    }
+}
+
 // Horizontal sum of the 8-lane accumulator f20.
 static inline float __attribute__((always_inline)) pq2_dot_reduce(void) {
     float result;
@@ -104,6 +157,12 @@ static inline float __attribute__((always_inline)) pq2_dot_reduce(void) {
 static inline float pq2_dot_compute(const block_pq2_0 * q_row, const float * b_col, int64_t K_blocks) {
     pq2_dot_reset();
     pq2_dot_tile(q_row, b_col, K_blocks);
+    return pq2_dot_reduce();
+}
+
+static inline float pq2_dot_compute_w(const block_pq2_0 * q_row, const float * b_col, int64_t K_blocks) {
+    pq2_dot_reset();
+    pq2_dot_tile_w(q_row, b_col, K_blocks);
     return pq2_dot_reduce();
 }
 
@@ -128,6 +187,26 @@ static inline float pq2_dot_compute(const block_pq2_0 * q_row, const float * b_c
         "fmadd.ps   f16, f18, f13, f16, rne\n\t"                                            \
         :                                                                                   \
         : [q0] "r"(a0), [q1] "r"(a1), [bv] "m"(*(const float (*)[8]) (b))                  \
+        : "f10", "f11", "f12", "f13", "f16", "f17", "f18")
+
+// PQ2V_CHUNK2 with the windowed gather; gi holds PQ2_GATHER_WINDOW_IDX, a0 and a1 must be even.
+#define PQ2V_CHUNK2_W(a0, a1, b, gi)                                                        \
+    __asm__ volatile(                                                                       \
+        "fg32b.ps   f11, %[gi](%[q0])\n\t"                                                  \
+        "fg32b.ps   f17, %[gi](%[q1])\n\t"                                                  \
+        "flw.ps     f13, %[bv]\n\t"                                                         \
+        "fsrl.pi    f12, f11, f30\n\t"                                                      \
+        "fsrl.pi    f18, f17, f30\n\t"                                                      \
+        "fandi.pi   f12, f12, 3\n\t"                                                        \
+        "fandi.pi   f18, f18, 3\n\t"                                                        \
+        "faddi.pi   f12, f12, -1\n\t"                                                       \
+        "faddi.pi   f18, f18, -1\n\t"                                                       \
+        "fcvt.ps.pw f12, f12, rne\n\t"                                                      \
+        "fcvt.ps.pw f18, f18, rne\n\t"                                                      \
+        "fmadd.ps   f10, f12, f13, f10, rne\n\t"                                            \
+        "fmadd.ps   f16, f18, f13, f16, rne\n\t"                                            \
+        :                                                                                   \
+        : [q0] "r"(a0), [q1] "r"(a1), [gi] "r"(gi), [bv] "m"(*(const float (*)[8]) (b))     \
         : "f10", "f11", "f12", "f13", "f16", "f17", "f18")
 
 static inline void __attribute__((always_inline)) pq2_dot_reset2(void) {
@@ -156,6 +235,38 @@ static inline void __attribute__((always_inline)) pq2_dot_tile2(const block_pq2_
             PQ2V_CHUNK2(qs0 + 2 * c + 2, qs1 + 2 * c + 2, b + 8 * c + 8);
             PQ2V_CHUNK2(qs0 + 2 * c + 4, qs1 + 2 * c + 4, b + 8 * c + 16);
             PQ2V_CHUNK2(qs0 + 2 * c + 6, qs1 + 2 * c + 6, b + 8 * c + 24);
+        }
+        const uint32_t sb0 = fp16_to_fp32_bits(q_row0[kb].d);
+        const uint32_t sb1 = fp16_to_fp32_bits(q_row1[kb].d);
+        __asm__ volatile(
+            "fbcx.ps  f15, %[s0]\n\t"
+            "fmadd.ps f20, f10, f15, f20, rne\n\t"
+            "fbcx.ps  f15, %[s1]\n\t"
+            "fmadd.ps f21, f16, f15, f21, rne\n\t"
+            :
+            : [s0] "r"(sb0), [s1] "r"(sb1)
+            : "f15", "f20", "f21");
+    }
+}
+
+// pq2_dot_tile2 with the windowed gather (even chunk addresses only).
+static inline void __attribute__((always_inline)) pq2_dot_tile2_w(const block_pq2_0 * q_row0,
+                                                                  const block_pq2_0 * q_row1,
+                                                                  const float *       b_col,
+                                                                  int64_t             n_blocks) {
+    static const int32_t __attribute__((aligned(64))) shift_pattern[8] = { 0, 2, 4, 6, 0, 2, 4, 6 };
+    const uint64_t                                    gi               = PQ2_GATHER_WINDOW_IDX;
+    __asm__ volatile("flw.ps f30, %[s]\n\t" : : [s] "m"(*(const int32_t (*)[8]) shift_pattern) : "f30");
+    for (int64_t kb = 0; kb < n_blocks; kb++) {
+        const uint8_t * qs0 = q_row0[kb].qs;
+        const uint8_t * qs1 = q_row1[kb].qs;
+        const float *   b   = b_col + kb * QK_PQ2_0;
+        __asm__ volatile("fbci.pi f10, 0\n\tfbci.pi f16, 0" ::: "f10", "f16");
+        for (int c = 0; c < 16; c += 4) {
+            PQ2V_CHUNK2_W(qs0 + 2 * c + 0, qs1 + 2 * c + 0, b + 8 * c + 0, gi);
+            PQ2V_CHUNK2_W(qs0 + 2 * c + 2, qs1 + 2 * c + 2, b + 8 * c + 8, gi);
+            PQ2V_CHUNK2_W(qs0 + 2 * c + 4, qs1 + 2 * c + 4, b + 8 * c + 16, gi);
+            PQ2V_CHUNK2_W(qs0 + 2 * c + 6, qs1 + 2 * c + 6, b + 8 * c + 24, gi);
         }
         const uint32_t sb0 = fp16_to_fp32_bits(q_row0[kb].d);
         const uint32_t sb1 = fp16_to_fp32_bits(q_row1[kb].d);
