@@ -1,4 +1,5 @@
 #include <map>
+#include "ggml-et-ops.h"
 #include <algorithm>
 #include "ggml-et-kernels.h"
 #include <chrono>
@@ -41,7 +42,7 @@ static size_t ggml_et_next_capacity(size_t current_capacity, size_t required_cap
 // instructions / standalone launches) - the number that decides whether the uberkernel pays.
 struct ggml_et_uk_stats { uint64_t segments = 0, insts = 0, standalone = 0, graphs = 0; };
 static ggml_et_uk_stats g_uk_stats;
-static std::map<uint16_t, std::pair<uint64_t, uint64_t>> g_uk_prof;  // kernel id -> (n, cycles)
+static std::map<std::string, std::pair<uint64_t, uint64_t>> g_uk_prof;  // kernel [shape] -> (n, cycles)
 static uint64_t g_uk_prof_bad = 0;  // segments whose stamps were unwritten or not monotonic
 static_assert(sizeof(ggml_et_uberkernel_params) == 40, "host/device params layout");
 static const bool g_uk_stats_on = [] { const char * e = getenv("GGML_ET_UBERKERNEL_STATS"); return e && *e && strcmp(e, "0") != 0; }();
@@ -499,7 +500,16 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
                 g_uk_prof_bad++;
             } else {
                 for (size_t i = 0; i < slot.insts.size(); ++i) {
-                    auto & acc = g_uk_prof[slot.insts[i].kernel_id];
+                    std::string key = ggml_et_uberkernel_kernel_name_from_id(slot.insts[i].kernel_id);
+                    if (key.rfind("mul_mat_", 0) == 0 && key.find("_id_") == std::string::npos &&
+                        slot.insts[i].params_size >= sizeof(ggml_et_mm_q8_params)) {
+                        // matmul kernels share the mm_q8 params layout (src0 first): key the row by [M,K,N]
+                        const auto * mp = reinterpret_cast<const ggml_et_mm_q8_params *>(slot.params_blob.data() +
+                                                                                           slot.insts[i].params_offset);
+                        key += "[" + std::to_string(mp->src0.ne[1]) + "," + std::to_string(mp->src0.ne[0]) + "," +
+                               std::to_string(mp->src1.ne[1]) + "]";
+                    }
+                    auto & acc = g_uk_prof[key];
                     acc.first++;
                     acc.second += stamps[i + 1] - stamps[i];
                 }
@@ -688,15 +698,15 @@ bool ggml_et_uberkernel_end_graph(ggml_backend_et_device_context * dev_ctx) {
     if (!g_uk_prof.empty()) {
         // One table per graph (GGML_ET_UK_PROFILE): instruction i = its body on the slowest hart + the next
         // instruction's evicts and chip-wide barrier; cycles are hpmcounter3 at 600 MHz.
-        std::vector<std::pair<uint16_t, std::pair<uint64_t, uint64_t>>> rows(g_uk_prof.begin(), g_uk_prof.end());
+        std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> rows(g_uk_prof.begin(), g_uk_prof.end());
         std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.second > b.second.second; });
         uint64_t total = 0;
         for (const auto & r : rows) { total += r.second.second; }
         fprintf(stderr, "ET-UK-PROF total_cycles=%llu total_ms@600MHz=%.2f bad_segments=%llu\n", (unsigned long long) total,
                 (double) total / 600e3, (unsigned long long) g_uk_prof_bad);
         for (const auto & r : rows) {
-            fprintf(stderr, "ET-UK-PROF %-28s n=%6llu mean_cycles=%10llu mean_us=%8.1f total_ms=%8.2f\n",
-                    ggml_et_uberkernel_kernel_name_from_id(r.first), (unsigned long long) r.second.first,
+            fprintf(stderr, "ET-UK-PROF %-40s n=%6llu mean_cycles=%10llu mean_us=%8.1f total_ms=%8.2f\n",
+                    r.first.c_str(), (unsigned long long) r.second.first,
                     (unsigned long long) (r.second.second / r.second.first),
                     (double) r.second.second / 600.0 / (double) r.second.first, (double) r.second.second / 600e3);
         }
