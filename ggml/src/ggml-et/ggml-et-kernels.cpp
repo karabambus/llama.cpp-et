@@ -1,3 +1,5 @@
+#include <map>
+#include <algorithm>
 #include "ggml-et-kernels.h"
 #include <chrono>
 
@@ -39,6 +41,7 @@ static size_t ggml_et_next_capacity(size_t current_capacity, size_t required_cap
 // instructions / standalone launches) - the number that decides whether the uberkernel pays.
 struct ggml_et_uk_stats { uint64_t segments = 0, insts = 0, standalone = 0, graphs = 0; };
 static ggml_et_uk_stats g_uk_stats;
+static std::map<uint16_t, std::pair<uint64_t, uint64_t>> g_uk_prof;  // kernel id -> (n, cycles)
 static const bool g_uk_stats_on = [] { const char * e = getenv("GGML_ET_UBERKERNEL_STATS"); return e && *e && strcmp(e, "0") != 0; }();
 
 static ggml_backend_et_uberkernel_slot & ggml_et_uberkernel_current_slot(ggml_backend_et_uberkernel_context * uk_ctx) {
@@ -439,6 +442,19 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
         runtime->memcpyHostToDevice(dev_ctx->default_stream, slot.params_blob.data(), slot.device_params, params_size,
                                     true);
 
+        static const bool uk_prof_on = [] {
+            const char * e = getenv("GGML_ET_UK_PROFILE");
+            return e && *e && strcmp(e, "0") != 0;
+        }();
+        const size_t prof_size = (slot.insts.size() + 1) * sizeof(uint64_t);
+        if (uk_prof_on && (slot.device_prof == nullptr || prof_size > slot.device_prof_capacity)) {
+            const size_t new_capacity = ggml_et_next_capacity(slot.device_prof_capacity, prof_size);
+            if (slot.device_prof) {
+                runtime->freeDevice(dev_ctx->rtid, slot.device_prof);
+            }
+            slot.device_prof          = runtime->mallocDevice(dev_ctx->rtid, new_capacity);
+            slot.device_prof_capacity = slot.device_prof ? new_capacity : 0;
+        }
         static const uint32_t uk_flags = [] {
             // Default mode 1 (whole-L1 evict, then the L2->L3 walk split across the shire): with every consumer case
             // evicting its inputs, mode 0 has every hart walk every input span and is slower than no uberkernel.
@@ -447,19 +463,33 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
             return ((uint32_t) ((e && *e) ? strtoul(e, nullptr, 0) : 1u) & 1u) |
                    ((uint32_t) ((t && *t) ? strtoul(t, nullptr, 0) : 0u) & 6u);
         }();
+        const bool prof_this = uk_prof_on && slot.device_prof != nullptr;
         ggml_et_uberkernel_params params = {
             static_cast<uint32_t>(slot.insts.size()),
             static_cast<uint32_t>(sizeof(ggml_et_uberkernel_inst)),
             reinterpret_cast<uint64_t>(slot.device_insts),
             reinterpret_cast<uint64_t>(slot.device_params),
-            uk_flags,
+            uk_flags | (prof_this ? 8u : 0u),
             0u,
+            prof_this ? reinterpret_cast<uint64_t>(slot.device_prof) : 0ull,
         };
 
         rt::EventId launch_event{};
         g_uk_stats.segments++;
         ok = ggml_et_launch_kernel_internal(dev_ctx, "uberkernel", &params, sizeof(params), shire_mask, false, false,
                                             &launch_event);
+        if (ok && prof_this) {
+            // Serialises the segment (profiling only): read the stamps back in stream order and attribute them.
+            std::vector<uint64_t> stamps(slot.insts.size() + 1);
+            rt::EventId ev = runtime->memcpyDeviceToHost(dev_ctx->default_stream, slot.device_prof,
+                                                         reinterpret_cast<std::byte *>(stamps.data()), prof_size, true);
+            runtime->waitForEvent(ev);
+            for (size_t i = 0; i < slot.insts.size(); ++i) {
+                auto & acc = g_uk_prof[slot.insts[i].kernel_id];
+                acc.first++;
+                acc.second += stamps[i + 1] - stamps[i];
+            }
+        }
         if (ok) {
             // The kernelLaunch above is the last thing on default_stream
             // that touches this slot's device buffers. Recording its event
@@ -639,6 +669,21 @@ bool ggml_et_uberkernel_end_graph(ggml_backend_et_device_context * dev_ctx) {
                 (unsigned long long) g_uk_stats.graphs, (unsigned long long) g_uk_stats.segments,
                 (unsigned long long) g_uk_stats.insts, (unsigned long long) g_uk_stats.standalone);
         g_uk_stats.segments = g_uk_stats.insts = g_uk_stats.standalone = 0;
+    }
+    if (!g_uk_prof.empty()) {
+        // One table per graph (GGML_ET_UK_PROFILE): instruction i = its body on the slowest hart + the next
+        // instruction's evicts and chip-wide barrier; cycles are hpmcounter3 at 600 MHz.
+        std::vector<std::pair<uint16_t, std::pair<uint64_t, uint64_t>>> rows(g_uk_prof.begin(), g_uk_prof.end());
+        std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.second > b.second.second; });
+        uint64_t total = 0;
+        for (const auto & r : rows) { total += r.second.second; }
+        fprintf(stderr, "ET-UK-PROF total_ms=%.2f\n", (double) total / 600e3);
+        for (const auto & r : rows) {
+            fprintf(stderr, "ET-UK-PROF %-28s n=%6llu mean_us=%8.1f total_ms=%8.2f\n",
+                    ggml_et_uberkernel_kernel_name_from_id(r.first), (unsigned long long) r.second.first,
+                    (double) r.second.second / 600.0 / (double) r.second.first, (double) r.second.second / 600e3);
+        }
+        g_uk_prof.clear();
     }
     return ok;
 }

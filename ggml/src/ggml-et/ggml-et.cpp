@@ -494,6 +494,10 @@ static void ggml_backend_et_free(ggml_backend_t backend) {
                     runtime->freeDevice(dev_ctx->rtid, slot.device_params);
                     slot.device_params = nullptr;
                 }
+                if (slot.device_prof) {
+                    runtime->freeDevice(dev_ctx->rtid, slot.device_prof);
+                    slot.device_prof = nullptr;
+                }
                 slot.has_pending = false;
             }
         }

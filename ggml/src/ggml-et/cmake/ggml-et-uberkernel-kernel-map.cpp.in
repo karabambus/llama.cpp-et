@@ -15,4 +15,16 @@ uint16_t ggml_et_uberkernel_kernel_id_from_name(const char * kernel_name) {
     auto it = kernel_id_map.find(std::string(kernel_name));
     return it == kernel_id_map.end() ? GGML_ET_UBERKERNEL_KERNEL_INVALID : it->second;
 }
+
+const char * ggml_et_uberkernel_kernel_name_from_id(uint16_t kernel_id) {
+    static const std::unordered_map<std::string, uint16_t> kernel_id_map = {
+@UBERKERNEL_MAP_ENTRIES@
+    };
+    for (const auto & kv : kernel_id_map) {
+        if (kv.second == kernel_id) {
+            return kv.first.c_str();
+        }
+    }
+    return "?";
+}
 #endif

@@ -130,6 +130,16 @@ static uint32_t uk_mode;  // set by every hart at entry from params->flags (same
 // evict (results are then wrong across shires - bench timing only), bit 2 takes the chip-wide barrier twice per
 // instruction (safe: every hart does it) so the delta against a plain run is the barrier's cost.
 static uint32_t uk_flags_all;
+static uint64_t * uk_prof;     // per-instruction cycle stamps (flags bit 3), written by hart 0 only
+static int        uk_prof_on;
+#define UK_STAMP(idx)                                                       \
+    do {                                                                    \
+        if (uk_prof_on) {                                                   \
+            uint64_t c_;                                                    \
+            __asm__ __volatile__("csrr %0, hpmcounter3" : "=r"(c_));        \
+            uk_prof[(idx)] = c_;                                            \
+        }                                                                   \
+    } while (0)
 
 static inline void uk_evict_region(const void * addr, size_t bytes) {
     if (!addr || bytes == 0 || (uk_flags_all & 2u)) {
@@ -406,10 +416,13 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
         if (uk_flags_all & 4u) {        \
             et_barrier_global(32ULL);   \
         }                               \
+        UK_STAMP(i);                    \
     } while (0)
     int failed   = 0;
     uk_mode      = params->flags & 1u;
     uk_flags_all = params->flags;
+    uk_prof      = (uint64_t *) params->prof_buf;
+    uk_prof_on   = (params->flags & 8u) && uk_prof && get_hart_id() == 0;
     for (uint32_t i = 0; i < params->num_insts; ++i) {
         struct ggml_et_uberkernel_inst * inst =
             (struct ggml_et_uberkernel_inst *) ((uint8_t *) insts + (i * params->inst_stride));
@@ -954,6 +967,13 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
         if (rc != 0) {
             failed = rc;  // keep looping for the barriers; the launch reports the first failure
         }
+    }
+    if (uk_prof_on) {
+        uint32_t n = params->num_insts;
+        UK_STAMP(n);
+        FENCE;
+        evict_region_past_l2(uk_prof, ((size_t) n + 1) * sizeof(uint64_t));
+        WAIT_CACHEOPS;
     }
 
     return failed;
