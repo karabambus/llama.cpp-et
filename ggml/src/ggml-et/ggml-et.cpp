@@ -1358,17 +1358,25 @@ static bool et_hadamard_match_signed(const ggml_cgraph * cgraph, int i, const gg
     return true;
 }
 
-// Token count of a graph: the widest activation operand of a plain MUL_MAT (src[1]->ne[1] is the token axis for
-// the dense projections and for QK^T; MUL_MAT_ID carries tokens on ne[2] and is skipped). 0 for a graph without one.
+// Token count of a graph. Primary source: a ROPE node, whose dst is [head_dim, n_head, n_tokens] in every llama
+// graph with attention layers. Fallback (graphs without rope): the widest activation operand of a plain MUL_MAT
+// (src[1]->ne[1]); that axis is not the token count for the fused Hadamard matmul, whose activation is reshaped to
+// [n_rot, nelements/n_rot], so hinted matmuls are skipped. MUL_MAT_ID carries tokens on ne[2] and is skipped.
 static int64_t et_graph_n_tokens(const ggml_cgraph * cgraph) {
-    int64_t n = 0;
+    int64_t n_rope = 0;
+    int64_t n_mm   = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
-        if (node->op == GGML_OP_MUL_MAT && node->src[1] && node->src[1]->ne[1] > n) {
-            n = node->src[1]->ne[1];
+        if (node->op == GGML_OP_ROPE) {
+            if (node->ne[2] > n_rope) {
+                n_rope = node->ne[2];
+            }
+        } else if (node->op == GGML_OP_MUL_MAT && node->src[1] && ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+                   node->src[1]->ne[1] > n_mm) {
+            n_mm = node->src[1]->ne[1];
         }
     }
-    return n;
+    return n_rope > 0 ? n_rope : n_mm;
 }
 
 static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
