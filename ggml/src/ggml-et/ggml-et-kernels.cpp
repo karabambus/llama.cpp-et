@@ -42,6 +42,8 @@ static size_t ggml_et_next_capacity(size_t current_capacity, size_t required_cap
 struct ggml_et_uk_stats { uint64_t segments = 0, insts = 0, standalone = 0, graphs = 0; };
 static ggml_et_uk_stats g_uk_stats;
 static std::map<uint16_t, std::pair<uint64_t, uint64_t>> g_uk_prof;  // kernel id -> (n, cycles)
+static uint64_t g_uk_prof_bad = 0;  // segments whose stamps were unwritten or not monotonic
+static_assert(sizeof(ggml_et_uberkernel_params) == 40, "host/device params layout");
 static const bool g_uk_stats_on = [] { const char * e = getenv("GGML_ET_UBERKERNEL_STATS"); return e && *e && strcmp(e, "0") != 0; }();
 
 static ggml_backend_et_uberkernel_slot & ggml_et_uberkernel_current_slot(ggml_backend_et_uberkernel_context * uk_ctx) {
@@ -464,6 +466,11 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
                    ((uint32_t) ((t && *t) ? strtoul(t, nullptr, 0) : 0u) & 6u);
         }();
         const bool prof_this = uk_prof_on && slot.device_prof != nullptr;
+        static const std::vector<uint64_t> poison(1 << 16, ~0ull);
+        if (prof_this && prof_size <= poison.size() * sizeof(uint64_t)) {
+            runtime->memcpyHostToDevice(dev_ctx->default_stream, reinterpret_cast<const std::byte *>(poison.data()),
+                                        slot.device_prof, prof_size, true);
+        }
         ggml_et_uberkernel_params params = {
             static_cast<uint32_t>(slot.insts.size()),
             static_cast<uint32_t>(sizeof(ggml_et_uberkernel_inst)),
@@ -484,10 +491,18 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
             rt::EventId ev = runtime->memcpyDeviceToHost(dev_ctx->default_stream, slot.device_prof,
                                                          reinterpret_cast<std::byte *>(stamps.data()), prof_size, true);
             runtime->waitForEvent(ev);
-            for (size_t i = 0; i < slot.insts.size(); ++i) {
-                auto & acc = g_uk_prof[slot.insts[i].kernel_id];
-                acc.first++;
-                acc.second += stamps[i + 1] - stamps[i];
+            bool sane = true;
+            for (size_t i = 0; i < stamps.size() && sane; ++i) {
+                sane = stamps[i] != ~0ull && (i == 0 || stamps[i] > stamps[i - 1]);
+            }
+            if (!sane) {
+                g_uk_prof_bad++;
+            } else {
+                for (size_t i = 0; i < slot.insts.size(); ++i) {
+                    auto & acc = g_uk_prof[slot.insts[i].kernel_id];
+                    acc.first++;
+                    acc.second += stamps[i + 1] - stamps[i];
+                }
             }
         }
         if (ok) {
@@ -677,13 +692,16 @@ bool ggml_et_uberkernel_end_graph(ggml_backend_et_device_context * dev_ctx) {
         std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.second > b.second.second; });
         uint64_t total = 0;
         for (const auto & r : rows) { total += r.second.second; }
-        fprintf(stderr, "ET-UK-PROF total_ms=%.2f\n", (double) total / 600e3);
+        fprintf(stderr, "ET-UK-PROF total_cycles=%llu total_ms@600MHz=%.2f bad_segments=%llu\n", (unsigned long long) total,
+                (double) total / 600e3, (unsigned long long) g_uk_prof_bad);
         for (const auto & r : rows) {
-            fprintf(stderr, "ET-UK-PROF %-28s n=%6llu mean_us=%8.1f total_ms=%8.2f\n",
+            fprintf(stderr, "ET-UK-PROF %-28s n=%6llu mean_cycles=%10llu mean_us=%8.1f total_ms=%8.2f\n",
                     ggml_et_uberkernel_kernel_name_from_id(r.first), (unsigned long long) r.second.first,
+                    (unsigned long long) (r.second.second / r.second.first),
                     (double) r.second.second / 600.0 / (double) r.second.first, (double) r.second.second / 600e3);
         }
         g_uk_prof.clear();
+        g_uk_prof_bad = 0;
     }
     return ok;
 }

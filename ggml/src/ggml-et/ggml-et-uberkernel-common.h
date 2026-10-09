@@ -20,6 +20,7 @@ struct ggml_et_uberkernel_params {
     uint32_t reserved;
     // flags bit 3 (host GGML_ET_UK_PROFILE): hart 0 writes hpmcounter3 (600 MHz) after every per-instruction
     // barrier into prof_buf[0..num_insts] (num_insts + 1 entries); the host attributes prof_buf[i+1] - prof_buf[i]
-    // to instruction i (its body on the slowest hart plus the next instruction's evicts and barrier).
+    // to instruction i (its body on the slowest hart plus the next instruction's evicts and barrier; a final
+    // chip-wide barrier precedes the last stamp). The host poisons the buffer and rejects non-monotonic stamps.
     uint64_t prof_buf;
 };

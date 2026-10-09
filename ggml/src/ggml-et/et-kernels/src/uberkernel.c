@@ -130,14 +130,21 @@ static uint32_t uk_mode;  // set by every hart at entry from params->flags (same
 // evict (results are then wrong across shires - bench timing only), bit 2 takes the chip-wide barrier twice per
 // instruction (safe: every hart does it) so the delta against a plain run is the barrier's cost.
 static uint32_t uk_flags_all;
-static uint64_t * uk_prof;     // per-instruction cycle stamps (flags bit 3), written by hart 0 only
-static int        uk_prof_on;
+// Per-instruction cycle stamps (flags bit 3): hart 0 alone writes them. The decision lives in locals of entry_point,
+// never in a static - a static holding a per-hart-different value is a race through the incoherent L1s (every
+// hart's store of its own value lands in L2 in arbitrary order). The four back-to-back reads are the firmware's
+// RTLMIN-6496 idiom for hpm counters.
 #define UK_STAMP(idx)                                                       \
     do {                                                                    \
-        if (uk_prof_on) {                                                   \
+        if (prof_on) {                                                      \
             uint64_t c_;                                                    \
-            __asm__ __volatile__("csrr %0, hpmcounter3" : "=r"(c_));        \
-            uk_prof[(idx)] = c_;                                            \
+            __asm__ __volatile__(".p2align 4\n"                             \
+                                 "csrr %0, hpmcounter3\n"                   \
+                                 "csrr %0, hpmcounter3\n"                   \
+                                 "csrr %0, hpmcounter3\n"                   \
+                                 "csrr %0, hpmcounter3\n"                   \
+                                 : "=r"(c_));                               \
+            prof[(idx)] = c_;                                               \
         }                                                                   \
     } while (0)
 
@@ -418,11 +425,12 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
         }                               \
         UK_STAMP(i);                    \
     } while (0)
+    _Static_assert(sizeof(struct ggml_et_uberkernel_params) == 40, "host/device params layout");
     int failed   = 0;
     uk_mode      = params->flags & 1u;
     uk_flags_all = params->flags;
-    uk_prof      = (uint64_t *) params->prof_buf;
-    uk_prof_on   = (params->flags & 8u) && uk_prof && get_hart_id() == 0;
+    uint64_t * const prof    = (uint64_t *) params->prof_buf;
+    const int        prof_on = (params->flags & 8u) && prof && get_hart_id() == 0;
     for (uint32_t i = 0; i < params->num_insts; ++i) {
         struct ggml_et_uberkernel_inst * inst =
             (struct ggml_et_uberkernel_inst *) ((uint8_t *) insts + (i * params->inst_stride));
@@ -968,12 +976,16 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             failed = rc;  // keep looping for the barriers; the launch reports the first failure
         }
     }
-    if (uk_prof_on) {
-        uint32_t n = params->num_insts;
+    if (params->flags & 8u) {
+        // Every hart takes one more chip-wide barrier so the final stamp covers the last body on the slowest hart.
+        et_barrier_global(32ULL);
+        const uint32_t n = params->num_insts;
         UK_STAMP(n);
-        FENCE;
-        evict_region_past_l2(uk_prof, ((size_t) n + 1) * sizeof(uint64_t));
-        WAIT_CACHEOPS;
+        if (prof_on) {
+            FENCE;
+            evict_region_past_l2(prof, ((size_t) n + 1) * sizeof(uint64_t));
+            WAIT_CACHEOPS;
+        }
     }
 
     return failed;
