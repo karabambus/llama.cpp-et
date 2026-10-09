@@ -132,7 +132,9 @@ static inline void __attribute__((always_inline)) pq2_dot_tile_w(const block_pq2
     const uint64_t                                    gi               = PQ2_GATHER_WINDOW_IDX;
 
     __asm__ volatile("flw.ps f30, %[s]\n\t" : : [s] "m"(*(const int32_t (*)[8]) shift_pattern) : "f30");
-    PQ2V_ACT_PROLOGUE(b_col);
+    if (n_blocks > 0) {
+        PQ2V_ACT_PROLOGUE(b_col);
+    }
 
     for (int64_t kb = 0; kb < n_blocks; kb++) {
         const block_pq2_0 * blk = q_row + kb;
@@ -283,7 +285,9 @@ static inline void __attribute__((always_inline)) pq2_dot_tile2_w(const block_pq
     static const int32_t __attribute__((aligned(64))) shift_pattern[8] = { 0, 2, 4, 6, 0, 2, 4, 6 };
     const uint64_t                                    gi               = PQ2_GATHER_WINDOW_IDX;
     __asm__ volatile("flw.ps f30, %[s]\n\t" : : [s] "m"(*(const int32_t (*)[8]) shift_pattern) : "f30");
-    PQ2V_ACT_PROLOGUE(b_col);
+    if (n_blocks > 0) {
+        PQ2V_ACT_PROLOGUE(b_col);
+    }
     for (int64_t kb = 0; kb < n_blocks; kb++) {
         const uint8_t * qs0 = q_row0[kb].qs;
         const uint8_t * qs1 = q_row1[kb].qs;
