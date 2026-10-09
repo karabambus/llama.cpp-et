@@ -176,5 +176,14 @@ int entry_point(struct ggml_et_hadamard_params * params, void * env) {
     }
 
     __asm__ volatile("mova.m.x %0" ::"r"(saved_mask));
+
+#ifdef ET_UBERKERNEL
+    // inside a segment the next instruction may run on other shires: publish dst past L2 (the standalone launch
+    // relies on the firmware's post-kernel cleanup instead)
+    FENCE;
+    evict_region_past_l2(dst->data, (size_t) dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3] * dst->nb[0]);
+    WAIT_CACHEOPS;
+    FENCE;
+#endif
     return 0;
 }

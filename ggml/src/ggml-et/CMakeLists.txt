@@ -101,9 +101,9 @@ set(KERNELS
 # Kernels that we support dispatch form Uberkernel
 set(UBERKERNEL_SUPPORTED_KERNELS
     el_map_f32
-    # unary_f32
+    unary_f32
     # cpy_f32_f16
-    # cont_f32
+    cont_f32
     get_rows_f32
     # 052: the Qwen3-MoE op set (per-instruction eviction contract in uberkernel.c)
     mul_mat_id_Q4_0
@@ -137,6 +137,8 @@ set(UBERKERNEL_SUPPORTED_KERNELS
     mul_mat_Q6_K
     mul_mat_Q8_0
     mul_mat_Q8_0_group
+    mul_mat_PQ2_0
+    hadamard_f32
     norm_f32
     pad_f32
     repeat_f32
@@ -151,7 +153,7 @@ set(UBERKERNEL_SUPPORTED_KERNELS
     softmax_f32
     solve_tri_f32
     sqr_f32
-    # ssm_conv_f32
+    ssm_conv_f32
     ssm_scan_f32
     sum_rows_f32
     tri_f32

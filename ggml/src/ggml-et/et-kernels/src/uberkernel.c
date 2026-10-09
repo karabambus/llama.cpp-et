@@ -80,6 +80,9 @@ extern int mul_mat_f16_matrix_engine_entry(struct ggml_et_binary_params *, void 
 extern int mul_mat_f32_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_f32_matrix_engine_entry(struct ggml_et_binary_params *, void *);
 extern int mul_mat_Q8_0_entry(struct ggml_et_mm_q8_params *, void *);
+extern int mul_mat_PQ2_0_entry(struct ggml_et_mm_q8_params *, void *);  // same bias-capable struct as Q8_0
+struct ggml_et_hadamard_params;
+extern int hadamard_f32_entry(struct ggml_et_hadamard_params *, void *);
 struct ggml_et_mul_mat_group_params;
 extern int mul_mat_Q8_0_group_entry(struct ggml_et_mul_mat_group_params *, void *);
 extern int mul_mat_Q4_0_entry(struct ggml_et_mm_q8_params *, void *);  // T2: bias-capable params (prefix-compatible)
@@ -264,6 +267,12 @@ struct uber_get_rows_params {
     struct ggml_tensor dst;
 };
 
+// hadamard_f32: src (activation, writable), signs (weight-like), dst; trailing scalars omitted
+struct uber_hadamard_params {
+    struct ggml_tensor src;
+    struct ggml_tensor signs;
+    struct ggml_tensor dst;
+};
 struct uber_cont_params {
     struct ggml_tensor src0;
     struct ggml_tensor dst;
@@ -412,12 +421,14 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                     rc                               = el_map_f32_entry(p, env);
                     break;
                 }
-            // case GGML_ET_UBERKERNEL_KERNEL_UNARY_F32: {
-            //     // struct uber_unary_params *p = (struct uber_unary_params *) inst_params;
-            //     // et_barrier(ET_BARRIER_GLOBAL);
-            //     rc = unary_f32_entry((struct ggml_et_unary_params *) inst_params, env);
-            //     break;
-            // }
+            case GGML_ET_UBERKERNEL_KERNEL_UNARY_F32:
+                {
+                    struct uber_unary_params * p = (struct uber_unary_params *) inst_params;
+                    uk_evict(&p->src0);
+                    UK_SYNC();
+                    rc = unary_f32_entry((struct ggml_et_unary_params *) inst_params, env);
+                    break;
+                }
             // case GGML_ET_UBERKERNEL_KERNEL_CPY_F32_F16: {
             //     struct uber_unary_params *p = (struct uber_unary_params *) inst_params;
             //     // evict_region_past_l2(p->src0.data, tensor_bytes(&p->src0));
@@ -429,13 +440,14 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
             //     rc = get_rows_f32_entry((struct ggml_et_get_rows_params *) inst_params, env);
             //     break;
             // }
-            // case GGML_ET_UBERKERNEL_KERNEL_CONT_F32: {
-            //     struct uber_cont_params *p = (struct uber_cont_params *) inst_params;
-            //     // evict_region_past_l2_local(p->src0.data, tensor_bytes(&p->src0));
-            //     // evict_region_past_l2(p->dst.data, tensor_bytes(&p->dst));
-            //     rc = cont_f32_entry((struct ggml_et_cont_params *) inst_params, env);
-            //     break;
-            // }
+            case GGML_ET_UBERKERNEL_KERNEL_CONT_F32:
+                {
+                    struct uber_cont_params * p = (struct uber_cont_params *) inst_params;
+                    uk_evict(&p->src0);  // strided view: uk_evict walks the span, not the packed size
+                    UK_SYNC();
+                    rc = cont_f32_entry((struct ggml_et_cont_params *) inst_params, env);
+                    break;
+                }
             case GGML_ET_UBERKERNEL_KERNEL_GLU_F32:
                 {
                     { struct uber_glu_params * g = (struct uber_glu_params *) inst_params; uk_evict(&g->src0); uk_evict(&g->src1); }
@@ -572,10 +584,14 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                     rc = concat_f32_entry((struct ggml_et_concat_params *) inst_params, env);
                     break;
                 }
-            // case GGML_ET_UBERKERNEL_KERNEL_SSM_CONV_F32: {
-            //     rc = ssm_conv_f32_entry((struct ggml_et_ssm_conv_params *) inst_params, env);
-            //     break;
-            // }
+            case GGML_ET_UBERKERNEL_KERNEL_SSM_CONV_F32:
+                {
+                    struct uber_ssm_conv_params * p = (struct uber_ssm_conv_params *) inst_params;
+                    uk_evict(&p->src0);  // conv window (concat of state and new inputs); src1 is the conv weight
+                    UK_SYNC();
+                    rc = ssm_conv_f32_entry((struct ggml_et_ssm_conv_params *) inst_params, env);
+                    break;
+                }
             case GGML_ET_UBERKERNEL_KERNEL_SOLVE_TRI_F32:
                 {
                     UK_SYNC();
@@ -690,6 +706,23 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                     uk_evict(&p->bias);
                     UK_SYNC();
                     rc                              = mul_mat_Q8_0_entry(p, env);
+                    break;
+                }
+            case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_PQ2_0:
+                {
+                    struct ggml_et_mm_q8_params * p = (struct ggml_et_mm_q8_params *) inst_params;
+                    uk_evict(&p->src1);  // activations; the PQ2_0 weights are read-only in a segment
+                    uk_evict(&p->bias);
+                    UK_SYNC();
+                    rc = mul_mat_PQ2_0_entry(p, env);
+                    break;
+                }
+            case GGML_ET_UBERKERNEL_KERNEL_HADAMARD_F32:
+                {
+                    struct uber_hadamard_params * p = (struct uber_hadamard_params *) inst_params;
+                    uk_evict(&p->src);  // the activation; signs are weights
+                    UK_SYNC();
+                    rc = hadamard_f32_entry((struct ggml_et_hadamard_params *) inst_params, env);
                     break;
                 }
             case GGML_ET_UBERKERNEL_KERNEL_MUL_MAT_Q8_0_GROUP:
