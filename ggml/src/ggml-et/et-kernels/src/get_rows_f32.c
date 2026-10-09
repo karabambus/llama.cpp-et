@@ -615,9 +615,9 @@ int entry_point(struct ggml_et_get_rows_params * params, void * env) {
     const int64_t ne13 = src1->ne[3];  // Outer batch dimension for indices
 
     const int64_t total_rows_to_extract = ne10 * ne11 * ne12 * ne13;
-#ifdef ET_UBERKERNEL
-    et_barrier(ET_BARRIER_GLOBAL);
-#endif
+    // No barrier here: every hart but thread 0 has returned above, so a chip-wide barrier taken by one hart can never
+    // complete (it hung the uberkernel on the card, home box r112). Publication to other shires is the dispatcher's
+    // job: the next instruction evicts this output before it reads it.
     // Naive single-threaded implementation - process all rows sequentially
     // XXX: Do we really need a single-threaded implementation?
     for (int64_t i = 0; i < total_rows_to_extract; i++) {
