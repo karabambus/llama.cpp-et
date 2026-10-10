@@ -178,24 +178,6 @@ static inline void uk_evict(const struct ggml_tensor * t) {
     }
 }
 
-// 052: evict the last (256 + n_batch) positions of a KV-cache view [D, n_kv, n_head_kv] (positions = ne[1]).
-// Positions are the outer stride in llama.cpp's cache view (nb[1] >= ne[2]*nb[2]); otherwise fall back to the span.
-static inline void uk_evict_kv_tail(const struct ggml_tensor * t, int64_t n_batch) {
-    if (!t->data) {
-        return;
-    }
-    const int64_t n_kv = t->ne[1];
-    if ((size_t) t->nb[1] >= (size_t) t->ne[2] * t->nb[2] && n_kv > 0) {
-        int64_t r0 = n_kv - 256 - n_batch;
-        if (r0 < 0) {
-            r0 = 0;
-        }
-        uk_evict_region((const char *) t->data + (size_t) r0 * t->nb[1], (size_t) (n_kv - r0) * t->nb[1]);
-    } else {
-        uk_evict_region(t->data, tensor_span_bytes(t));
-    }
-}
-
 // 052 mirrors of the MoE kernels' parameter structs (layouts must match the kernel sources exactly)
 struct uber_moe_router_params {
     struct ggml_tensor src0;  // logits (written by the router mul_mat)
@@ -712,12 +694,13 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                         struct uber_flash_attn_ext_params * f = (struct uber_flash_attn_ext_params *) inst_params;
                         uk_evict(&f->src0);
                         uk_evict(&f->mask);
-                        // K/V cache: attn_qkv_glue wrote rows [kv_used-N, kv_used) earlier in this segment and this
-                        // shire may hold stale copies of exactly those rows (it read them as padding, n_kv is padded to
-                        // 256, in an earlier forward / prefetched them). Evict the tail that can contain them:
-                        // rows [n_kv - 256 - N, n_kv) - bounded, independent of the context length.
-                        uk_evict_kv_tail(&f->src1, f->src0.ne[1]);
-                        uk_evict_kv_tail(&f->src2, f->src0.ne[1]);
+                        // K/V cache: rows written earlier in this segment (set_rows or attn_qkv_glue) sit dirty in the
+                        // writer shire's L2 after the L1 flush and must be published wherever they are: cells are not
+                        // always appended at the end (several server slots share one cache, a reused slot refills a
+                        // hole, a sliding drafter window restarts at cell 0, several streams). Evict the whole views,
+                        // split over the 64 harts of every shire; the kernel itself takes no entry evict.
+                        uk_evict(&f->src1);
+                        uk_evict(&f->src2);
                     }
                     UK_SYNC();
                     rc = flash_attn_ext_f16_me_entry((struct ggml_et_flash_attn_ext_params *) inst_params, env);

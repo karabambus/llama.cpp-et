@@ -363,8 +363,8 @@ int entry_point(struct ggml_et_flash_attn_ext_params * params, void * env) {
     struct ggml_tensor * v = &params->src2;
 #ifndef ET_UBERKERNEL
     // Standalone launch: publish the inputs. Under the uberkernel the dispatcher does it (whole-L1 flush, then Q, the
-    // mask and only the KV-cache tail that this segment can have written, split over the harts); here every hart would
-    // walk the whole K and V views, a cost that grows with the context length (11.8 ms per launch at 3.5 k positions).
+    // mask and the K/V views, split over the harts); here every hart would walk the whole views, a cost that grows with
+    // the context length.
     evict_region_past_l2(q->data, tensor_bytes_fa(q));
     evict_region_past_l2(k->data, tensor_bytes_fa(k));
     evict_region_past_l2(v->data, tensor_bytes_fa(v));
