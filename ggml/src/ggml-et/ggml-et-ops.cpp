@@ -925,6 +925,12 @@ bool ggml_et_op_mul_mat_group(ggml_backend_et_device_context * dev_ctx,
     return kernel_result;
 }
 
+// tensor_load and tensor_store drop the low address bits silently (KB 03 section 9): an engine operand whose base or
+// row/batch strides are not multiples of 64 bytes would give noise, so such views stay on the vector-lane kernel.
+static bool ggml_et_engine_operand_aligned(const ggml_tensor * t) {
+    return ((uintptr_t) t->data % 64) == 0 && t->nb[1] % 64 == 0 && t->nb[2] % 64 == 0 && t->nb[3] % 64 == 0;
+}
+
 // GGML_ET_PQ2_ENGINE_MIN_N: smallest token count N for which PQ2_0 MUL_MAT runs on the tensor engine (default 53,
 // as for Q4_0); 0 keeps every N on the vector-lane kernel.
 static int64_t ggml_et_pq2_engine_min_n() {
@@ -1048,7 +1054,8 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
                node->src[1]->type == GGML_TYPE_F32 && ggml_et_pq2_engine_min_n() > 0 &&
                node->src[1]->ne[1] >= ggml_et_pq2_engine_min_n() &&
                node->src[0]->ne[1] % 16 == 0 &&   // M % TILE_M
-               node->src[0]->ne[0] % 128 == 0) {  // K % QK_PQ2_0
+               node->src[0]->ne[0] % 128 == 0 &&  // K % QK_PQ2_0
+               ggml_et_engine_operand_aligned(node->src[1]) && ggml_et_engine_operand_aligned(fused_dst)) {
         // Prefill: dequantised weight panels on the tensor engine, reused across N-tiles.
         kernel_name    = "mul_mat_PQ2_0_matrix_engine";
         src0_type_name = "PQ2_0";

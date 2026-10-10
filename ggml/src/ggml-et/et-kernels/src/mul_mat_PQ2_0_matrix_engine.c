@@ -428,7 +428,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
     }
 
     // =====================================================================
-    // ORIGINAL path: one output tile at a time (N % TILE_N != 0). No reuse.
+    // ORIGINAL path (ru_n < 2): one output tile at a time, no reuse.
     // =====================================================================
     const int64_t base_tiles = m_tiles * n_tiles * batch_count;
     float *scp_panel[2] = {
