@@ -105,6 +105,11 @@ struct ggml_backend_et_device_context {
     std::vector<std::vector<std::byte>> staged_h2d;
     size_t                              staged_h2d_bytes = 0;
     std::vector<ggml_et_input_copy_src> pending_h2d;
+    // True once anything has been queued on default_stream without waiting for it (kernel launch, segment, async copy,
+    // staged flush); cleared when synchronize drains the stream. llama's scheduler synchronizes before copying each
+    // user input (12 times per decode graph): with nothing in flight there is nothing to wait for, and the staged
+    // inputs already own private copies, so synchronize returns at once and the graph can fold them in.
+    bool                                stream_busy = true;
 };
 
 struct ggml_backend_et_reg_ctx {

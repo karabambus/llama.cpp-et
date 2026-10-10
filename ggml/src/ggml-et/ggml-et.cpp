@@ -243,8 +243,22 @@ static void ggml_et_driver_cleanup() {
 
 static ggml_backend_dev_t ggml_backend_et_reg_get_device(ggml_backend_reg_t reg, size_t devidx);
 
+static void ggml_et_flush_staged_h2d(ggml_backend_et_device_context * dev_ctx);
+
 static void ggml_backend_et_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_et_buffer_context * ctx = (ggml_backend_et_buffer_context *) buffer->context;
+    // Staged uploads into this buffer must not land later in memory the allocator hands to someone else.
+    if (ctx->data != nullptr && buffer->buft && buffer->buft->device) {
+        auto * dev_ctx = (ggml_backend_et_device_context *) buffer->buft->device->context;
+        if (dev_ctx) {
+            const std::byte * lo = static_cast<const std::byte *>(ctx->data);
+            const std::byte * hi = lo + ctx->size;
+            auto &            p  = dev_ctx->pending_h2d;
+            p.erase(std::remove_if(p.begin(), p.end(), [&](const ggml_et_input_copy_src & op) {
+                        return op.dst < hi && lo < op.dst + op.size;
+                    }), p.end());
+        }
+    }
     if (ctx->data != nullptr) {
         std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
         if (runtime) {
@@ -282,6 +296,7 @@ static ggml_status ggml_backend_et_buffer_init_tensor(ggml_backend_buffer_t buff
 
         // Use device-side memset kernel for efficient padding clear
         std::byte * padding_ptr = static_cast<std::byte *>(tensor->data) + original_size;
+        ggml_et_flush_staged_h2d(dev_ctx);
         if (!ggml_et_memset(dev_ctx, padding_ptr, 0, padding_size)) {
             GGML_LOG_ERROR("ET: Failed to clear padding using memset kernel for tensor %s", tensor->name);
             return GGML_STATUS_FAILED;
@@ -320,6 +335,7 @@ static void ggml_et_flush_staged_h2d(ggml_backend_et_device_context * dev_ctx) {
         runtime->memcpyHostToDevice(dev_ctx->default_stream, op.src, op.dst, op.size, true /*barrier*/);
     }
     dev_ctx->pending_h2d.clear();
+    dev_ctx->stream_busy = true;
 }
 
 static void ggml_et_release_staged_h2d(ggml_backend_et_device_context * dev_ctx) {
@@ -609,6 +625,7 @@ static void ggml_backend_et_set_tensor_async(ggml_backend_t backend,
     const std::byte * src_ptr = static_cast<const std::byte *>(data);
 
     ggml_et_flush_staged_h2d(dev_ctx);
+    dev_ctx->stream_busy = true;
     const auto ht0 = std::chrono::steady_clock::now();
     runtime->memcpyHostToDevice(stream, src_ptr, dst_ptr, size, true /*barrier*/);
     if (g_et_ht.on) {
@@ -635,6 +652,7 @@ static void ggml_backend_et_get_tensor_async(ggml_backend_t      backend,
     std::byte *       dst_ptr = static_cast<std::byte *>(data);
 
     ggml_et_flush_staged_h2d(dev_ctx);
+    dev_ctx->stream_busy = true;
     const auto ht0 = std::chrono::steady_clock::now();
     runtime->memcpyDeviceToHost(stream, src_ptr, dst_ptr, size, true /*barrier*/);
     if (g_et_ht.on) {
@@ -662,10 +680,15 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
     }
 
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
+    static const bool no_idle_skip = [] { const char * e = getenv("GGML_ET_SYNC_ALWAYS"); return e && *e && strcmp(e, "0") != 0; }();
+    if (!dev_ctx->stream_busy && !no_idle_skip) {
+        return;  // nothing queued since the last drain; staged inputs stay staged (private copies)
+    }
     ggml_et_flush_staged_h2d(dev_ctx);
     const auto                       ht0     = std::chrono::steady_clock::now();
     ggml_et_wait_stream(dev_ctx, "synchronize");
     ggml_et_release_staged_h2d(dev_ctx);  // the stream has drained: the runtime has read every staged copy
+    dev_ctx->stream_busy = false;
     if (g_et_ht.on) {
         g_et_ht.sync_ms += et_ms_since(ht0);
         g_et_ht.n_sync++;

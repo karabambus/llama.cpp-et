@@ -40,3 +40,10 @@ struct ggml_et_uk_input_copy_job {
     uint32_t src_off;
     uint32_t words;
 };
+#ifdef __cplusplus
+static_assert(sizeof(struct ggml_et_uk_input_copy_hdr) == 8, "input copy header layout");
+static_assert(sizeof(struct ggml_et_uk_input_copy_job) == 16, "input copy job layout");
+#else
+_Static_assert(sizeof(struct ggml_et_uk_input_copy_hdr) == 8, "input copy header layout");
+_Static_assert(sizeof(struct ggml_et_uk_input_copy_job) == 16, "input copy job layout");
+#endif

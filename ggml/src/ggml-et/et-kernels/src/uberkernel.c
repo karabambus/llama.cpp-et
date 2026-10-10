@@ -985,6 +985,7 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                             }
                         }
                     }
+                    FENCE;  // the copy may be a segment's last instruction
                     rc = 0;
                     break;
                 }

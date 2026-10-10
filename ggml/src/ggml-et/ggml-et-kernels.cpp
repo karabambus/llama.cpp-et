@@ -233,6 +233,9 @@ static bool ggml_et_launch_kernel_internal(ggml_backend_et_device_context * dev_
                                            bool                             enable_print,
                                            bool                             sync_error_check,
                                            rt::EventId *                    out_event = nullptr) {
+    if (dev_ctx) {
+        dev_ctx->stream_busy = true;
+    }
     std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
     if (!runtime) {
         GGML_LOG_ERROR("ET: Runtime not available for kernel launch\n");
@@ -403,6 +406,9 @@ void ggml_et_uberkernel_begin_graph(ggml_backend_et_uberkernel_context * uk_ctx)
 
 static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *     dev_ctx,
                                               ggml_backend_et_uberkernel_context * uk_ctx) {
+    if (dev_ctx) {
+        dev_ctx->stream_busy = true;
+    }
     if (!uk_ctx || !dev_ctx) {
         return false;
     }
