@@ -734,6 +734,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "mtp_attn_pregate", il);
 
+    // Catch-up rows (the accepted prefix decoded together with the first draft row) only have to write their K/V,
+    // which build_attn has done. As in the trunk's last layer, the attention output projection, the FFN and the head
+    // run on the output rows alone, unless every row's hidden state is extracted (unmasked nextn).
+    const bool narrow = inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    if (narrow) {
+        cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
+        gate  = ggml_get_rows(ctx0, gate,  inp_out_ids);
+        inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+    }
+
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
@@ -768,7 +778,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     // so publish the output rows only (as the trunk graph does); unmasked readers index by token.
     // Matters as soon as an MTP batch has more tokens than outputs, e.g. catch-up rows decoded
     // together with the first draft row.
-    if (cparams.embeddings_nextn_masked) {
+    if (narrow) {
+        res->t_h_nextn = cur;  // already the output rows
+    } else if (cparams.embeddings_nextn_masked) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
         res->t_h_nextn = cur;
     } else {
