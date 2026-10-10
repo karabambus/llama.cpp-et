@@ -925,6 +925,16 @@ bool ggml_et_op_mul_mat_group(ggml_backend_et_device_context * dev_ctx,
     return kernel_result;
 }
 
+// GGML_ET_PQ2_ENGINE_MIN_N: smallest token count N for which PQ2_0 MUL_MAT runs on the tensor engine (default 53,
+// as for Q4_0); 0 keeps every N on the vector-lane kernel.
+static int64_t ggml_et_pq2_engine_min_n() {
+    static const int64_t v = [] {
+        const char * e = getenv("GGML_ET_PQ2_ENGINE_MIN_N");
+        return (e && *e) ? (int64_t) atoll(e) : (int64_t) 53;
+    }();
+    return v;
+}
+
 bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
                         const ggml_tensor *              node,
                         const ggml_tensor *              add_node) {
@@ -1035,8 +1045,17 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
         src0_type_name = "Q8_0";
 
     } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_PQ2_0 &&
+               node->src[1]->type == GGML_TYPE_F32 && ggml_et_pq2_engine_min_n() > 0 &&
+               node->src[1]->ne[1] >= ggml_et_pq2_engine_min_n() &&
+               node->src[0]->ne[1] % 16 == 0 &&   // M % TILE_M
+               node->src[0]->ne[0] % 128 == 0) {  // K % QK_PQ2_0
+        // Prefill: dequantised weight panels on the tensor engine, reused across N-tiles.
+        kernel_name    = "mul_mat_PQ2_0_matrix_engine";
+        src0_type_name = "PQ2_0";
+
+    } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_PQ2_0 &&
                node->src[1]->type == GGML_TYPE_F32) {
-        kernel_name    = "mul_mat_PQ2_0";  // vector-lane unpack, every N; no matrix-engine variant yet
+        kernel_name    = "mul_mat_PQ2_0";  // vector-lane unpack (decode, verification, small N)
         src0_type_name = "PQ2_0";
 
     } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F16 &&
@@ -1097,7 +1116,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
     }
 
     bool kernel_result;
-    if (node->src[0]->type == GGML_TYPE_Q8_0 || node->src[0]->type == GGML_TYPE_PQ2_0 ||
+    if (node->src[0]->type == GGML_TYPE_Q8_0 || strcmp(kernel_name, "mul_mat_PQ2_0") == 0 ||
         (node->src[0]->type == GGML_TYPE_Q4_0 && strcmp(kernel_name, "mul_mat_Q4_0") == 0)) {
         // Q8_0 kernel always takes the extended struct. bias.data is non-NULL
         // only on the fused path; otherwise the kernel skips the add entirely.
