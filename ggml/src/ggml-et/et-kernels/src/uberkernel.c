@@ -966,6 +966,28 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                     break;
                 }
 
+            case GGML_ET_UBERKERNEL_INPUT_COPY:
+                {
+                    // Graph inputs carried in the parameter blob (see ggml-et-uberkernel-common.h). Caches are clean at
+                    // segment start and nothing reads these lines before this instruction; the global atomic stores
+                    // land where every later plain load finds them, and the next instruction's barrier orders them.
+                    const struct ggml_et_uk_input_copy_hdr * h    = (const struct ggml_et_uk_input_copy_hdr *) inst_params;
+                    const struct ggml_et_uk_input_copy_job * jobs = (const struct ggml_et_uk_input_copy_job *) (h + 1);
+                    UK_SYNC();
+                    const int tid = get_relative_thread_id(kernel_env->shire_mask);
+                    const int nth = get_num_threads(kernel_env->shire_mask);
+                    if (tid >= 0 && nth > 0) {
+                        for (uint32_t j = 0; j < h->n_jobs; ++j) {
+                            const uint32_t *    src = (const uint32_t *) ((const uint8_t *) inst_params + jobs[j].src_off);
+                            volatile uint32_t * dst = (volatile uint32_t *) (uintptr_t) jobs[j].dst;
+                            for (uint32_t w = (uint32_t) tid; w < jobs[j].words; w += (uint32_t) nth) {
+                                et_global_swap_w(&dst[w], src[w]);
+                            }
+                        }
+                    }
+                    rc = 0;
+                    break;
+                }
             default:
                 UK_SYNC();
                 rc = -1;

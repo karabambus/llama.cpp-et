@@ -28,6 +28,8 @@ bool ggml_et_load_kernel(ggml_backend_et_device_context * dev_ctx, const std::st
 // aborted through the firmware (rt::IRuntime::abortStream) and the process exits with a clear message instead of
 // sitting on a hung kernel (a hung launch left the card unusable until a PCIe reset, Exp 039). Returns false on timeout.
 bool ggml_et_wait_stream(ggml_backend_et_device_context * dev_ctx, const char * where);
+bool ggml_et_uberkernel_add_input_copy(ggml_backend_et_device_context * dev_ctx, const ggml_et_input_copy_src * ops,
+                                       size_t n_ops);
 
 bool ggml_et_launch_kernel(ggml_backend_et_device_context * dev_ctx,
                            const std::string &              kernel_name,

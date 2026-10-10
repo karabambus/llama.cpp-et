@@ -24,3 +24,19 @@ struct ggml_et_uberkernel_params {
     // chip-wide barrier precedes the last stamp). The host poisons the buffer and rejects non-monotonic stamps.
     uint64_t prof_buf;
 };
+
+// Reserved instruction (outside the generated kernel ids): copy small graph inputs into place at the start of a
+// segment. The bytes travel inside the segment's parameter upload instead of one host->device command each (each
+// such command is a ~1.2 ms round trip through the master minion, seven per decode graph). Layout at the
+// instruction's params: header, n_jobs jobs, then the data; job.src_off is relative to the params start, words are
+// 32-bit. The device writes with global atomic stores, which later plain loads of any shire see.
+#define GGML_ET_UBERKERNEL_INPUT_COPY 0xFFF0u
+struct ggml_et_uk_input_copy_hdr {
+    uint32_t n_jobs;
+    uint32_t reserved;
+};
+struct ggml_et_uk_input_copy_job {
+    uint64_t dst;
+    uint32_t src_off;
+    uint32_t words;
+};

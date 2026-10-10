@@ -64,6 +64,13 @@ struct ggml_backend_et_uberkernel_context {
     size_t                          current_slot = 0;
 };
 
+// One small host->device upload staged by set_tensor and not yet sent.
+struct ggml_et_input_copy_src {
+    const std::byte * src;   // private copy owned by the device context (staged_h2d)
+    std::byte *       dst;
+    size_t            size;
+};
+
 struct ggml_backend_et_device_context {
     int                        devidx;
     rt::DeviceId               rtid;
@@ -90,6 +97,14 @@ struct ggml_backend_et_device_context {
     bool                               uberkernel_active  = false;
     int                                uberkernel_max_tokens = 0;
     ggml_backend_et_uberkernel_context uberkernel;
+
+    // Small set_tensor uploads (graph inputs) staged instead of sent at once. graph_compute folds them into the
+    // segment's first instruction when the graph is batched; every other path sends them, in order, before it
+    // queues anything (ggml_et_flush_staged_h2d). The private copies live until the stream has drained, because
+    // the runtime reads a host source from a worker thread after memcpyHostToDevice returns.
+    std::vector<std::vector<std::byte>> staged_h2d;
+    size_t                              staged_h2d_bytes = 0;
+    std::vector<ggml_et_input_copy_src> pending_h2d;
 };
 
 struct ggml_backend_et_reg_ctx {

@@ -561,6 +561,46 @@ bool ggml_et_uberkernel_failed(const ggml_backend_et_uberkernel_context * uk_ctx
     return uk_ctx && uk_ctx->failed;
 }
 
+// Prepend the staged graph inputs to the (empty) current segment as one GGML_ET_UBERKERNEL_INPUT_COPY instruction.
+bool ggml_et_uberkernel_add_input_copy(ggml_backend_et_device_context * dev_ctx, const ggml_et_input_copy_src * ops,
+                                       size_t n_ops) {
+    if (!dev_ctx || !dev_ctx->uberkernel_active || n_ops == 0) {
+        return false;
+    }
+    ggml_backend_et_uberkernel_context * uk_ctx = &dev_ctx->uberkernel;
+    auto &                               slot   = ggml_et_uberkernel_current_slot(uk_ctx);
+    if (!slot.insts.empty()) {
+        return false;  // the copy must be the segment's first instruction
+    }
+    const size_t head = sizeof(ggml_et_uk_input_copy_hdr) + n_ops * sizeof(ggml_et_uk_input_copy_job);
+    size_t       data = ggml_et_align_up(head, 64);
+    std::vector<std::byte> blob(data);
+    auto * hdr   = reinterpret_cast<ggml_et_uk_input_copy_hdr *>(blob.data());
+    hdr->n_jobs  = (uint32_t) n_ops;
+    hdr->reserved = 0;
+    for (size_t i = 0; i < n_ops; ++i) {
+        if (ops[i].size % 4 != 0 || ((uintptr_t) ops[i].dst % 4) != 0) {
+            return false;
+        }
+        const size_t off = blob.size();
+        blob.insert(blob.end(), ops[i].src, ops[i].src + ops[i].size);
+        blob.resize(ggml_et_align_up(blob.size(), 64));
+        auto * job    = reinterpret_cast<ggml_et_uk_input_copy_job *>(blob.data() + sizeof(ggml_et_uk_input_copy_hdr)) + i;
+        job->dst      = (uint64_t) (uintptr_t) ops[i].dst;
+        job->src_off  = (uint32_t) off;
+        job->words    = (uint32_t) (ops[i].size / 4);
+    }
+    const size_t params_offset = ggml_et_align_up(slot.params_blob.size(), GGML_ET_UBERKERNEL_PARAM_ALIGN);
+    slot.params_blob.resize(params_offset);
+    slot.params_blob.insert(slot.params_blob.end(), blob.begin(), blob.end());
+    ggml_et_uberkernel_inst inst = { (uint16_t) GGML_ET_UBERKERNEL_INPUT_COPY, 0, (uint32_t) params_offset,
+                                     (uint32_t) blob.size() };
+    slot.insts.push_back(inst);
+    uk_ctx->shire_mask = 0xFFFFFFFFULL;
+    g_uk_stats.insts++;
+    return true;
+}
+
 static bool ggml_et_launch_uberkernel(ggml_backend_et_device_context * dev_ctx,
                                       const std::string &              kernel_name,
                                       void *                           params,

@@ -307,6 +307,26 @@ static inline double et_ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// Send the staged uploads one by one, in request order, before anything else is queued on the default stream.
+static void ggml_et_flush_staged_h2d(ggml_backend_et_device_context * dev_ctx) {
+    if (dev_ctx->pending_h2d.empty()) {
+        return;
+    }
+    std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    if (!runtime) {
+        return;
+    }
+    for (const auto & op : dev_ctx->pending_h2d) {
+        runtime->memcpyHostToDevice(dev_ctx->default_stream, op.src, op.dst, op.size, true /*barrier*/);
+    }
+    dev_ctx->pending_h2d.clear();
+}
+
+static void ggml_et_release_staged_h2d(ggml_backend_et_device_context * dev_ctx) {
+    dev_ctx->staged_h2d.clear();
+    dev_ctx->staged_h2d_bytes = 0;
+}
+
 static void ggml_backend_et_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                               ggml_tensor *         tensor,
                                               const void *          data,
@@ -324,7 +344,34 @@ static void ggml_backend_et_buffer_set_tensor(ggml_backend_buffer_t buffer,
     std::byte *       dst_ptr = static_cast<std::byte *>(tensor->data) + offset;
     const std::byte * src_ptr = static_cast<const std::byte *>(data);
 
-    const auto  ht0   = std::chrono::steady_clock::now();
+    const auto ht0 = std::chrono::steady_clock::now();
+    // Small uploads (graph inputs) are staged: a batched graph carries them in its first instruction (no host->device
+    // command each, ~1.2 ms per command, home box r217); otherwise they are sent before the next queued work.
+    // GGML_ET_SYNC_SET=1 restores one waited upload per call.
+    static const bool sync_set = [] { const char * e = getenv("GGML_ET_SYNC_SET"); return e && *e && strcmp(e, "0") != 0; }();
+    if (!sync_set && size <= (64u << 10)) {
+        if (dev_ctx->staged_h2d_bytes + size > (64u << 20)) {  // bound the private copies between synchronizations
+            ggml_et_flush_staged_h2d(dev_ctx);
+            ggml_et_wait_stream(dev_ctx, "staged set_tensor");
+            ggml_et_release_staged_h2d(dev_ctx);
+        }
+        for (const auto & op : dev_ctx->pending_h2d) {  // a later write to the same bytes must not overtake an earlier one
+            if (dst_ptr < op.dst + op.size && op.dst < dst_ptr + size) {
+                ggml_et_flush_staged_h2d(dev_ctx);
+                break;
+            }
+        }
+        dev_ctx->staged_h2d.emplace_back(src_ptr, src_ptr + size);
+        dev_ctx->staged_h2d_bytes += size;
+        dev_ctx->pending_h2d.push_back({ dev_ctx->staged_h2d.back().data(), dst_ptr, size });
+        if (g_et_ht.on) {
+            g_et_ht.aset_ms += et_ms_since(ht0);
+            g_et_ht.n_aset++;
+            g_et_ht.b_aset += size;
+        }
+        return;
+    }
+    ggml_et_flush_staged_h2d(dev_ctx);
     rt::EventId event = runtime->memcpyHostToDevice(stream, src_ptr, dst_ptr, size, true /*barrier*/);
 
     runtime->waitForEvent(event);
@@ -351,6 +398,7 @@ static void ggml_backend_et_buffer_get_tensor(ggml_backend_buffer_t buffer,
     const std::byte * src_ptr = static_cast<const std::byte *>(tensor->data) + offset;
     std::byte *       dst_ptr = static_cast<std::byte *>(data);
 
+    ggml_et_flush_staged_h2d(dev_ctx);
     const auto  ht0   = std::chrono::steady_clock::now();
     rt::EventId event = runtime->memcpyDeviceToHost(stream, src_ptr, dst_ptr, size, true /*barrier*/);
 
@@ -386,6 +434,7 @@ static void ggml_backend_et_buffer_clear(ggml_backend_buffer_t buffer, uint8_t v
     }
 
     // Use device-side memset kernel for efficient clearing
+    ggml_et_flush_staged_h2d(dev_ctx);
     if (!ggml_et_memset(dev_ctx, ctx->data, value, ctx->size)) {
         GGML_LOG_ERROR("ET: buffer_clear failed using memset kernel");
         return;
@@ -508,7 +557,9 @@ static void ggml_backend_et_free(ggml_backend_t backend) {
             }
             // Drain any in-flight uberkernel launches before freeing the
             // device buffers they read from.
+            ggml_et_flush_staged_h2d(dev_ctx);
             ggml_et_wait_stream(dev_ctx, "synchronize");
+            ggml_et_release_staged_h2d(dev_ctx);
             if (dev_ctx->moe_w_scratch) {
                 runtime->freeDevice(dev_ctx->rtid, dev_ctx->moe_w_scratch);
                 dev_ctx->moe_w_scratch = nullptr;
@@ -557,6 +608,7 @@ static void ggml_backend_et_set_tensor_async(ggml_backend_t backend,
     std::byte *       dst_ptr = static_cast<std::byte *>(tensor->data) + offset;
     const std::byte * src_ptr = static_cast<const std::byte *>(data);
 
+    ggml_et_flush_staged_h2d(dev_ctx);
     const auto ht0 = std::chrono::steady_clock::now();
     runtime->memcpyHostToDevice(stream, src_ptr, dst_ptr, size, true /*barrier*/);
     if (g_et_ht.on) {
@@ -582,6 +634,7 @@ static void ggml_backend_et_get_tensor_async(ggml_backend_t      backend,
     const std::byte * src_ptr = static_cast<const std::byte *>(tensor->data) + offset;
     std::byte *       dst_ptr = static_cast<std::byte *>(data);
 
+    ggml_et_flush_staged_h2d(dev_ctx);
     const auto ht0 = std::chrono::steady_clock::now();
     runtime->memcpyDeviceToHost(stream, src_ptr, dst_ptr, size, true /*barrier*/);
     if (g_et_ht.on) {
@@ -609,8 +662,10 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
     }
 
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
+    ggml_et_flush_staged_h2d(dev_ctx);
     const auto                       ht0     = std::chrono::steady_clock::now();
     ggml_et_wait_stream(dev_ctx, "synchronize");
+    ggml_et_release_staged_h2d(dev_ctx);  // the stream has drained: the runtime has read every staged copy
     if (g_et_ht.on) {
         g_et_ht.sync_ms += et_ms_since(ht0);
         g_et_ht.n_sync++;
@@ -1443,6 +1498,16 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
                                  (dev_ctx->uberkernel_max_tokens <= 0 ||
                                   et_graph_n_tokens(cgraph) <= dev_ctx->uberkernel_max_tokens);
     ggml_et_uberkernel_begin_graph(&dev_ctx->uberkernel);
+    // Staged graph inputs: carried in the segment's first instruction when this graph is batched, else sent now.
+    if (!dev_ctx->pending_h2d.empty()) {
+        static const bool no_fold = [] { const char * e = getenv("GGML_ET_UK_NO_INPUT_FOLD"); return e && *e && strcmp(e, "0") != 0; }();
+        if (!no_fold && dev_ctx->uberkernel_active &&
+            ggml_et_uberkernel_add_input_copy(dev_ctx, dev_ctx->pending_h2d.data(), dev_ctx->pending_h2d.size())) {
+            dev_ctx->pending_h2d.clear();
+        } else {
+            ggml_et_flush_staged_h2d(dev_ctx);
+        }
+    }
 
     int fused_groups           = 0;
     int fused_dispatches_saved = 0;
