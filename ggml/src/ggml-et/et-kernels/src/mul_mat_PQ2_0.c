@@ -92,8 +92,69 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
             const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbb2 : (const char *) 0;
 
             int64_t n = 0;
-            // Two token columns per weight pass on the windowed path (each weight line is loaded once for both).
-            for (; windowed && n + 1 < N; n += 2) {
+            // Two token columns per weight pass on the windowed path (each weight line is loaded once for both); when
+            // exactly three columns remain (odd N > 1: a 3-token speculative verification, or the tail of N = 5, 7)
+            // they share one pass instead of a pair pass plus a separate one-column pass.
+            while (windowed && n + 1 < N) {
+                if (N - n == 3) {
+                    const float * b_c0    = (const float *) (src1_ptr2 + n * nb11);
+                    const float * b_c1    = (const float *) (src1_ptr2 + (n + 1) * nb11);
+                    const float * b_c2    = (const float *) (src1_ptr2 + (n + 2) * nb11);
+                    const float * bias_c0 = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
+                    const float * bias_c1 = bias_ptr2 ? (const float *) (bias_ptr2 + (n + 1) * nbb1) : (const float *) 0;
+                    const float * bias_c2 = bias_ptr2 ? (const float *) (bias_ptr2 + (n + 2) * nbb1) : (const float *) 0;
+                    float *       d_c0    = (float *) (dst_ptr2 + n * nbd1);
+                    float *       d_c1    = (float *) (dst_ptr2 + (n + 1) * nbd1);
+                    float *       d_c2    = (float *) (dst_ptr2 + (n + 2) * nbd1);
+
+                    int64_t m = (int64_t) hart_id;
+                    for (; m + STRIDE_M < M; m += 2 * STRIDE_M) {
+                        const block_pq2_0 * q_row0 = (const block_pq2_0 *) (src0_ptr2 + m * nb01);
+                        const block_pq2_0 * q_row1 = (const block_pq2_0 *) (src0_ptr2 + (m + STRIDE_M) * nb01);
+                        float               r0c0, r1c0, r0c1, r1c1, r0c2, r1c2;
+                        pq2_dot_reset23();
+                        pq2_dot_tile23_w(q_row0, q_row1, b_c0, b_c1, b_c2, K_blocks);
+                        PQ2V_HSUM("f20", r0c0);
+                        PQ2V_HSUM("f21", r1c0);
+                        PQ2V_HSUM("f28", r0c1);
+                        PQ2V_HSUM("f29", r1c1);
+                        PQ2V_HSUM("f14", r0c2);
+                        PQ2V_HSUM("f31", r1c2);
+                        if (bias_c0) {
+                            r0c0 += bias_c0[m];
+                            r1c0 += bias_c0[m + STRIDE_M];
+                            r0c1 += bias_c1[m];
+                            r1c1 += bias_c1[m + STRIDE_M];
+                            r0c2 += bias_c2[m];
+                            r1c2 += bias_c2[m + STRIDE_M];
+                        }
+                        atomic_store_f32((volatile float *) (d_c0 + m), r0c0);
+                        atomic_store_f32((volatile float *) (d_c0 + m + STRIDE_M), r1c0);
+                        atomic_store_f32((volatile float *) (d_c1 + m), r0c1);
+                        atomic_store_f32((volatile float *) (d_c1 + m + STRIDE_M), r1c1);
+                        atomic_store_f32((volatile float *) (d_c2 + m), r0c2);
+                        atomic_store_f32((volatile float *) (d_c2 + m + STRIDE_M), r1c2);
+                    }
+                    for (; m < M; m += STRIDE_M) {
+                        const block_pq2_0 * q_row = (const block_pq2_0 *) (src0_ptr2 + m * nb01);
+                        float               r0c0, r0c1, r0c2;
+                        pq2_dot_reset23();
+                        pq2_dot_tile13_w(q_row, b_c0, b_c1, b_c2, K_blocks);
+                        PQ2V_HSUM("f20", r0c0);
+                        PQ2V_HSUM("f28", r0c1);
+                        PQ2V_HSUM("f14", r0c2);
+                        if (bias_c0) {
+                            r0c0 += bias_c0[m];
+                            r0c1 += bias_c1[m];
+                            r0c2 += bias_c2[m];
+                        }
+                        atomic_store_f32((volatile float *) (d_c0 + m), r0c0);
+                        atomic_store_f32((volatile float *) (d_c1 + m), r0c1);
+                        atomic_store_f32((volatile float *) (d_c2 + m), r0c2);
+                    }
+                    n += 3;
+                    continue;
+                }
                 const float * b_c0    = (const float *) (src1_ptr2 + n * nb11);
                 const float * b_c1    = (const float *) (src1_ptr2 + (n + 1) * nb11);
                 const float * bias_c0 = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
@@ -137,6 +198,7 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                     atomic_store_f32((volatile float *) (d_c0 + m), r0c0);
                     atomic_store_f32((volatile float *) (d_c1 + m), r0c1);
                 }
+                n += 2;
             }
             for (; n < N; n++) {
                 const float * b_col  = (const float *) (src1_ptr2 + n * nb11);
