@@ -8506,6 +8506,29 @@ static const ggml_type other_types[] = {
     GGML_TYPE_BF16,
 };
 
+// ET: extra FLASH_ATTN_EXT cases from the environment — GGML_ET_TBO_FA_SHAPES="hs,nh,nr2,kv,nb;..." (F16 K/V,
+// mask on; nh = KV heads, nr2 = query heads per KV head). Decode-attention shapes of a particular model, in both
+// the eval and the perf lists.
+static void add_env_flash_attn_cases(std::vector<std::unique_ptr<test_case>> & test_cases) {
+    const char * shapes_env = getenv("GGML_ET_TBO_FA_SHAPES");
+    if (!shapes_env) {
+        return;
+    }
+    std::string shapes(shapes_env);
+    size_t pos = 0;
+    while (pos < shapes.size()) {
+        size_t end = shapes.find(';', pos);
+        if (end == std::string::npos) { end = shapes.size(); }
+        std::string item = shapes.substr(pos, end - pos);
+        pos = end + 1;
+        long long hs = 0, nh = 0, nr2 = 0, kv = 0, nb = 0;
+        if (sscanf(item.c_str(), "%lld,%lld,%lld,%lld,%lld", &hs, &nh, &nr2, &kv, &nb) == 5) {
+            test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr2, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                            GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+}
+
 #ifdef _MSC_VER
 // Workaround long compile time with msvc
 #pragma optimize("", off)
@@ -10551,6 +10574,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    add_env_flash_attn_cases(test_cases);
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -11006,6 +11031,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    add_env_flash_attn_cases(test_cases);
 
     return test_cases;
 }
