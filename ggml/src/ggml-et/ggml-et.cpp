@@ -291,6 +291,22 @@ static ggml_status ggml_backend_et_buffer_init_tensor(ggml_backend_buffer_t buff
     return GGML_STATUS_SUCCESS;
 }
 
+// GGML_ET_HOST_TIMING=1: one line per graph with the host-side phases since the previous graph (timing only).
+//   gap   = previous graph_compute return -> this graph_compute entry (llama's host work + waits + copies)
+//   build = node loop (instructions marshalled); launch = end of graph (instruction/param upload + launch)
+//   sync  = time in backend synchronize; set/get = synchronous tensor copies (count, bytes, time)
+struct et_host_timing {
+    bool                                  on = [] { const char * e = getenv("GGML_ET_HOST_TIMING"); return e && *e && strcmp(e, "0") != 0; }();
+    std::chrono::steady_clock::time_point last_return{};
+    double                                sync_ms = 0, set_ms = 0, get_ms = 0, aset_ms = 0, aget_ms = 0;
+    uint64_t                              n_sync = 0, n_set = 0, n_get = 0, n_aset = 0, n_aget = 0;
+    uint64_t                              b_set = 0, b_get = 0, b_aset = 0, b_aget = 0, graphs = 0;
+};
+static et_host_timing g_et_ht;
+static inline double et_ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
 static void ggml_backend_et_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                               ggml_tensor *         tensor,
                                               const void *          data,
@@ -308,9 +324,15 @@ static void ggml_backend_et_buffer_set_tensor(ggml_backend_buffer_t buffer,
     std::byte *       dst_ptr = static_cast<std::byte *>(tensor->data) + offset;
     const std::byte * src_ptr = static_cast<const std::byte *>(data);
 
+    const auto  ht0   = std::chrono::steady_clock::now();
     rt::EventId event = runtime->memcpyHostToDevice(stream, src_ptr, dst_ptr, size, true /*barrier*/);
 
     runtime->waitForEvent(event);
+    if (g_et_ht.on) {
+        g_et_ht.set_ms += et_ms_since(ht0);
+        g_et_ht.n_set++;
+        g_et_ht.b_set += size;
+    }
 }
 
 static void ggml_backend_et_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -329,9 +351,15 @@ static void ggml_backend_et_buffer_get_tensor(ggml_backend_buffer_t buffer,
     const std::byte * src_ptr = static_cast<const std::byte *>(tensor->data) + offset;
     std::byte *       dst_ptr = static_cast<std::byte *>(data);
 
+    const auto  ht0   = std::chrono::steady_clock::now();
     rt::EventId event = runtime->memcpyDeviceToHost(stream, src_ptr, dst_ptr, size, true /*barrier*/);
 
     runtime->waitForEvent(event);
+    if (g_et_ht.on) {
+        g_et_ht.get_ms += et_ms_since(ht0);
+        g_et_ht.n_get++;
+        g_et_ht.b_get += size;
+    }
 }
 
 static bool ggml_backend_et_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
@@ -529,7 +557,13 @@ static void ggml_backend_et_set_tensor_async(ggml_backend_t backend,
     std::byte *       dst_ptr = static_cast<std::byte *>(tensor->data) + offset;
     const std::byte * src_ptr = static_cast<const std::byte *>(data);
 
+    const auto ht0 = std::chrono::steady_clock::now();
     runtime->memcpyHostToDevice(stream, src_ptr, dst_ptr, size, true /*barrier*/);
+    if (g_et_ht.on) {
+        g_et_ht.aset_ms += et_ms_since(ht0);
+        g_et_ht.n_aset++;
+        g_et_ht.b_aset += size;
+    }
 }
 
 static void ggml_backend_et_get_tensor_async(ggml_backend_t      backend,
@@ -548,7 +582,13 @@ static void ggml_backend_et_get_tensor_async(ggml_backend_t      backend,
     const std::byte * src_ptr = static_cast<const std::byte *>(tensor->data) + offset;
     std::byte *       dst_ptr = static_cast<std::byte *>(data);
 
+    const auto ht0 = std::chrono::steady_clock::now();
     runtime->memcpyDeviceToHost(stream, src_ptr, dst_ptr, size, true /*barrier*/);
+    if (g_et_ht.on) {
+        g_et_ht.aget_ms += et_ms_since(ht0);
+        g_et_ht.n_aget++;
+        g_et_ht.b_aget += size;
+    }
 }
 
 static bool ggml_backend_et_cpy_tensor_async(ggml_backend_t      backend_src,
@@ -569,7 +609,12 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
     }
 
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
+    const auto                       ht0     = std::chrono::steady_clock::now();
     ggml_et_wait_stream(dev_ctx, "synchronize");
+    if (g_et_ht.on) {
+        g_et_ht.sync_ms += et_ms_since(ht0);
+        g_et_ht.n_sync++;
+    }
 
     auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
     if (errors.empty()) {
@@ -1389,6 +1434,11 @@ static int64_t et_graph_n_tokens(const ggml_cgraph * cgraph) {
 
 static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
+    const auto                       ht_entry = std::chrono::steady_clock::now();
+    double                           ht_gap   = 0;
+    if (g_et_ht.on && g_et_ht.graphs > 0) {
+        ht_gap = std::chrono::duration<double, std::milli>(ht_entry - g_et_ht.last_return).count();
+    }
     dev_ctx->uberkernel_active = dev_ctx->uberkernel_enabled &&
                                  (dev_ctx->uberkernel_max_tokens <= 0 ||
                                   et_graph_n_tokens(cgraph) <= dev_ctx->uberkernel_max_tokens);
@@ -1772,9 +1822,28 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
 
+    const double ht_build = g_et_ht.on ? et_ms_since(ht_entry) : 0.0;
+    const auto   ht_l0    = std::chrono::steady_clock::now();
     if (!ggml_et_uberkernel_end_graph(dev_ctx)) {
         ggml_et_uberkernel_abort_graph(&dev_ctx->uberkernel);
         return GGML_STATUS_FAILED;
+    }
+    if (g_et_ht.on) {
+        const double ht_launch = et_ms_since(ht_l0);
+        fprintf(stderr,
+                "ET-HOST graph=%llu nodes=%d gap_ms=%.2f build_ms=%.2f launch_ms=%.2f | since prev: sync n=%llu %.2f ms, "
+                "set n=%llu %llu B %.2f ms, get n=%llu %llu B %.2f ms, aset n=%llu %llu B %.2f ms, aget n=%llu %llu B %.2f ms\n",
+                (unsigned long long) g_et_ht.graphs, cgraph->n_nodes, ht_gap, ht_build, ht_launch,
+                (unsigned long long) g_et_ht.n_sync, g_et_ht.sync_ms, (unsigned long long) g_et_ht.n_set,
+                (unsigned long long) g_et_ht.b_set, g_et_ht.set_ms, (unsigned long long) g_et_ht.n_get,
+                (unsigned long long) g_et_ht.b_get, g_et_ht.get_ms, (unsigned long long) g_et_ht.n_aset,
+                (unsigned long long) g_et_ht.b_aset, g_et_ht.aset_ms, (unsigned long long) g_et_ht.n_aget,
+                (unsigned long long) g_et_ht.b_aget, g_et_ht.aget_ms);
+        g_et_ht.sync_ms = g_et_ht.set_ms = g_et_ht.get_ms = g_et_ht.aset_ms = g_et_ht.aget_ms = 0;
+        g_et_ht.n_sync = g_et_ht.n_set = g_et_ht.n_get = g_et_ht.n_aset = g_et_ht.n_aget = 0;
+        g_et_ht.b_set = g_et_ht.b_get = g_et_ht.b_aset = g_et_ht.b_aget = 0;
+        g_et_ht.graphs++;
+        g_et_ht.last_return = std::chrono::steady_clock::now();
     }
 
     if (et_fcheck_enabled()) {
