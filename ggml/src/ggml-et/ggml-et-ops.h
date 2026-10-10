@@ -278,6 +278,11 @@ struct ggml_et_gated_delta_net_params {
     int32_t     K;         // snapshot slot count
     int32_t     raw_gates; // 1: beta = sigmoid(beta), g = a[h] * softplus(g + dt_bias[h]) (scalar gate only)
     float       scale;     // 1/sqrt(S_v)
+    // Folded snapshot scatter (rows mode, one sequence; data == NULL when off): the graph's SET_ROWS that copies the
+    // snapshot planes of dst into the state cache is skipped and the kernel writes slot s straight to row
+    // snap_rows[s] of snap_dst.
+    ggml_tensor snap_rows; // I64 [n_written]
+    ggml_tensor snap_dst;  // state cache [S_v*S_v*H, n_cache_rows], contiguous rows
 };
 
 struct ggml_et_set_rows_params {
@@ -487,7 +492,8 @@ bool ggml_et_op_repeat(ggml_backend_et_device_context * dev_ctx, const ggml_tens
 bool ggml_et_op_rwkv_wkv6(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_rwkv_wkv7(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_cpy(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
-bool ggml_et_op_gated_delta_net(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
+bool ggml_et_op_gated_delta_net(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node,
+                                const ggml_tensor * fused_set_rows = nullptr);
 bool ggml_et_op_elmap(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_fill(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_diag(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);

@@ -2567,7 +2567,8 @@ static ggml_et_cpu_compare_config gated_delta_net_cpu_compare_config = {
     /* .max_log_elements = */ 4096
 };
 
-bool ggml_et_op_gated_delta_net(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node) {
+bool ggml_et_op_gated_delta_net(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node,
+                                const ggml_tensor * fused_set_rows) {
     ET_PERF_START();
 
     if (!dev_ctx || !node) {
@@ -2637,6 +2638,8 @@ bool ggml_et_op_gated_delta_net(ggml_backend_et_device_context * dev_ctx, const 
     params.K         = ggml_get_op_params_i32(node, 0);
     params.raw_gates = raw_gates ? 1 : 0;
     params.scale     = 1.0f / sqrtf((float) S_v);
+    params.snap_rows = fused_set_rows ? *fused_set_rows->src[1] : ggml_tensor{};
+    params.snap_dst  = fused_set_rows ? *fused_set_rows->src[2] : ggml_tensor{};
 
     // CPU comparison for debugging
     ggml_et_cpu_compare_ctx cpu_cmp_ctx;

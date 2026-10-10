@@ -17,6 +17,10 @@
 //   rows mode (rows set): state_in is a 2-D cache view [S_v*S_v*H, n_rows]; sequence s
 //     reads its state at row rows[s] (stride state_in.nb[1]) instead of seq s of a 4-D tensor.
 //     The output layout is unchanged.
+//   folded snapshot scatter (snap_rows set; rows mode, one sequence): the state planes (slot 0 = live state,
+//     slots 1..K-1 = snapshots) are written to rows snap_rows[slot] of the state cache snap_dst instead of the
+//     dst planes, replacing the graph's SET_ROWS copy. A block's read of its state row and its writes stay on the
+//     same hart, in program order, so an output row equal to the input row is safe.
 //******************************************************************************
 
 #include "ggml_tensor.h"
@@ -48,6 +52,8 @@ struct ggml_et_gated_delta_net_params {
     int32_t            K;         // snapshot slot count
     int32_t            raw_gates; // 1: apply sigmoid / a*softplus(g + dt_bias) to beta / g first
     float              scale;     // 1/sqrt(S_v)
+    struct ggml_tensor snap_rows; // I64 [n_written], folded snapshot scatter only (data == NULL otherwise)
+    struct ggml_tensor snap_dst;  // state cache [S_v*S_v*H, n_cache_rows], folded snapshot scatter only
 };
 
 // softplus(x) = log(1 + exp(x)); x itself above 20, where 1 + exp(x) loses the 1 in fp32 anyway
@@ -152,6 +158,15 @@ int entry_point(struct ggml_et_gated_delta_net_params * params, void * env) {
 
     const int32_t state_plane_floats  = S_v * S_v * H * n_seqs;
 
+    // Folded snapshot scatter: slot s goes to cache row snap_rows[s] (one sequence, so a plane is one row).
+    const int64_t * snap_rows        = (const int64_t *) params->snap_rows.data;
+    float *         snap_dst         = (float *) params->snap_dst.data;
+    const size_t    snap_row_floats  = snap_rows ? params->snap_dst.nb[1] / sizeof(float) : 0;
+    if (snap_rows && (n_seqs != 1 || !rows || !snap_dst || params->snap_rows.nb[0] != sizeof(int64_t) ||
+                      params->snap_dst.nb[0] != sizeof(float) || snap_row_floats < (size_t) S_v * S_v * H)) {
+        return -1;
+    }
+
     const int32_t G0 = kda ? S_v : 1;
 
     const size_t  q_nb1      = q_tsr->nb[1];
@@ -206,7 +221,8 @@ int entry_point(struct ggml_et_gated_delta_net_params * params, void * env) {
 
         const int32_t head_state_off = (seq * H + head) * S_v * S_v;
         // Live RMW buffer = first snapshot plane (slot 0).
-        float *       s_out          = state_out_base + head_state_off;
+        float *       s_out          = snap_rows ? snap_dst + (size_t) snap_rows[0] * snap_row_floats + head_state_off
+                                                 : state_out_base + head_state_off;
         // Input state: seq `seq`, head `head` -- from the cache row rows[seq] in rows mode, else the
         // contiguous 4-D tensor (seq stride S_v*S_v*H).
         const float * s_in           = rows ? state_in + (size_t) rows[seq] * state_row_floats + head * S_v * S_v
@@ -368,7 +384,8 @@ int entry_point(struct ggml_et_gated_delta_net_params * params, void * env) {
             if (K > 1) {
                 const int32_t target_slot = (n_tokens - 1) - t;
                 if (target_slot > 0 && target_slot < K) {
-                    float * snap = state_out_base + target_slot * state_plane_floats + head_state_off;
+                    float * snap = snap_rows ? snap_dst + (size_t) snap_rows[target_slot] * snap_row_floats + head_state_off
+                                             : state_out_base + target_slot * state_plane_floats + head_state_off;
                     for (int32_t j = j_start; j < j_end; j++) {
                         const float * src = s_out + j * S_v;
                         float *       dst = snap + j * S_v;

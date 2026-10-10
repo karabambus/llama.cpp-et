@@ -1148,6 +1148,56 @@ static bool ggml_et_moe_router_match(const ggml_cgraph * cgraph, int i, et_route
     return true;
 }
 
+// Delta-net snapshot fold. In rows mode (`n_rs_seq > 0`, speculative decoding) the graph copies the op's snapshot
+// planes into the recurrent cache with a separate SET_ROWS; for one sequence the kernel can write them there itself
+// (ggml_et_gated_delta_net_params::snap_rows). Returns that SET_ROWS when it is exactly the compact snapshot scatter
+// of node i (view at the snapshot offset, [D, n_written] rows, I64 indices, 64-byte aligned contiguous cache rows),
+// else nullptr. GGML_ET_NO_GDN_SNAP_FOLD=1 keeps the SET_ROWS.
+static const ggml_tensor * ggml_et_gdn_snap_fold(const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = [] {
+        const char * e = getenv("GGML_ET_NO_GDN_SNAP_FOLD");
+        return e && *e && strcmp(e, "0") != 0;
+    }();
+    const ggml_tensor * gdn = cgraph->nodes[i];
+    if (disabled || gdn->op != GGML_OP_GATED_DELTA_NET || !gdn->src[6] || !gdn->data) {
+        return nullptr;
+    }
+    const ggml_tensor * v        = gdn->src[2];
+    const int64_t       S_v      = v->ne[0];
+    const int64_t       H        = v->ne[1];
+    const int64_t       n_tokens = v->ne[2];
+    const int64_t       n_seqs   = v->ne[3];
+    const int64_t       K        = ggml_get_op_params_i32(gdn, 0);
+    if (n_seqs != 1 || K < 1) {
+        return nullptr;
+    }
+    const int64_t D          = S_v * S_v * H;
+    const int64_t n_write    = std::min<int64_t>(n_tokens, K);
+    const size_t  attn_bytes = (size_t) (S_v * H * n_tokens * n_seqs) * sizeof(float);
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 16; j++) {
+        const ggml_tensor * sr = cgraph->nodes[j];
+        if (sr->op != GGML_OP_SET_ROWS) {
+            continue;
+        }
+        const ggml_tensor * view = sr->src[0];
+        const ggml_tensor * idx  = sr->src[1];
+        const ggml_tensor * dst  = sr->src[2];
+        if (!view || !idx || !dst || !view->data || !idx->data || !dst->data ||
+            (const char *) view->data != (const char *) gdn->data + attn_bytes) {
+            continue;
+        }
+        if (view->type != GGML_TYPE_F32 || sr->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            idx->type != GGML_TYPE_I64 || view->ne[0] != D || view->nb[0] != sizeof(float) ||
+            view->nb[1] != (size_t) D * sizeof(float) || ggml_nelements(view) != D * n_write ||
+            ggml_nelements(idx) != n_write || dst->ne[0] != D || dst->nb[0] != sizeof(float) || dst->nb[1] % 64 != 0 ||
+            ((uintptr_t) dst->data % 64) != 0) {
+            continue;
+        }
+        return sr;
+    }
+    return nullptr;
+}
+
 // T2 fusion 2: attention glue. One "norm+rope" chain = RMS_NORM(x [D,H,N]) -> MUL(w [D]) -> ROPE, optionally
 // consumed by SET_ROWS(kv cache, view(rope,[D*H,N]), idx). After the k chain, v's SET_ROWS (a plain copy) follows.
 static bool et_set_rows_ok(const ggml_tensor * sr, int64_t D, int64_t H, int64_t N) {
@@ -1534,6 +1584,7 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
 
     int fused_groups           = 0;
     int fused_dispatches_saved = 0;
+    const ggml_tensor * gdn_fold_skip = nullptr;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -1546,6 +1597,10 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
         // zero-sized at one sequence), but as an uberkernel instruction it still costs the dispatcher's evict walk
         // of its inputs and a chip-wide barrier.
         if (ggml_is_empty(node)) {
+            continue;
+        }
+        if (node == gdn_fold_skip) {  // snapshot scatter written by the delta-net kernel itself
+            gdn_fold_skip = nullptr;
             continue;
         }
 
@@ -1883,7 +1938,11 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
                 break;
 
             case GGML_OP_GATED_DELTA_NET:
-                ggml_et_op_gated_delta_net(dev_ctx, node);
+                {
+                    const ggml_tensor * sr = ggml_et_gdn_snap_fold(cgraph, i);
+                    ggml_et_op_gated_delta_net(dev_ctx, node, sr);
+                    gdn_fold_skip = sr;
+                }
                 break;
 
             default:
