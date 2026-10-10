@@ -1067,7 +1067,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 const llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                const float p_min_i = i < (int) params.p_min_pos.size() ? params.p_min_pos[i] : params.p_min;  // per-position when given
+                if (cur_p->data[0].p < p_min_i) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1529,7 +1530,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
-                if (cur_p->data[0].p < params.p_min) {
+                const float p_min_i = i < (int) params.p_min_pos.size() ? params.p_min_pos[i] : params.p_min;  // per-position when given
+                if (cur_p->data[0].p < p_min_i) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -2777,7 +2779,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                const float p_min_i = i < (int) params.p_min_pos.size() ? params.p_min_pos[i] : params.p_min;  // per-position when given
+                if (cur_p->data[0].p < p_min_i) {
                     drafting[seq_id] = false;
                     n_drafting--;
 

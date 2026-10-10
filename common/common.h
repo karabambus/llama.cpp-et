@@ -329,6 +329,11 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // per-position minimum probability: draft position i stops the draft when its top-1 probability is below
+    // p_min_pos[i] (positions past the list use p_min). A later position carries an extra verification column
+    // and is accepted less often, so it needs a more confident draft to pay.
+    std::vector<float> p_min_pos;
+
     // stop drafting once the sequence is this long (0 = never). Deep in the context a step is bound
     // by reading the KV cache, and the draft passes plus the multi-column verify add to that read
     // without shortening it: on a 4070 with Bonsai 2 27B the draft is +85% at zero depth, breaks

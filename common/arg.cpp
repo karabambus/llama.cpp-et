@@ -4144,6 +4144,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-p-min-pos"}, "P0,P1,...",
+        "per-position minimum speculative decoding probability (greedy): draft position i needs top-1 probability >= Pi "
+        "(positions past the list use --spec-draft-p-min)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.p_min_pos.clear();
+            for (const auto & tok : string_split<std::string>(value, ',')) {
+                params.speculative.draft.p_min_pos.push_back(std::stof(tok));
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN_POS"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",
