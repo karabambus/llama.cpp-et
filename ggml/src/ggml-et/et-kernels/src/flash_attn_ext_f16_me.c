@@ -422,16 +422,24 @@ int entry_point(struct ggml_et_flash_attn_ext_params * params, void * env) {
     // k_splits is a power of two, capped at MINIONS_PER_SHIRE (so a team
     // never spans shires — L2 SCP is shire-local) and at nk_tiles (so each
     // team member gets at least one KV tile).
-    const int64_t nk_tiles      = (nk + TILE_KV - 1) / TILE_KV;
-    const int64_t total_minions = 2 * NUM_COMPUTE_SHIRES * MINIONS_PER_SHIRE;
-    int64_t       k_splits      = 1;
-    if (total_rows < total_minions) {
-        int64_t target = total_minions / total_rows;
-        int64_t ks     = 1;
-        while (ks * 2 <= target && ks * 2 <= MINIONS_PER_SHIRE && ks * 2 <= nk_tiles) {
-            ks *= 2;
+    //
+    // A minion's time is set by the KV tiles it walks (each tile is a chain of dependent loads), so pick the
+    // k_splits that minimises passes × (tiles per slab + one tile's worth for the merge): 72 decode rows at
+    // 3.5 k positions take three passes over 7 tiles at k_splits 32 instead of two over 14 at 16. Ties keep
+    // the smaller split (fewer merges).
+    const int64_t nk_tiles = (nk + TILE_KV - 1) / TILE_KV;
+    int64_t       k_splits = 1;
+    {
+        int64_t best_cost = -1;
+        for (int64_t ks = 1; ks <= MINIONS_PER_SHIRE && ks <= nk_tiles; ks *= 2) {
+            const int64_t teams  = (int64_t) NUM_COMPUTE_SHIRES * (MINIONS_PER_SHIRE / ks);
+            const int64_t passes = (total_rows + teams - 1) / teams;
+            const int64_t cost   = passes * ((nk_tiles + ks - 1) / ks + (ks > 1 ? 1 : 0));
+            if (best_cost < 0 || cost < best_cost) {
+                best_cost = cost;
+                k_splits  = ks;
+            }
         }
-        k_splits = ks;
     }
 
     const int64_t tiles_per_shire = MINIONS_PER_SHIRE / k_splits;
