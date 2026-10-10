@@ -23,6 +23,52 @@ static inline size_t tensor_bytes(const struct ggml_tensor * t) {
     return (size_t) t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3] * t->nb[0];
 }
 
+// Row pairing for the 2x3 tile. A hart's rows are STRIDE_M rows apart, a multiple of 128 bytes, so both rows' weight lines
+// fall into the same set of the hart's 2-set x 4-way L1; with three activation lines in that set as well (the columns are
+// also a multiple of 128 bytes apart) the set would need five ways. Pairing row r with row r + d, where d * nb01 is 64
+// modulo 128, puts the two weight lines into opposite sets at every chunk. Returns d, or 0 when no d <= 64 exists.
+static inline int64_t pq2_pair_offset(size_t nb01) {
+    for (int64_t d = 1; d <= 64; d++) {
+        if (((size_t) d * nb01) % 128 == 64) {
+            return d;
+        }
+    }
+    return 0;
+}
+
+// One 2x3 tile (rows r0, r1 against columns c0..c2) including the horizontal sums, bias and output stores.
+static inline void __attribute__((always_inline)) pq2_rows23(const char * src0_ptr2, size_t nb01, int64_t r0, int64_t r1,
+                                                             const float * b_c0, const float * b_c1, const float * b_c2,
+                                                             const float * bias_c0, const float * bias_c1,
+                                                             const float * bias_c2, float * d_c0, float * d_c1, float * d_c2,
+                                                             int64_t K_blocks) {
+    const block_pq2_0 * q_row0 = (const block_pq2_0 *) (src0_ptr2 + r0 * nb01);
+    const block_pq2_0 * q_row1 = (const block_pq2_0 *) (src0_ptr2 + r1 * nb01);
+    float               r0c0, r1c0, r0c1, r1c1, r0c2, r1c2;
+    pq2_dot_reset23();
+    pq2_dot_tile23_w(q_row0, q_row1, b_c0, b_c1, b_c2, K_blocks);
+    PQ2V_HSUM("f20", r0c0);
+    PQ2V_HSUM("f21", r1c0);
+    PQ2V_HSUM("f28", r0c1);
+    PQ2V_HSUM("f29", r1c1);
+    PQ2V_HSUM("f14", r0c2);
+    PQ2V_HSUM("f31", r1c2);
+    if (bias_c0) {
+        r0c0 += bias_c0[r0];
+        r1c0 += bias_c0[r1];
+        r0c1 += bias_c1[r0];
+        r1c1 += bias_c1[r1];
+        r0c2 += bias_c2[r0];
+        r1c2 += bias_c2[r1];
+    }
+    atomic_store_f32((volatile float *) (d_c0 + r0), r0c0);
+    atomic_store_f32((volatile float *) (d_c0 + r1), r1c0);
+    atomic_store_f32((volatile float *) (d_c1 + r0), r0c1);
+    atomic_store_f32((volatile float *) (d_c1 + r1), r1c1);
+    atomic_store_f32((volatile float *) (d_c2 + r0), r0c2);
+    atomic_store_f32((volatile float *) (d_c2 + r1), r1c2);
+}
+
 int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     (void) env;
     const uint64_t hart_id = get_hart_id();
@@ -72,6 +118,7 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     // The windowed gather (fg32b.ps) is bit-identical to fgb.ps only at even chunk addresses: blocks are 34 bytes,
     // so every chunk address is even exactly when the weight base and the row/batch strides are even (pq2_ops.h).
     const int windowed = ((((uintptr_t) params->src0.data) | nb01 | nb02 | nb03) & 1) == 0;
+    const int64_t pair_d = pq2_pair_offset(nb01);
 
     unsigned long saved_mask;
     __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
@@ -107,33 +154,20 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                     float *       d_c1    = (float *) (dst_ptr2 + (n + 1) * nbd1);
                     float *       d_c2    = (float *) (dst_ptr2 + (n + 2) * nbd1);
 
-                    int64_t m = (int64_t) hart_id;
+                    // Region A (whole rounds of 2 * STRIDE_M rows): pair slot p = hart_id + k * STRIDE_M maps to rows r0 and
+                    // r0 + pair_d in opposite L1 sets, a bijection on the region; every hart keeps its row count. The rest
+                    // of the rows keep the STRIDE_M pairing (plus single rows) of the other tiles.
+                    const int64_t full = pair_d ? M / (2 * STRIDE_M) : 0;
+                    for (int64_t k = 0; k < full; k++) {
+                        const int64_t p  = k * STRIDE_M + (int64_t) hart_id;
+                        const int64_t r0 = (p / pair_d) * 2 * pair_d + (p % pair_d);
+                        pq2_rows23(src0_ptr2, nb01, r0, r0 + pair_d, b_c0, b_c1, b_c2, bias_c0, bias_c1, bias_c2, d_c0, d_c1,
+                                   d_c2, K_blocks);
+                    }
+                    int64_t m = full * 2 * STRIDE_M + (int64_t) hart_id;
                     for (; m + STRIDE_M < M; m += 2 * STRIDE_M) {
-                        const block_pq2_0 * q_row0 = (const block_pq2_0 *) (src0_ptr2 + m * nb01);
-                        const block_pq2_0 * q_row1 = (const block_pq2_0 *) (src0_ptr2 + (m + STRIDE_M) * nb01);
-                        float               r0c0, r1c0, r0c1, r1c1, r0c2, r1c2;
-                        pq2_dot_reset23();
-                        pq2_dot_tile23_w(q_row0, q_row1, b_c0, b_c1, b_c2, K_blocks);
-                        PQ2V_HSUM("f20", r0c0);
-                        PQ2V_HSUM("f21", r1c0);
-                        PQ2V_HSUM("f28", r0c1);
-                        PQ2V_HSUM("f29", r1c1);
-                        PQ2V_HSUM("f14", r0c2);
-                        PQ2V_HSUM("f31", r1c2);
-                        if (bias_c0) {
-                            r0c0 += bias_c0[m];
-                            r1c0 += bias_c0[m + STRIDE_M];
-                            r0c1 += bias_c1[m];
-                            r1c1 += bias_c1[m + STRIDE_M];
-                            r0c2 += bias_c2[m];
-                            r1c2 += bias_c2[m + STRIDE_M];
-                        }
-                        atomic_store_f32((volatile float *) (d_c0 + m), r0c0);
-                        atomic_store_f32((volatile float *) (d_c0 + m + STRIDE_M), r1c0);
-                        atomic_store_f32((volatile float *) (d_c1 + m), r0c1);
-                        atomic_store_f32((volatile float *) (d_c1 + m + STRIDE_M), r1c1);
-                        atomic_store_f32((volatile float *) (d_c2 + m), r0c2);
-                        atomic_store_f32((volatile float *) (d_c2 + m + STRIDE_M), r1c2);
+                        pq2_rows23(src0_ptr2, nb01, m, m + STRIDE_M, b_c0, b_c1, b_c2, bias_c0, bias_c1, bias_c2, d_c0, d_c1,
+                                   d_c2, K_blocks);
                     }
                     for (; m < M; m += STRIDE_M) {
                         const block_pq2_0 * q_row = (const block_pq2_0 *) (src0_ptr2 + m * nb01);
