@@ -176,21 +176,19 @@ int entry_point(struct ggml_et_gated_delta_net_params * params, void * env) {
     unsigned long default_mask;
     __asm__ volatile("mova.x.m %[ms]\n" : [ms] "=r"(default_mask));
 
-    // Parallelize over (j_block, head, seq).  J_BLK must satisfy two separate
-    // cache-line alignment constraints at once:
-    //   (a) State: J_BLK consecutive rows of s_out (each S_v floats) span an
-    //       integer number of cache lines.  For S_v * sizeof(float) >= 64 this
-    //       is trivially any J_BLK >= 1.
-    //   (b) Attention output: each j writes exactly one float into
-    //       attn_ptr[j], which is densely packed.  If J_BLK * sizeof(float) is
-    //       less than a cache line, distinct threads will share a line and
-    //       race on scalar stores — ET's L1 isn't coherent so we lose writes.
-    //
-    // (b) dominates: J_BLK must be at least ET_CACHE_LINE_SIZE_BYTES / 4 so
-    // that each thread owns a whole cache line of attn_ptr.  That's 16 on
-    // ET-SoC-1, and it's also a whole number of state rows for every
-    // S_v >= 1, so (a) is automatically satisfied.
-    const int32_t J_BLK      = ET_CACHE_LINE_SIZE_BYTES / (int32_t) sizeof(float);
+    // Parallelize over (j_block, head, seq). A block is J_BLK consecutive rows j of one head's state. State rows
+    // (S_v floats, S_v >= 16) are whole cache lines, so any J_BLK keeps a hart's state and snapshot stores on its
+    // own lines. The attention output attn_ptr[j] is one float per row, densely packed: with J_BLK < 16 several
+    // harts write into one 64-byte line, and plain stores through the incoherent L1s would lose writes, so those
+    // stores go out as global atomic stores (atomic_store_f32), which need no line ownership. J_BLK is the
+    // smallest power of two in 1..16 that keeps the blocks within the launched harts: with 16 rows per block a
+    // 48-head layer gave work to 384 of 2,048 harts.
+    int32_t J_BLK = 1;
+    while (J_BLK < ET_CACHE_LINE_SIZE_BYTES / (int32_t) sizeof(float) &&
+           ((S_v + J_BLK - 1) / J_BLK) * H * n_seqs > num_threads) {
+        J_BLK *= 2;
+    }
+    const int    attn_atomic = J_BLK < ET_CACHE_LINE_SIZE_BYTES / (int32_t) sizeof(float);
     const int32_t n_j_blocks = (S_v + J_BLK - 1) / J_BLK;
     const int32_t total_work = n_j_blocks * H * n_seqs;
 
@@ -357,7 +355,11 @@ int entry_point(struct ggml_et_gated_delta_net_params * params, void * env) {
                 float attn_val = hsum_f10();
                 __asm__ volatile("mova.m.x %[ms]\n" : : [ms] "r"(default_mask));
 
-                attn_ptr[j] = attn_val * scale;
+                if (attn_atomic) {
+                    atomic_store_f32((volatile float *) &attn_ptr[j], attn_val * scale);
+                } else {
+                    attn_ptr[j] = attn_val * scale;
+                }
             }
 
             // n-way merge snapshot: live state lives in slot 0 (== s_out).
