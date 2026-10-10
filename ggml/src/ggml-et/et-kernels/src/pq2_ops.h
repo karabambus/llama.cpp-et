@@ -342,4 +342,177 @@ static inline void __attribute__((always_inline)) pq2_dot_reduce2(float * r0, fl
     *r1 = b;
 }
 
+// Two token columns per weight pass (windowed path, even chunk addresses only). A batch of N > 1 tokens (speculative
+// verification, prefill) used to stream every weight row once per column; these tiles gather and unpack each chunk of
+// codes once and apply it to two columns. Each (row, column) keeps its own block accumulator and sees chunks 0..15
+// and the block scale in the same order as the one-column tiles, so results are bit-identical per column. Both
+// columns' activations are loaded two chunks ahead as in PQ2V_CHUNK_WP: column 0 rotates f13, f19, f22, f23 and
+// column 1 rotates f24, f25, f26, f27. At most two weight lines and two activation lines are live per L1 set (a
+// hart's rows, and the two columns, are each a multiple of 128 bytes apart, so they share a set).
+// Register contract (live across the asm blocks of a tile; no compiler float code inside the loops, KB 04 G2a):
+//   block accumulators: row0/col0 f10, row1/col0 f16, row0/col1 f6, row1/col1 f7
+//   row accumulators:   row0/col0 f20, row1/col0 f21, row0/col1 f28, row1/col1 f29
+//   gather scratch f11/f12 (row 0), f17/f18 (row 1); shift pattern f30; scale f15
+#define PQ2V_CH22(a0, a1, RC0, RN0, bn0, RC1, RN1, bn1, gi)                                 \
+    __asm__ volatile(                                                                       \
+        "fg32b.ps   f11, %[gi](%[q0])\n\t"                                                  \
+        "fg32b.ps   f17, %[gi](%[q1])\n\t"                                                  \
+        "flw.ps     " RN0 ", %[v0]\n\t"                                                     \
+        "flw.ps     " RN1 ", %[v1]\n\t"                                                     \
+        "fsrl.pi    f12, f11, f30\n\t"                                                      \
+        "fsrl.pi    f18, f17, f30\n\t"                                                      \
+        "fandi.pi   f12, f12, 3\n\t"                                                        \
+        "fandi.pi   f18, f18, 3\n\t"                                                        \
+        "faddi.pi   f12, f12, -1\n\t"                                                       \
+        "faddi.pi   f18, f18, -1\n\t"                                                       \
+        "fcvt.ps.pw f12, f12, rne\n\t"                                                      \
+        "fcvt.ps.pw f18, f18, rne\n\t"                                                      \
+        "fmadd.ps   f10, f12, " RC0 ", f10, rne\n\t"                                        \
+        "fmadd.ps   f16, f18, " RC0 ", f16, rne\n\t"                                        \
+        "fmadd.ps   f6, f12, " RC1 ", f6, rne\n\t"                                          \
+        "fmadd.ps   f7, f18, " RC1 ", f7, rne\n\t"                                          \
+        :                                                                                   \
+        : [q0] "r"(a0), [q1] "r"(a1), [gi] "r"(gi), [v0] "m"(*(const float (*)[8]) (bn0)),  \
+          [v1] "m"(*(const float (*)[8]) (bn1))                                             \
+        : "f10", "f11", "f12", "f16", "f17", "f18", "f6", "f7", RN0, RN1)
+
+#define PQ2V_CH12(a0, RC0, RN0, bn0, RC1, RN1, bn1, gi)                                     \
+    __asm__ volatile(                                                                       \
+        "fg32b.ps   f11, %[gi](%[q0])\n\t"                                                  \
+        "flw.ps     " RN0 ", %[v0]\n\t"                                                     \
+        "flw.ps     " RN1 ", %[v1]\n\t"                                                     \
+        "fsrl.pi    f12, f11, f30\n\t"                                                      \
+        "fandi.pi   f12, f12, 3\n\t"                                                        \
+        "faddi.pi   f12, f12, -1\n\t"                                                       \
+        "fcvt.ps.pw f12, f12, rne\n\t"                                                      \
+        "fmadd.ps   f10, f12, " RC0 ", f10, rne\n\t"                                        \
+        "fmadd.ps   f6, f12, " RC1 ", f6, rne\n\t"                                          \
+        :                                                                                   \
+        : [q0] "r"(a0), [gi] "r"(gi), [v0] "m"(*(const float (*)[8]) (bn0)),                \
+          [v1] "m"(*(const float (*)[8]) (bn1))                                             \
+        : "f10", "f11", "f12", "f6", RN0, RN1)
+
+// First two activation chunks of both columns (column 0 -> f13, f19; column 1 -> f24, f25).
+#define PQ2V_ACT_PROLOGUE2(c0, c1)                                                          \
+    __asm__ volatile(                                                                       \
+        "flw.ps f13, %[a0]\n\t"                                                             \
+        "flw.ps f19, %[a1]\n\t"                                                             \
+        "flw.ps f24, %[b0]\n\t"                                                             \
+        "flw.ps f25, %[b1]\n\t"                                                             \
+        :                                                                                   \
+        : [a0] "m"(*(const float (*)[8]) (c0)), [a1] "m"(*(const float (*)[8]) ((c0) + 8)),  \
+          [b0] "m"(*(const float (*)[8]) (c1)), [b1] "m"(*(const float (*)[8]) ((c1) + 8))   \
+        : "f13", "f19", "f24", "f25")
+
+// One block for a 2x2 or 1x2 tile: CH is PQ2V_CH22 or PQ2V_CH12 with its row arguments bound by the caller macro.
+#define PQ2V_BLOCK22(qs0, qs1, b0, b1, bn0, bn1, gi)                                                         \
+    do {                                                                                                     \
+        for (int c = 0; c < 12; c += 4) {                                                                    \
+            PQ2V_CH22((qs0) + 2 * c + 0, (qs1) + 2 * c + 0, "f13", "f22", (b0) + 8 * c + 16, "f24", "f26", (b1) + 8 * c + 16, gi); \
+            PQ2V_CH22((qs0) + 2 * c + 2, (qs1) + 2 * c + 2, "f19", "f23", (b0) + 8 * c + 24, "f25", "f27", (b1) + 8 * c + 24, gi); \
+            PQ2V_CH22((qs0) + 2 * c + 4, (qs1) + 2 * c + 4, "f22", "f13", (b0) + 8 * c + 32, "f26", "f24", (b1) + 8 * c + 32, gi); \
+            PQ2V_CH22((qs0) + 2 * c + 6, (qs1) + 2 * c + 6, "f23", "f19", (b0) + 8 * c + 40, "f27", "f25", (b1) + 8 * c + 40, gi); \
+        }                                                                                                    \
+        PQ2V_CH22((qs0) + 24, (qs1) + 24, "f13", "f22", (b0) + 112, "f24", "f26", (b1) + 112, gi);           \
+        PQ2V_CH22((qs0) + 26, (qs1) + 26, "f19", "f23", (b0) + 120, "f25", "f27", (b1) + 120, gi);           \
+        PQ2V_CH22((qs0) + 28, (qs1) + 28, "f22", "f13", (bn0), "f26", "f24", (bn1), gi);                     \
+        PQ2V_CH22((qs0) + 30, (qs1) + 30, "f23", "f19", (bn0) + 8, "f27", "f25", (bn1) + 8, gi);             \
+    } while (0)
+
+#define PQ2V_BLOCK12(qs0, b0, b1, bn0, bn1, gi)                                                              \
+    do {                                                                                                     \
+        for (int c = 0; c < 12; c += 4) {                                                                    \
+            PQ2V_CH12((qs0) + 2 * c + 0, "f13", "f22", (b0) + 8 * c + 16, "f24", "f26", (b1) + 8 * c + 16, gi); \
+            PQ2V_CH12((qs0) + 2 * c + 2, "f19", "f23", (b0) + 8 * c + 24, "f25", "f27", (b1) + 8 * c + 24, gi); \
+            PQ2V_CH12((qs0) + 2 * c + 4, "f22", "f13", (b0) + 8 * c + 32, "f26", "f24", (b1) + 8 * c + 32, gi); \
+            PQ2V_CH12((qs0) + 2 * c + 6, "f23", "f19", (b0) + 8 * c + 40, "f27", "f25", (b1) + 8 * c + 40, gi); \
+        }                                                                                                    \
+        PQ2V_CH12((qs0) + 24, "f13", "f22", (b0) + 112, "f24", "f26", (b1) + 112, gi);                       \
+        PQ2V_CH12((qs0) + 26, "f19", "f23", (b0) + 120, "f25", "f27", (b1) + 120, gi);                       \
+        PQ2V_CH12((qs0) + 28, "f22", "f13", (bn0), "f26", "f24", (bn1), gi);                                 \
+        PQ2V_CH12((qs0) + 30, "f23", "f19", (bn0) + 8, "f27", "f25", (bn1) + 8, gi);                         \
+    } while (0)
+
+static inline void __attribute__((always_inline)) pq2_dot_reset22(void) {
+    __asm__ volatile("fbci.pi f20, 0\n\tfbci.pi f21, 0\n\tfbci.pi f28, 0\n\tfbci.pi f29, 0" ::: "f20", "f21", "f28", "f29");
+}
+
+// Rows q_row0/q_row1 against columns c0/c1 into f20 (r0c0), f21 (r1c0), f28 (r0c1), f29 (r1c1).
+static inline void __attribute__((always_inline)) pq2_dot_tile22_w(const block_pq2_0 * q_row0,
+                                                                   const block_pq2_0 * q_row1,
+                                                                   const float *       c0,
+                                                                   const float *       c1,
+                                                                   int64_t             n_blocks) {
+    static const int32_t __attribute__((aligned(64))) shift_pattern[8] = { 0, 2, 4, 6, 0, 2, 4, 6 };
+    const uint64_t                                    gi               = PQ2_GATHER_WINDOW_IDX;
+    __asm__ volatile("flw.ps f30, %[s]\n\t" : : [s] "m"(*(const int32_t (*)[8]) shift_pattern) : "f30");
+    if (n_blocks > 0) {
+        PQ2V_ACT_PROLOGUE2(c0, c1);
+    }
+    for (int64_t kb = 0; kb < n_blocks; kb++) {
+        const uint8_t * qs0 = q_row0[kb].qs;
+        const uint8_t * qs1 = q_row1[kb].qs;
+        const float *   b0  = c0 + kb * QK_PQ2_0;
+        const float *   b1  = c1 + kb * QK_PQ2_0;
+        const float *   bn0 = (kb + 1 < n_blocks) ? b0 + QK_PQ2_0 : c0;  // next block's activation (row end: any valid)
+        const float *   bn1 = (kb + 1 < n_blocks) ? b1 + QK_PQ2_0 : c1;
+        __asm__ volatile("fbci.pi f10, 0\n\tfbci.pi f16, 0\n\tfbci.pi f6, 0\n\tfbci.pi f7, 0" ::: "f10", "f16", "f6", "f7");
+        PQ2V_BLOCK22(qs0, qs1, b0, b1, bn0, bn1, gi);
+        const uint32_t sb0 = fp16_to_fp32_bits(q_row0[kb].d);
+        const uint32_t sb1 = fp16_to_fp32_bits(q_row1[kb].d);
+        __asm__ volatile(
+            "fbcx.ps  f15, %[s0]\n\t"
+            "fmadd.ps f20, f10, f15, f20, rne\n\t"
+            "fmadd.ps f28, f6, f15, f28, rne\n\t"
+            "fbcx.ps  f15, %[s1]\n\t"
+            "fmadd.ps f21, f16, f15, f21, rne\n\t"
+            "fmadd.ps f29, f7, f15, f29, rne\n\t"
+            :
+            : [s0] "r"(sb0), [s1] "r"(sb1)
+            : "f15", "f20", "f21", "f28", "f29");
+    }
+}
+
+// Row q_row0 against columns c0/c1 into f20 (c0) and f28 (c1).
+static inline void __attribute__((always_inline)) pq2_dot_tile12_w(const block_pq2_0 * q_row0,
+                                                                   const float *       c0,
+                                                                   const float *       c1,
+                                                                   int64_t             n_blocks) {
+    static const int32_t __attribute__((aligned(64))) shift_pattern[8] = { 0, 2, 4, 6, 0, 2, 4, 6 };
+    const uint64_t                                    gi               = PQ2_GATHER_WINDOW_IDX;
+    __asm__ volatile("flw.ps f30, %[s]\n\t" : : [s] "m"(*(const int32_t (*)[8]) shift_pattern) : "f30");
+    if (n_blocks > 0) {
+        PQ2V_ACT_PROLOGUE2(c0, c1);
+    }
+    for (int64_t kb = 0; kb < n_blocks; kb++) {
+        const uint8_t * qs0 = q_row0[kb].qs;
+        const float *   b0  = c0 + kb * QK_PQ2_0;
+        const float *   b1  = c1 + kb * QK_PQ2_0;
+        const float *   bn0 = (kb + 1 < n_blocks) ? b0 + QK_PQ2_0 : c0;
+        const float *   bn1 = (kb + 1 < n_blocks) ? b1 + QK_PQ2_0 : c1;
+        __asm__ volatile("fbci.pi f10, 0\n\tfbci.pi f6, 0" ::: "f10", "f6");
+        PQ2V_BLOCK12(qs0, b0, b1, bn0, bn1, gi);
+        const uint32_t sb0 = fp16_to_fp32_bits(q_row0[kb].d);
+        __asm__ volatile(
+            "fbcx.ps  f15, %[s0]\n\t"
+            "fmadd.ps f20, f10, f15, f20, rne\n\t"
+            "fmadd.ps f28, f6, f15, f28, rne\n\t"
+            :
+            : [s0] "r"(sb0)
+            : "f15", "f20", "f28");
+    }
+}
+
+// Horizontal sum of one 8-lane accumulator (same tree as pq2_dot_reduce).
+#define PQ2V_HSUM(ACC, OUT)                                                                 \
+    __asm__ __volatile__(                                                                   \
+        "fswizz.ps f1, " ACC ", 0xB1 \n\t"                                                  \
+        "fadd.ps   f2, " ACC ", f1, rne \n\t"                                               \
+        "fswizz.ps f3, f2, 0x4E \n\t"                                                       \
+        "fadd.ps   f4, f2, f3, rne \n\t"                                                    \
+        "fmvz.x.ps t0, f4, 4 \n\t"                                                          \
+        "fbcx.ps   f5, t0 \n\t"                                                             \
+        "fadd.ps   %[v], f4, f5, rne \n\t"                                                  \
+        : [v] "=f"(OUT)::"t0", "f1", "f2", "f3", "f4", "f5", "f20", "f21", "f28", "f29")
+
 #endif  // PQ2_OPS_H
