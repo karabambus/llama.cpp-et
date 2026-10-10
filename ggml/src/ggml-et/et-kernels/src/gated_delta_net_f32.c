@@ -176,19 +176,18 @@ int entry_point(struct ggml_et_gated_delta_net_params * params, void * env) {
     unsigned long default_mask;
     __asm__ volatile("mova.x.m %[ms]\n" : [ms] "=r"(default_mask));
 
-    // Parallelize over (j_block, head, seq). A block is J_BLK consecutive rows j of one head's state. State rows
-    // (S_v floats, S_v >= 16) are whole cache lines, so any J_BLK keeps a hart's state and snapshot stores on its
-    // own lines. The attention output attn_ptr[j] is one float per row, densely packed: with J_BLK < 16 several
-    // harts write into one 64-byte line, and plain stores through the incoherent L1s would lose writes, so those
-    // stores go out as global atomic stores (atomic_store_f32), which need no line ownership. J_BLK is the
-    // smallest power of two in 1..16 that keeps the blocks within the launched harts: with 16 rows per block a
-    // 48-head layer gave work to 384 of 2,048 harts.
-    int32_t J_BLK = 1;
-    while (J_BLK < ET_CACHE_LINE_SIZE_BYTES / (int32_t) sizeof(float) &&
-           ((S_v + J_BLK - 1) / J_BLK) * H * n_seqs > num_threads) {
+    // Parallelize over (j_block, head, seq). A block is J_BLK consecutive rows j of one head's state; a hart's
+    // state and snapshot stores stay on its own cache lines when J_BLK * S_v floats is a whole number of lines, so
+    // J_BLK is rounded up until it is. The attention output attn_ptr[j] is one float per row, densely packed: with
+    // J_BLK < 16 several harts write into one 64-byte line, and plain stores through the incoherent L1s would lose
+    // writes, so those stores go out as global atomic stores (atomic_store_f32), which need no line ownership.
+    // J_BLK is the smallest such power of two in 1..16 that keeps the blocks within the launched harts.
+    const int32_t line_floats = ET_CACHE_LINE_SIZE_BYTES / (int32_t) sizeof(float);
+    int32_t       J_BLK       = 1;
+    while (J_BLK < line_floats && (((J_BLK * S_v) % line_floats) != 0 || ((S_v + J_BLK - 1) / J_BLK) * H * n_seqs > num_threads)) {
         J_BLK *= 2;
     }
-    const int    attn_atomic = J_BLK < ET_CACHE_LINE_SIZE_BYTES / (int32_t) sizeof(float);
+    const int     attn_atomic = J_BLK < line_floats;
     const int32_t n_j_blocks = (S_v + J_BLK - 1) / J_BLK;
     const int32_t total_work = n_j_blocks * H * n_seqs;
 
