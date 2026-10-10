@@ -249,6 +249,10 @@ struct uber_rms_norm_mul_params {
     struct ggml_tensor src0;
     struct ggml_tensor src1;
     struct ggml_tensor dst;
+    float              eps;
+    int32_t            has_res;
+    struct ggml_tensor res;  // residual operand of a fused ADD (has_res only)
+    struct ggml_tensor sum;
 };
 
 struct uber_softmax_params {
@@ -500,6 +504,9 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                     struct uber_rms_norm_mul_params * p = (struct uber_rms_norm_mul_params *) inst_params;
                     uk_evict(&p->src0);
                     uk_evict(&p->src1);
+                    if (p->has_res) {
+                        uk_evict(&p->res);
+                    }
                     UK_SYNC();
                     rc = rms_norm_mul_f32_entry((struct ggml_et_rms_norm_mul_params *) inst_params, env);
                     break;

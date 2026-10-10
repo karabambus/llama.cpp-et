@@ -224,7 +224,8 @@ static ggml_et_cpu_compare_config set_rows_cpu_compare_config = {
 
 bool ggml_et_op_rms_norm_mul(ggml_backend_et_device_context * dev_ctx,
                              const ggml_tensor *              rms_norm_node,
-                             const ggml_tensor *              mul_node) {
+                             const ggml_tensor *              mul_node,
+                             const ggml_tensor *              add_node) {
     ET_PERF_START();
 
     if (!dev_ctx || !rms_norm_node || !mul_node) {
@@ -249,14 +250,22 @@ bool ggml_et_op_rms_norm_mul(ggml_backend_et_device_context * dev_ctx,
     memcpy(&eps, rms_norm_node->op_params, sizeof(float));
 
     ggml_et_rms_norm_mul_params params;
+    memset(&params, 0, sizeof(params));
     params.src0 = *rms_norm_node->src[0];  // input to normalize
     params.src1 = *weights;                // normalization weights
     params.dst  = *mul_node;               // final output
     params.eps  = eps;
+    if (add_node) {
+        // rms_norm_node->src[0] == add_node: normalise add_node = src0 + res, written by the same kernel
+        params.src0    = *add_node->src[0];
+        params.res     = *add_node->src[1];
+        params.sum     = *add_node;
+        params.has_res = 1;
+    }
 
     bool kernel_result = ggml_et_launch_kernel(dev_ctx, "rms_norm_mul_f32", &params, sizeof(params), 0xFFFFFFFF);
 
-    ET_PERF_END_EXT("RMS_NORM_MUL", "rms_norm_mul_f32", mul_node, "eps=%.6f", (double) eps);
+    ET_PERF_END_EXT(add_node ? "ADD_RMS_NORM_MUL" : "RMS_NORM_MUL", "rms_norm_mul_f32", mul_node, "eps=%.6f", (double) eps);
     return kernel_result;
 }
 

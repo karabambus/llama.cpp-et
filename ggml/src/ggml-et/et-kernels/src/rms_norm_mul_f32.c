@@ -15,7 +15,37 @@ struct ggml_et_rms_norm_mul_params {
     struct ggml_tensor src1;  // F32 weights tensor (element-wise multiply)
     struct ggml_tensor dst;   // F32 output tensor
     float              eps;   // Epsilon for numerical stability
+    int32_t            has_res;  // 1: normalise x = src0 + res and also write x to sum (fused residual ADD)
+    struct ggml_tensor res;
+    struct ggml_tensor sum;      // may alias src0 or res: each hart reads and writes only its own elements
 };
+
+// Sum of squares over [i0, i1) of x = src (+ res, stored to sum when res != 0), accumulated in f10.
+static inline void __attribute__((always_inline)) sumsq_chunk(const float * src, const float * res, float * sum,
+                                                              int32_t i0, int32_t i1) {
+    if (res) {
+        for (int32_t i = i0; i < i1; i += 8) {
+            __asm__ volatile(
+                "flw.ps f11, %[a]\n"
+                "flw.ps f16, %[r]\n"
+                "fadd.ps f11, f11, f16\n"
+                "fsw.ps f11, %[x]\n"
+                "fmadd.ps f10, f11, f11, f10\n"
+                : [x] "=m"(*(float (*)[8]) & sum[i])
+                : [a] "m"(*(const float (*)[8]) & src[i]), [r] "m"(*(const float (*)[8]) & res[i])
+                : "f10", "f11", "f16");
+        }
+    } else {
+        for (int32_t i = i0; i < i1; i += 8) {
+            __asm__ volatile(
+                "flw.ps f11, %[x_vec]\n"
+                "fmadd.ps f10, f11, f11, f10\n"
+                :
+                : [x_vec] "m"(*(const float (*)[8]) & src[i])
+                : "f10", "f11");
+        }
+    }
+}
 
 static inline size_t tensor_bytes(const struct ggml_tensor * t) {
     return (size_t) t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3] * t->nb[0];
@@ -67,6 +97,13 @@ int entry_point(struct ggml_et_rms_norm_mul_params * params, void * env) {
         return -1;  // Invalid epsilon
     }
 
+    const int has_res = params->has_res != 0;
+    if (has_res && (!params->res.data || !params->sum.data || params->res.type != GGML_TYPE_F32 ||
+                    params->sum.type != GGML_TYPE_F32 || params->res.nb[0] != 4 || params->sum.nb[0] != 4 ||
+                    src0->nb[0] != 4)) {
+        return -1;
+    }
+
     const int64_t ne0 = dst->ne[0];  // Inner dimension (row size)
     const int64_t ne1 = dst->ne[1];  // Dimension 1
     const int64_t ne2 = dst->ne[2];  // Dimension 2
@@ -102,20 +139,22 @@ int entry_point(struct ggml_et_rms_norm_mul_params * params, void * env) {
 
                     const float * wgt_ptr = (const float *) ((const char *) src1_data + (i3 % src1->ne[3]) * nb13 +
                                                              (i2 % src1->ne[2]) * nb12 + (i1 % src1->ne[1]) * nb11);
+                    const float * res_ptr = has_res ? (const float *) ((const char *) params->res.data + i3 * params->res.nb[3] +
+                                                                       i2 * params->res.nb[2] + i1 * params->res.nb[1])
+                                                    : (const float *) 0;
+                    float * sum_ptr = has_res ? (float *) ((char *) params->sum.data + i3 * params->sum.nb[3] +
+                                                           i2 * params->sum.nb[2] + i1 * params->sum.nb[1])
+                                              : (float *) 0;
 
                     unsigned long saved_mask;
                     __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
                     __asm__ volatile("mov.m.x m0, x0, 0xFF");
 
-                    // Sum of squares
+                    // Sum of squares (of src0 + res when a residual ADD is fused; x is then read back from sum)
                     __asm__ volatile("fbci.pi f10, 0" ::: "f10");
-                    for (int32_t i0 = 0; i0 < (int32_t) ne0; i0 += 8) {
-                        __asm__ volatile(
-                            "flw.ps f11, %[x_vec]\n"
-                            "fmadd.ps f10, f11, f11, f10\n"
-                            :
-                            : [x_vec] "m"(*(const float (*)[8]) & src_ptr[i0])
-                            : "f10", "f11");
+                    sumsq_chunk(src_ptr, res_ptr, sum_ptr, 0, (int32_t) ne0);
+                    if (has_res) {
+                        src_ptr = sum_ptr;
                     }
 
                     float sum;
@@ -170,6 +209,12 @@ int entry_point(struct ggml_et_rms_norm_mul_params * params, void * env) {
         int local_tid       = shire_tid % threads_per_row;
         int group_base      = my_row * threads_per_row;
 
+        // With a fused residual ADD only the first shire works: the others would recompute the same rows, and
+        // sum may alias an operand that another shire is still reading.
+        if (has_res && thread_id >= shire_threads) {
+            return 0;
+        }
+
         // Excess threads within this shire
         if (my_row >= total_rows) {
             __asm__ __volatile__("fence\n" ::: "memory");
@@ -187,6 +232,12 @@ int entry_point(struct ggml_et_rms_norm_mul_params * params, void * env) {
 
         const float * wgt_ptr = (const float *) ((const char *) src1_data + (i3 % src1->ne[3]) * nb13 +
                                                  (i2 % src1->ne[2]) * nb12 + (i1 % src1->ne[1]) * nb11);
+        const float * res_ptr = has_res ? (const float *) ((const char *) params->res.data + i3 * params->res.nb[3] +
+                                                           i2 * params->res.nb[2] + i1 * params->res.nb[1])
+                                        : (const float *) 0;
+        float * sum_ptr = has_res ? (float *) ((char *) params->sum.data + i3 * params->sum.nb[3] + i2 * params->sum.nb[2] +
+                                               i1 * params->sum.nb[1])
+                                  : (float *) 0;
 
         // Chunk boundaries aligned to 16 floats (64-byte cache line)
         const int32_t elems_per_cl   = 16;
@@ -206,15 +257,11 @@ int entry_point(struct ggml_et_rms_norm_mul_params * params, void * env) {
         __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
         __asm__ volatile("mov.m.x m0, x0, 0xFF");
 
-        // Phase 1: partial sum of squares on own chunk
+        // Phase 1: partial sum of squares on own chunk (x = src0 + res written to sum first when fused)
         __asm__ volatile("fbci.pi f10, 0" ::: "f10");
-        for (int32_t i0 = my_start; i0 < my_end; i0 += 8) {
-            __asm__ volatile(
-                "flw.ps f11, %[x_vec]\n"
-                "fmadd.ps f10, f11, f11, f10\n"
-                :
-                : [x_vec] "m"(*(const float (*)[8]) & src_ptr[i0])
-                : "f10", "f11");
+        sumsq_chunk(src_ptr, res_ptr, sum_ptr, my_start, my_end);
+        if (has_res) {
+            src_ptr = sum_ptr;  // phase 3 reads this hart's own x back
         }
 
         float partial_sum;

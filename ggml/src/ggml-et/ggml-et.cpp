@@ -874,6 +874,42 @@ static int ggml_et_mul_mat_group_len(const ggml_cgraph * cgraph, int node_idx, i
     return len >= 2 ? len : 0;
 }
 
+// A residual ADD whose result feeds RMS_NORM -> MUL(weights) at once (every pre-norm transformer layer, twice): one
+// rms_norm_mul instruction computes the sum, writes it (it stays live as the next residual) and normalises it. The
+// generic ggml_can_fuse rejects this because the ADD has a second consumer.
+static bool ggml_et_add_rms_norm_mul_match(const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = [] { const char * e = getenv("GGML_ET_NO_ADD_NORM"); return e && *e && strcmp(e, "0") != 0; }();
+    if (disabled || i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * add  = cgraph->nodes[i];
+    const ggml_tensor * norm = cgraph->nodes[i + 1];
+    const ggml_tensor * mul  = cgraph->nodes[i + 2];
+    if (add->op != GGML_OP_ADD || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || norm->src[0] != add ||
+        (mul->src[0] != norm && mul->src[1] != norm)) {
+        return false;
+    }
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * r = add->src[1];
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    if (add->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || r->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
+        mul->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // No broadcast in the ADD; unit element stride everywhere; whole cache lines per row (the kernel splits a row
+    // into 16-float chunks and steps 8 lanes).
+    if (!ggml_are_same_shape(a, add) || !ggml_are_same_shape(r, add) || !ggml_are_same_shape(mul, add) ||
+        a->nb[0] != 4 || r->nb[0] != 4 || add->nb[0] != 4 || mul->nb[0] != 4 || w->nb[0] != 4 || add->ne[0] % 16 != 0 ||
+        w->ne[0] != add->ne[0]) {
+        return false;
+    }
+    // The normalised intermediate must not be needed elsewhere (the fused kernel never writes it).
+    if (ggml_node_get_use_count(cgraph, i + 1) != 1 || (norm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    return true;
+}
+
 // 038: recognise llama.cpp's MoE aggregation — MUL(experts [E,S,N], weights [1,S,N]) followed (after the S VIEW
 // nodes) by an ADD chain over the S [E,N] slot views: add_1 = v0 + v1, add_k = add_{k-1} + v_{k+1}. Returns the index
 // of the last ADD; the fused kernel writes that tensor. Falls back to per-op dispatch when anything differs.
@@ -1749,6 +1785,19 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
                 }
                 continue;
             }
+        }
+        if (ggml_et_add_rms_norm_mul_match(cgraph, i)) {
+            const ggml_tensor * norm = cgraph->nodes[i + 1];
+            const ggml_tensor * mul  = cgraph->nodes[i + 2];
+            auto fused = [&] { return ggml_et_op_rms_norm_mul(dev_ctx, norm, mul, node); };
+            if (et_fcheck_enabled()) {
+                et_fcheck_run(dev_ctx, "add+rms_norm_mul", { node->src[0], node->src[1] }, { node, mul }, fused,
+                              [&] { return ggml_et_op_add(dev_ctx, node) && ggml_et_op_rms_norm_mul(dev_ctx, norm, mul); });
+            } else {
+                fused();
+            }
+            i += 2;  // skip the RMS_NORM and MUL nodes
+            continue;
         }
         if (ggml_et_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
             ggml_et_op_rms_norm_mul(dev_ctx, node, cgraph->nodes[i + 1]);

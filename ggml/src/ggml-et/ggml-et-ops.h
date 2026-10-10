@@ -301,10 +301,13 @@ struct ggml_et_set_params {
 };
 
 struct ggml_et_rms_norm_mul_params {
-    ggml_tensor src0;  // F32 input tensor (to be normalized)
-    ggml_tensor src1;  // F32 weights tensor (element-wise multiply)
-    ggml_tensor dst;   // F32 output tensor
-    float       eps;   // Epsilon for numerical stability
+    ggml_tensor src0;     // F32 input tensor (to be normalized)
+    ggml_tensor src1;     // F32 weights tensor (element-wise multiply)
+    ggml_tensor dst;      // F32 output tensor
+    float       eps;      // Epsilon for numerical stability
+    int32_t     has_res;  // 1: normalise sum = src0 + res and write sum too (a fused residual ADD)
+    ggml_tensor res;      // F32, same shape as src0 (has_res only)
+    ggml_tensor sum;      // F32, same shape as src0 (has_res only); may alias src0 or res
 };
 
 struct ggml_et_mul_mat_id_params {
@@ -503,9 +506,11 @@ bool ggml_et_op_pad(ggml_backend_et_device_context * dev_ctx, const ggml_tensor 
 bool ggml_et_op_set(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_ssm_conv(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_ssm_scan(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
+// add_node (optional): rms_norm_node->src[0] == add_node; the kernel also computes and writes the ADD.
 bool ggml_et_op_rms_norm_mul(ggml_backend_et_device_context * dev_ctx,
                              const ggml_tensor *              rms_norm_node,
-                             const ggml_tensor *              mul_node);
+                             const ggml_tensor *              mul_node,
+                             const ggml_tensor *              add_node = nullptr);
 
 // Independent Q8_0 mul_mats that share one activation, issued as one dispatch.
 // Members write disjoint outputs and none reads another's, so no barrier is needed
