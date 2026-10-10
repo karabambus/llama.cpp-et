@@ -359,11 +359,16 @@ int entry_point(struct ggml_et_flash_attn_ext_params * params, void * env) {
     uint64_t  local_minion = (hart_id >> 1) & 0x1F;
 
     struct ggml_tensor * q = &params->src0;
-    evict_region_past_l2(q->data, tensor_bytes_fa(q));
     struct ggml_tensor * k = &params->src1;
-    evict_region_past_l2(k->data, tensor_bytes_fa(k));
     struct ggml_tensor * v = &params->src2;
+#ifndef ET_UBERKERNEL
+    // Standalone launch: publish the inputs. Under the uberkernel the dispatcher does it (whole-L1 flush, then Q, the
+    // mask and only the KV-cache tail that this segment can have written, split over the harts); here every hart would
+    // walk the whole K and V views, a cost that grows with the context length (11.8 ms per launch at 3.5 k positions).
+    evict_region_past_l2(q->data, tensor_bytes_fa(q));
+    evict_region_past_l2(k->data, tensor_bytes_fa(k));
     evict_region_past_l2(v->data, tensor_bytes_fa(v));
+#endif
     struct ggml_tensor * dst      = &params->dst;
     const int32_t        has_mask = params->has_mask;
     struct ggml_tensor * mask     = has_mask ? &params->mask : (struct ggml_tensor *) 0;
