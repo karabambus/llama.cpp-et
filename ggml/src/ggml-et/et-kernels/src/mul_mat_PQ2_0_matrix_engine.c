@@ -47,6 +47,7 @@
 
 #define A_L1_START 0    // L1 SCP lines  0..15 for A (activations)
 #define B_L1_START 16   // L1 SCP lines 16..31 for B (dequantized weights)
+#define A1_L1_START 32  // L1 SCP lines 32..47: second A buffer (REUSE path double-buffers the activation loads)
 
 // Single dequant panel: BLOCK_K k-lines x TILE_M m (FP32) = 32*64 = 2048 bytes,
 // [k][m] order: panel[k*TILE_M + m].
@@ -385,29 +386,41 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                         tensor_load(false, false, A_L1_START + 4, TENSOR_LOAD_PLAIN, 0,
                                     (uint64_t) zero_line, 0, 0, 64, 0);
                         tensor_wait(TENSOR_LOAD_WAIT_0);
+                        tensor_load(false, false, A1_L1_START + 4, TENSOR_LOAD_PLAIN, 0,
+                                    (uint64_t) zero_line, 0, 0, 64, 0);
+                        tensor_wait(TENSOR_LOAD_WAIT_0);
                     }
 
-                    for (int64_t i = 0; i < kbn; ++i) {
-                        for (int half = 0; half < 2; ++half) {
-                            const int64_t k_elem = (kb0 + i) * BLOCK_K + half * FMA_K;
-                            tensor_load(
-                                false, false, A_L1_START, TENSOR_LOAD_PLAIN, 0,
-                                (uint64_t)(src1_batch + nb * nb1_1 + k_elem * (int64_t) sizeof(float)),
+                    // Activation loads are double-buffered: step s (K-block kb0 + s/2, half s%2) reads A from buffer
+                    // s%2 while the load for step s+1 fills the other one. All A loads use id 0 (one in flight; the
+                    // TenB weight load uses id 1), and a buffer is refilled only after the FMA that read it has
+                    // completed. FMA order is unchanged, so results are bit-identical to the single-buffered loop.
+                    const char *a_col = src1_batch + nb * nb1_1;
+                    const int64_t n_steps = 2 * kbn;
+                    tensor_load(false, false, A_L1_START, TENSOR_LOAD_PLAIN, 0,
+                                (uint64_t)(a_col + kb0 * BLOCK_K * (int64_t) sizeof(float)),
                                 0, n_cur - 1, (uint64_t) nb1_1, 0);
-                            tensor_wait(TENSOR_LOAD_WAIT_0);
-
-                            tensor_load_setup_b(
-                                false,
-                                (uint64_t)(cf + i * (SCP_PANEL_SIZE / 4) + half * FMA_K * TILE_M),
-                                FMA_K - 1, 64, 1);
-
-                            tensor_fma(
-                                false, 3, arows_fma, FMA_K - 1, 0,
-                                false, false, false, true,
-                                B_L1_START, A_L1_START, TENSOR_FMA_OP_FP32, first);
-                            tensor_wait(TENSOR_FMA_WAIT);
-                            first = 0;
+                    for (int64_t st = 0; st < n_steps; ++st) {
+                        tensor_wait(TENSOR_LOAD_WAIT_0);
+                        if (st + 1 < n_steps) {
+                            const int64_t k_next = kb0 * BLOCK_K + (st + 1) * FMA_K;
+                            tensor_load(false, false, ((st + 1) & 1) ? A1_L1_START : A_L1_START,
+                                        TENSOR_LOAD_PLAIN, 0,
+                                        (uint64_t)(a_col + k_next * (int64_t) sizeof(float)),
+                                        0, n_cur - 1, (uint64_t) nb1_1, 0);
                         }
+
+                        tensor_load_setup_b(
+                            false,
+                            (uint64_t)(cf + (st >> 1) * (SCP_PANEL_SIZE / 4) + (st & 1) * FMA_K * TILE_M),
+                            FMA_K - 1, 64, 1);
+
+                        tensor_fma(
+                            false, 3, arows_fma, FMA_K - 1, 0,
+                            false, false, false, true,
+                            B_L1_START, (st & 1) ? A1_L1_START : A_L1_START, TENSOR_FMA_OP_FP32, first);
+                        tensor_wait(TENSOR_FMA_WAIT);
+                        first = 0;
                     }
 
                     if (is_last) {
