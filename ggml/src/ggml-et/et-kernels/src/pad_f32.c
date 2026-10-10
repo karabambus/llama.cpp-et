@@ -9,7 +9,8 @@
 //   - Zero-pad only (no circular mode)
 //
 // Two paths:
-//   Aligned (ne0 % 16 == 0): rows distributed across harts, vectorized.
+//   Aligned (ne0 % 16 == 0): rows split into 256-float chunks (whole cache lines) distributed across harts,
+//                            vectorized; a few long rows (e.g. padded logits) still use every hart.
 //   Small   (16 % ne0 == 0): cache-line distributed, scalar per-element.
 //******************************************************************************
 
@@ -106,20 +107,29 @@ int entry_point(struct ggml_et_pad_params * params, void * env) {
 
     // Aligned: ne0 % 16 == 0 -> row-based distribution, vectorized
     if (ne0 % 16 == 0) {
-        for (int64_t row = thread_id; row < total_rows; row += num_threads) {
+        // Work unit = one PAD_CHUNK-float slice of one row: chunk boundaries are multiples of 16 floats, so with a
+        // 64-byte aligned dst every cache line has a single writer.
+        const int64_t PAD_CHUNK       = 256;
+        const int64_t chunks_per_row  = (ne0 + PAD_CHUNK - 1) / PAD_CHUNK;
+        const int64_t total_chunks    = total_rows * chunks_per_row;
+        for (int64_t w = thread_id; w < total_chunks; w += num_threads) {
+            const int64_t row = w / chunks_per_row;
+            const int64_t c0  = (w % chunks_per_row) * PAD_CHUNK;
+            const int64_t n   = (c0 + PAD_CHUNK <= ne0) ? PAD_CHUNK : (ne0 - c0);
+
             const int64_t i3 = row / (ne1 * ne2);
             const int64_t i2 = (row / ne1) % ne2;
             const int64_t i1 = row % ne1;
 
-            float * dst_row = dst_data + row * ne0;
+            float * dst_row = dst_data + row * ne0 + c0;
 
             if (i1 >= lp1 && i1 < ne1 - rp1 && i2 >= lp2 && i2 < ne2 - rp2 && i3 >= lp3 && i3 < ne3 - rp3) {
                 const float * src_row = (const float *) ((const char *) src0_data + (i1 - lp1) * nb1_src +
-                                                         (i2 - lp2) * nb2_src + (i3 - lp3) * nb3_src);
-                vec_copy_f32(dst_row, src_row, (int32_t) ne0);
+                                                         (i2 - lp2) * nb2_src + (i3 - lp3) * nb3_src) + c0;
+                vec_copy_f32(dst_row, src_row, (int32_t) n);
             } else {
                 int64_t       i       = 0;
-                const int64_t vec_end = (ne0 / 8) * 8;
+                const int64_t vec_end = (n / 8) * 8;
                 for (; i < vec_end; i += 8) {
                     __asm__ volatile("fsw.ps f12, %[d]\n" : [d] "=m"(*(float (*)[8]) & dst_row[i])::"f12");
                 }
