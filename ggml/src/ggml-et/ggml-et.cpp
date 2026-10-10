@@ -907,6 +907,28 @@ static bool ggml_et_add_rms_norm_mul_match(const ggml_cgraph * cgraph, int i) {
     if (ggml_node_get_use_count(cgraph, i + 1) != 1 || (norm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return false;
     }
+    // a and r are dead after the ADD in the unfused schedule, so ggml-alloc may place the MUL output over either of
+    // them at any offset. The kernel's row-parallel path (>= 64 rows, one hart per row) still reads other harts' rows
+    // of a/r while dst rows are written; only the identical row layout is safe there (each element of a/r is read by
+    // the hart that later writes it). Below 64 rows every read of a/r ends before the shire barrier and the writes of
+    // dst start after it, so any overlap is safe.
+    const bool row_parallel = ggml_nrows(add) >= 64;
+    for (const ggml_tensor * in : { a, r }) {
+        if (!row_parallel) {
+            break;
+        }
+        const uintptr_t i0 = (uintptr_t) in->data, i1 = i0 + ggml_nbytes(in);
+        const uintptr_t o0 = (uintptr_t) mul->data, o1 = o0 + ggml_nbytes(mul);
+        if (i0 < o1 && o0 < i1 && !(in->data == mul->data && in->nb[1] == mul->nb[1])) {
+            return false;
+        }
+    }
+    // Rows start on cache lines (the intra-row path splits a row into 64-byte chunks per hart).
+    for (const ggml_tensor * t : { a, r, add, mul }) {
+        if (((uintptr_t) t->data % 64) != 0 || (t->ne[1] > 1 && t->nb[1] % 64 != 0)) {
+            return false;
+        }
+    }
     return true;
 }
 
