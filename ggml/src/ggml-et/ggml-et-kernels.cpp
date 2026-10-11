@@ -776,6 +776,13 @@ static bool ggml_et_launch_uberkernel(ggml_backend_et_device_context * dev_ctx,
     return true;
 }
 
+bool ggml_et_uberkernel_flush(ggml_backend_et_device_context * dev_ctx) {
+    if (!dev_ctx || !dev_ctx->uberkernel_active) {
+        return true;
+    }
+    return ggml_et_launch_uberkernel_segment(dev_ctx, &dev_ctx->uberkernel);
+}
+
 bool ggml_et_uberkernel_end_graph(ggml_backend_et_device_context * dev_ctx) {
     if (!dev_ctx || !dev_ctx->uberkernel_active) {
         return true;

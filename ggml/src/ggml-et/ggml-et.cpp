@@ -1417,8 +1417,15 @@ bool et_fcheck_enabled() {
     return on;
 }
 
+// Under the uberkernel a launch only queues an instruction in the pending segment, so the segment is launched first;
+// otherwise every read below would see the memory from before the segment and every restore would land before the
+// queued instructions run.
 void et_fcheck_sync(ggml_backend_et_device_context * dev_ctx) {
     std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    if (!ggml_et_uberkernel_flush(dev_ctx)) {
+        fprintf(stderr, "ET-FCHECK: uberkernel segment launch failed\n");
+        abort();
+    }
     ggml_et_wait_stream(dev_ctx, "synchronize");
     auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
     if (!errors.empty()) {

@@ -42,6 +42,8 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context * dev_ctx,
 void ggml_et_uberkernel_begin_graph(ggml_backend_et_uberkernel_context * uk_ctx);
 // Names the graph node whose launches follow, for GGML_ET_UK_PROFILE_NODES rows.
 void ggml_et_uberkernel_set_node(const ggml_tensor * node);
+// Launches the pending segment now (mid-graph); later launches start a new one.
+bool ggml_et_uberkernel_flush(ggml_backend_et_device_context * dev_ctx);
 bool ggml_et_uberkernel_end_graph(ggml_backend_et_device_context * dev_ctx);
 void ggml_et_uberkernel_abort_graph(ggml_backend_et_uberkernel_context * uk_ctx);
 bool ggml_et_uberkernel_failed(const ggml_backend_et_uberkernel_context * uk_ctx);
