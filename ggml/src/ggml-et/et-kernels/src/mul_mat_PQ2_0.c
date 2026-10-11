@@ -171,12 +171,8 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
-#ifndef ET_UBERKERNEL
-    evict_region_past_l2(params->src1.data, tensor_bytes(&params->src1));
-    if (params->bias.data) {
-        evict_region_past_l2(params->bias.data, tensor_bytes(&params->bias));
-    }
-#endif
+    // No entry evict: the uberkernel's dispatcher publishes src1 and the bias; after a standalone launch the firmware's
+    // cleanup leaves no input line in any L1 or L2 (KB 04 §1.1).
 
     // The windowed gather (fg32b.ps) is bit-identical to fgb.ps only at even chunk addresses: blocks are 34 bytes,
     // so every chunk address is even exactly when the weight base and the row/batch strides are even (pq2_ops.h).
