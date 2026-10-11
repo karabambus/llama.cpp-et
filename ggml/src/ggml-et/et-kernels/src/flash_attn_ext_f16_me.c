@@ -856,164 +856,253 @@ static void gq_softmax_half(char * scp, int h, int cls, const char * mrow, int64
     }
 }
 
-// After a P x V FMA: acc[row0 + r][dv_off .. dv_off + 15] = O + acc, O in f(2r), f(2r + 1), for r < rows <= 12, in the
-// row path's operand order. m0 must be all lanes.
+// After a P x V FMA: acc[r][0..15] = O + acc for the rows one P x V FMA wrote (O in f(2r), f(2r + 1), r < rows <= 12),
+// in the row path's operand order. The accumulator lives in the L2 scratchpad: each group of four rows issues its eight
+// loads into the free registers f24..f31 before the adds use them. m0 must be all lanes.
 static inline void __attribute__((always_inline)) gq_acc_add(float * acc_row0, int64_t rows) {
-    if (rows > 0) {
-        float * a = acc_row0 + 0 * (GQ_ACC_ROW / sizeof(float));
+    const int64_t RS = GQ_ACC_ROW / sizeof(float);
+    if (rows >= 4) {
         __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
-            "fadd.ps   f0, f0, f30         \n\t"
-            "fadd.ps   f1, f1, f31         \n\t"
-            "fsw.ps    f0, 0(%[a])            \n\t"
-            "fsw.ps    f1, 32(%[a])           \n\t"
-            :
-            : [a] "r"(a)
-            : "f0", "f1", "f30", "f31", "memory");
-    }
-    if (rows > 1) {
-        float * a = acc_row0 + 1 * (GQ_ACC_ROW / sizeof(float));
-        __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
-            "fadd.ps   f2, f2, f30         \n\t"
-            "fadd.ps   f3, f3, f31         \n\t"
-            "fsw.ps    f2, 0(%[a])            \n\t"
-            "fsw.ps    f3, 32(%[a])           \n\t"
-            :
-            : [a] "r"(a)
-            : "f2", "f3", "f30", "f31", "memory");
-    }
-    if (rows > 2) {
-        float * a = acc_row0 + 2 * (GQ_ACC_ROW / sizeof(float));
-        __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
-            "fadd.ps   f4, f4, f30         \n\t"
-            "fadd.ps   f5, f5, f31         \n\t"
-            "fsw.ps    f4, 0(%[a])            \n\t"
-            "fsw.ps    f5, 32(%[a])           \n\t"
-            :
-            : [a] "r"(a)
-            : "f4", "f5", "f30", "f31", "memory");
-    }
-    if (rows > 3) {
-        float * a = acc_row0 + 3 * (GQ_ACC_ROW / sizeof(float));
-        __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "flw.ps    f26, 0(%[a1])        \n\t"
+            "flw.ps    f27, 32(%[a1])       \n\t"
+            "flw.ps    f28, 0(%[a2])        \n\t"
+            "flw.ps    f29, 32(%[a2])       \n\t"
+            "flw.ps    f30, 0(%[a3])        \n\t"
+            "flw.ps    f31, 32(%[a3])       \n\t"
+            "fadd.ps   f0, f0, f24         \n\t"
+            "fadd.ps   f1, f1, f25         \n\t"
+            "fadd.ps   f2, f2, f26         \n\t"
+            "fadd.ps   f3, f3, f27         \n\t"
+            "fadd.ps   f4, f4, f28         \n\t"
+            "fadd.ps   f5, f5, f29         \n\t"
             "fadd.ps   f6, f6, f30         \n\t"
             "fadd.ps   f7, f7, f31         \n\t"
-            "fsw.ps    f6, 0(%[a])            \n\t"
-            "fsw.ps    f7, 32(%[a])           \n\t"
+            "fsw.ps    f0, 0(%[a0])         \n\t"
+            "fsw.ps    f1, 32(%[a0])        \n\t"
+            "fsw.ps    f2, 0(%[a1])         \n\t"
+            "fsw.ps    f3, 32(%[a1])        \n\t"
+            "fsw.ps    f4, 0(%[a2])         \n\t"
+            "fsw.ps    f5, 32(%[a2])        \n\t"
+            "fsw.ps    f6, 0(%[a3])         \n\t"
+            "fsw.ps    f7, 32(%[a3])        \n\t"
             :
-            : [a] "r"(a)
-            : "f6", "f7", "f30", "f31", "memory");
-    }
-    if (rows > 4) {
-        float * a = acc_row0 + 4 * (GQ_ACC_ROW / sizeof(float));
+            : [a0] "r"(acc_row0 + 0 * RS), [a1] "r"(acc_row0 + 1 * RS), [a2] "r"(acc_row0 + 2 * RS), [a3] "r"(acc_row0 + 3 * RS)
+            : "f0", "f1", "f24", "f25", "f2", "f3", "f26", "f27", "f4", "f5", "f28", "f29", "f6", "f7", "f30", "f31", "memory");
+    } else if (rows == 3) {
         __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
-            "fadd.ps   f8, f8, f30         \n\t"
-            "fadd.ps   f9, f9, f31         \n\t"
-            "fsw.ps    f8, 0(%[a])            \n\t"
-            "fsw.ps    f9, 32(%[a])           \n\t"
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "flw.ps    f26, 0(%[a1])        \n\t"
+            "flw.ps    f27, 32(%[a1])       \n\t"
+            "flw.ps    f28, 0(%[a2])        \n\t"
+            "flw.ps    f29, 32(%[a2])       \n\t"
+            "fadd.ps   f0, f0, f24         \n\t"
+            "fadd.ps   f1, f1, f25         \n\t"
+            "fadd.ps   f2, f2, f26         \n\t"
+            "fadd.ps   f3, f3, f27         \n\t"
+            "fadd.ps   f4, f4, f28         \n\t"
+            "fadd.ps   f5, f5, f29         \n\t"
+            "fsw.ps    f0, 0(%[a0])         \n\t"
+            "fsw.ps    f1, 32(%[a0])        \n\t"
+            "fsw.ps    f2, 0(%[a1])         \n\t"
+            "fsw.ps    f3, 32(%[a1])        \n\t"
+            "fsw.ps    f4, 0(%[a2])         \n\t"
+            "fsw.ps    f5, 32(%[a2])        \n\t"
             :
-            : [a] "r"(a)
-            : "f8", "f9", "f30", "f31", "memory");
-    }
-    if (rows > 5) {
-        float * a = acc_row0 + 5 * (GQ_ACC_ROW / sizeof(float));
+            : [a0] "r"(acc_row0 + 0 * RS), [a1] "r"(acc_row0 + 1 * RS), [a2] "r"(acc_row0 + 2 * RS)
+            : "f0", "f1", "f24", "f25", "f2", "f3", "f26", "f27", "f4", "f5", "f28", "f29", "memory");
+    } else if (rows == 2) {
         __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
-            "fadd.ps   f10, f10, f30         \n\t"
-            "fadd.ps   f11, f11, f31         \n\t"
-            "fsw.ps    f10, 0(%[a])            \n\t"
-            "fsw.ps    f11, 32(%[a])           \n\t"
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "flw.ps    f26, 0(%[a1])        \n\t"
+            "flw.ps    f27, 32(%[a1])       \n\t"
+            "fadd.ps   f0, f0, f24         \n\t"
+            "fadd.ps   f1, f1, f25         \n\t"
+            "fadd.ps   f2, f2, f26         \n\t"
+            "fadd.ps   f3, f3, f27         \n\t"
+            "fsw.ps    f0, 0(%[a0])         \n\t"
+            "fsw.ps    f1, 32(%[a0])        \n\t"
+            "fsw.ps    f2, 0(%[a1])         \n\t"
+            "fsw.ps    f3, 32(%[a1])        \n\t"
             :
-            : [a] "r"(a)
-            : "f10", "f11", "f30", "f31", "memory");
-    }
-    if (rows > 6) {
-        float * a = acc_row0 + 6 * (GQ_ACC_ROW / sizeof(float));
+            : [a0] "r"(acc_row0 + 0 * RS), [a1] "r"(acc_row0 + 1 * RS)
+            : "f0", "f1", "f24", "f25", "f2", "f3", "f26", "f27", "memory");
+    } else if (rows == 1) {
         __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
-            "fadd.ps   f12, f12, f30         \n\t"
-            "fadd.ps   f13, f13, f31         \n\t"
-            "fsw.ps    f12, 0(%[a])            \n\t"
-            "fsw.ps    f13, 32(%[a])           \n\t"
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "fadd.ps   f0, f0, f24         \n\t"
+            "fadd.ps   f1, f1, f25         \n\t"
+            "fsw.ps    f0, 0(%[a0])         \n\t"
+            "fsw.ps    f1, 32(%[a0])        \n\t"
             :
-            : [a] "r"(a)
-            : "f12", "f13", "f30", "f31", "memory");
+            : [a0] "r"(acc_row0 + 0 * RS)
+            : "f0", "f1", "f24", "f25", "memory");
     }
-    if (rows > 7) {
-        float * a = acc_row0 + 7 * (GQ_ACC_ROW / sizeof(float));
+    if (rows >= 8) {
         __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "flw.ps    f26, 0(%[a1])        \n\t"
+            "flw.ps    f27, 32(%[a1])       \n\t"
+            "flw.ps    f28, 0(%[a2])        \n\t"
+            "flw.ps    f29, 32(%[a2])       \n\t"
+            "flw.ps    f30, 0(%[a3])        \n\t"
+            "flw.ps    f31, 32(%[a3])       \n\t"
+            "fadd.ps   f8, f8, f24         \n\t"
+            "fadd.ps   f9, f9, f25         \n\t"
+            "fadd.ps   f10, f10, f26         \n\t"
+            "fadd.ps   f11, f11, f27         \n\t"
+            "fadd.ps   f12, f12, f28         \n\t"
+            "fadd.ps   f13, f13, f29         \n\t"
             "fadd.ps   f14, f14, f30         \n\t"
             "fadd.ps   f15, f15, f31         \n\t"
-            "fsw.ps    f14, 0(%[a])            \n\t"
-            "fsw.ps    f15, 32(%[a])           \n\t"
+            "fsw.ps    f8, 0(%[a0])         \n\t"
+            "fsw.ps    f9, 32(%[a0])        \n\t"
+            "fsw.ps    f10, 0(%[a1])         \n\t"
+            "fsw.ps    f11, 32(%[a1])        \n\t"
+            "fsw.ps    f12, 0(%[a2])         \n\t"
+            "fsw.ps    f13, 32(%[a2])        \n\t"
+            "fsw.ps    f14, 0(%[a3])         \n\t"
+            "fsw.ps    f15, 32(%[a3])        \n\t"
             :
-            : [a] "r"(a)
-            : "f14", "f15", "f30", "f31", "memory");
-    }
-    if (rows > 8) {
-        float * a = acc_row0 + 8 * (GQ_ACC_ROW / sizeof(float));
+            : [a0] "r"(acc_row0 + 4 * RS), [a1] "r"(acc_row0 + 5 * RS), [a2] "r"(acc_row0 + 6 * RS), [a3] "r"(acc_row0 + 7 * RS)
+            : "f8", "f9", "f24", "f25", "f10", "f11", "f26", "f27", "f12", "f13", "f28", "f29", "f14", "f15", "f30", "f31", "memory");
+    } else if (rows == 7) {
         __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
-            "fadd.ps   f16, f16, f30         \n\t"
-            "fadd.ps   f17, f17, f31         \n\t"
-            "fsw.ps    f16, 0(%[a])            \n\t"
-            "fsw.ps    f17, 32(%[a])           \n\t"
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "flw.ps    f26, 0(%[a1])        \n\t"
+            "flw.ps    f27, 32(%[a1])       \n\t"
+            "flw.ps    f28, 0(%[a2])        \n\t"
+            "flw.ps    f29, 32(%[a2])       \n\t"
+            "fadd.ps   f8, f8, f24         \n\t"
+            "fadd.ps   f9, f9, f25         \n\t"
+            "fadd.ps   f10, f10, f26         \n\t"
+            "fadd.ps   f11, f11, f27         \n\t"
+            "fadd.ps   f12, f12, f28         \n\t"
+            "fadd.ps   f13, f13, f29         \n\t"
+            "fsw.ps    f8, 0(%[a0])         \n\t"
+            "fsw.ps    f9, 32(%[a0])        \n\t"
+            "fsw.ps    f10, 0(%[a1])         \n\t"
+            "fsw.ps    f11, 32(%[a1])        \n\t"
+            "fsw.ps    f12, 0(%[a2])         \n\t"
+            "fsw.ps    f13, 32(%[a2])        \n\t"
             :
-            : [a] "r"(a)
-            : "f16", "f17", "f30", "f31", "memory");
-    }
-    if (rows > 9) {
-        float * a = acc_row0 + 9 * (GQ_ACC_ROW / sizeof(float));
+            : [a0] "r"(acc_row0 + 4 * RS), [a1] "r"(acc_row0 + 5 * RS), [a2] "r"(acc_row0 + 6 * RS)
+            : "f8", "f9", "f24", "f25", "f10", "f11", "f26", "f27", "f12", "f13", "f28", "f29", "memory");
+    } else if (rows == 6) {
         __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
-            "fadd.ps   f18, f18, f30         \n\t"
-            "fadd.ps   f19, f19, f31         \n\t"
-            "fsw.ps    f18, 0(%[a])            \n\t"
-            "fsw.ps    f19, 32(%[a])           \n\t"
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "flw.ps    f26, 0(%[a1])        \n\t"
+            "flw.ps    f27, 32(%[a1])       \n\t"
+            "fadd.ps   f8, f8, f24         \n\t"
+            "fadd.ps   f9, f9, f25         \n\t"
+            "fadd.ps   f10, f10, f26         \n\t"
+            "fadd.ps   f11, f11, f27         \n\t"
+            "fsw.ps    f8, 0(%[a0])         \n\t"
+            "fsw.ps    f9, 32(%[a0])        \n\t"
+            "fsw.ps    f10, 0(%[a1])         \n\t"
+            "fsw.ps    f11, 32(%[a1])        \n\t"
             :
-            : [a] "r"(a)
-            : "f18", "f19", "f30", "f31", "memory");
-    }
-    if (rows > 10) {
-        float * a = acc_row0 + 10 * (GQ_ACC_ROW / sizeof(float));
+            : [a0] "r"(acc_row0 + 4 * RS), [a1] "r"(acc_row0 + 5 * RS)
+            : "f8", "f9", "f24", "f25", "f10", "f11", "f26", "f27", "memory");
+    } else if (rows == 5) {
         __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
-            "fadd.ps   f20, f20, f30         \n\t"
-            "fadd.ps   f21, f21, f31         \n\t"
-            "fsw.ps    f20, 0(%[a])            \n\t"
-            "fsw.ps    f21, 32(%[a])           \n\t"
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "fadd.ps   f8, f8, f24         \n\t"
+            "fadd.ps   f9, f9, f25         \n\t"
+            "fsw.ps    f8, 0(%[a0])         \n\t"
+            "fsw.ps    f9, 32(%[a0])        \n\t"
             :
-            : [a] "r"(a)
-            : "f20", "f21", "f30", "f31", "memory");
+            : [a0] "r"(acc_row0 + 4 * RS)
+            : "f8", "f9", "f24", "f25", "memory");
     }
-    if (rows > 11) {
-        float * a = acc_row0 + 11 * (GQ_ACC_ROW / sizeof(float));
+    if (rows >= 12) {
         __asm__ volatile(
-            "flw.ps    f30, 0(%[a])           \n\t"
-            "flw.ps    f31, 32(%[a])          \n\t"
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "flw.ps    f26, 0(%[a1])        \n\t"
+            "flw.ps    f27, 32(%[a1])       \n\t"
+            "flw.ps    f28, 0(%[a2])        \n\t"
+            "flw.ps    f29, 32(%[a2])       \n\t"
+            "flw.ps    f30, 0(%[a3])        \n\t"
+            "flw.ps    f31, 32(%[a3])       \n\t"
+            "fadd.ps   f16, f16, f24         \n\t"
+            "fadd.ps   f17, f17, f25         \n\t"
+            "fadd.ps   f18, f18, f26         \n\t"
+            "fadd.ps   f19, f19, f27         \n\t"
+            "fadd.ps   f20, f20, f28         \n\t"
+            "fadd.ps   f21, f21, f29         \n\t"
             "fadd.ps   f22, f22, f30         \n\t"
             "fadd.ps   f23, f23, f31         \n\t"
-            "fsw.ps    f22, 0(%[a])            \n\t"
-            "fsw.ps    f23, 32(%[a])           \n\t"
+            "fsw.ps    f16, 0(%[a0])         \n\t"
+            "fsw.ps    f17, 32(%[a0])        \n\t"
+            "fsw.ps    f18, 0(%[a1])         \n\t"
+            "fsw.ps    f19, 32(%[a1])        \n\t"
+            "fsw.ps    f20, 0(%[a2])         \n\t"
+            "fsw.ps    f21, 32(%[a2])        \n\t"
+            "fsw.ps    f22, 0(%[a3])         \n\t"
+            "fsw.ps    f23, 32(%[a3])        \n\t"
             :
-            : [a] "r"(a)
-            : "f22", "f23", "f30", "f31", "memory");
+            : [a0] "r"(acc_row0 + 8 * RS), [a1] "r"(acc_row0 + 9 * RS), [a2] "r"(acc_row0 + 10 * RS), [a3] "r"(acc_row0 + 11 * RS)
+            : "f16", "f17", "f24", "f25", "f18", "f19", "f26", "f27", "f20", "f21", "f28", "f29", "f22", "f23", "f30", "f31", "memory");
+    } else if (rows == 11) {
+        __asm__ volatile(
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "flw.ps    f26, 0(%[a1])        \n\t"
+            "flw.ps    f27, 32(%[a1])       \n\t"
+            "flw.ps    f28, 0(%[a2])        \n\t"
+            "flw.ps    f29, 32(%[a2])       \n\t"
+            "fadd.ps   f16, f16, f24         \n\t"
+            "fadd.ps   f17, f17, f25         \n\t"
+            "fadd.ps   f18, f18, f26         \n\t"
+            "fadd.ps   f19, f19, f27         \n\t"
+            "fadd.ps   f20, f20, f28         \n\t"
+            "fadd.ps   f21, f21, f29         \n\t"
+            "fsw.ps    f16, 0(%[a0])         \n\t"
+            "fsw.ps    f17, 32(%[a0])        \n\t"
+            "fsw.ps    f18, 0(%[a1])         \n\t"
+            "fsw.ps    f19, 32(%[a1])        \n\t"
+            "fsw.ps    f20, 0(%[a2])         \n\t"
+            "fsw.ps    f21, 32(%[a2])        \n\t"
+            :
+            : [a0] "r"(acc_row0 + 8 * RS), [a1] "r"(acc_row0 + 9 * RS), [a2] "r"(acc_row0 + 10 * RS)
+            : "f16", "f17", "f24", "f25", "f18", "f19", "f26", "f27", "f20", "f21", "f28", "f29", "memory");
+    } else if (rows == 10) {
+        __asm__ volatile(
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "flw.ps    f26, 0(%[a1])        \n\t"
+            "flw.ps    f27, 32(%[a1])       \n\t"
+            "fadd.ps   f16, f16, f24         \n\t"
+            "fadd.ps   f17, f17, f25         \n\t"
+            "fadd.ps   f18, f18, f26         \n\t"
+            "fadd.ps   f19, f19, f27         \n\t"
+            "fsw.ps    f16, 0(%[a0])         \n\t"
+            "fsw.ps    f17, 32(%[a0])        \n\t"
+            "fsw.ps    f18, 0(%[a1])         \n\t"
+            "fsw.ps    f19, 32(%[a1])        \n\t"
+            :
+            : [a0] "r"(acc_row0 + 8 * RS), [a1] "r"(acc_row0 + 9 * RS)
+            : "f16", "f17", "f24", "f25", "f18", "f19", "f26", "f27", "memory");
+    } else if (rows == 9) {
+        __asm__ volatile(
+            "flw.ps    f24, 0(%[a0])        \n\t"
+            "flw.ps    f25, 32(%[a0])       \n\t"
+            "fadd.ps   f16, f16, f24         \n\t"
+            "fadd.ps   f17, f17, f25         \n\t"
+            "fsw.ps    f16, 0(%[a0])         \n\t"
+            "fsw.ps    f17, 32(%[a0])        \n\t"
+            :
+            : [a0] "r"(acc_row0 + 8 * RS)
+            : "f16", "f17", "f24", "f25", "memory");
     }
 }
 
