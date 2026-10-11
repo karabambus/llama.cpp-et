@@ -344,9 +344,14 @@ struct uber_concat_params {
 };
 
 struct uber_ssm_conv_params {
-    struct ggml_tensor src0;
+    struct ggml_tensor src0;  // conv window; state mode: the conv-state table
     struct ggml_tensor src1;
     struct ggml_tensor dst;
+    struct ggml_tensor ids;   // state mode only
+    struct ggml_tensor x;     // state mode only
+    uint32_t           n_upd, reserved;
+    uint64_t           upd_dst[8];
+    int64_t            upd_off[8];
 };
 
 struct uber_solve_tri_params {
@@ -702,6 +707,10 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
                 {
                     struct uber_ssm_conv_params * p = (struct uber_ssm_conv_params *) inst_params;
                     uk_evict(&p->src0);  // conv window (concat of state and new inputs); src1 is the conv weight
+                    if (p->n_upd) {      // state mode: src0 is the state table; the row index and new inputs too
+                        uk_evict(&p->ids);
+                        uk_evict(&p->x);
+                    }
                     UK_SYNC();
                     rc = ssm_conv_f32_entry((struct ggml_et_ssm_conv_params *) inst_params, env);
                     break;

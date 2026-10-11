@@ -3,11 +3,152 @@
 
 #include <stdint.h>
 
+#define SSMC_MAX_UPD 8
+#define SSMC_STATE_MAX_T 8
+
 struct ggml_et_ssm_conv_params {
-    struct ggml_tensor src0;  // conv_x: [d_conv - 1 + n_t, d_inner, n_seqs]
+    struct ggml_tensor src0;  // conv_x: [d_conv - 1 + n_t, d_inner, n_seqs]; state mode: conv-state table [3 * d_inner, rows]
     struct ggml_tensor src1;  // conv1d.weight: [d_conv, d_inner]
     struct ggml_tensor dst;   // output: [d_inner, n_t, n_seqs]
+    // State mode (n_upd > 0): conv_x = state row ids[0] of src0 followed by x, dst = silu(conv), state slot j
+    // (upd_dst[j]) receives conv_x columns upd_off[j] .. upd_off[j] + 2.
+    struct ggml_tensor ids;   // I32 [1]
+    struct ggml_tensor x;     // [d_inner, n_t], unit channel stride
+    uint32_t           n_upd;
+    uint32_t           reserved;
+    uint64_t           upd_dst[SSMC_MAX_UPD];
+    int64_t            upd_off[SSMC_MAX_UPD];
 };
+
+// State mode, one sequence, d_conv = 4, n_t <= SSMC_STATE_MAX_T (the delta-net conv block of a decode or MTP step: the
+// state gather, the concat, the state-slot copies, the conv and the SiLU in one instruction). Work items are 16-channel
+// output lines; a state row holds 3 floats per channel, so an item's state is 3 whole 64-byte lines that only its hart
+// reads and writes (the read row may be one of the slots). Each 8-channel half stages its window (3 state taps, then the
+// n_t inputs) in `win` before anything is written: the output may sit over x with the same layout, and the slots over
+// the read row. The conv adds its taps in the same order as the batched path below (fmadd from +0.0, tap 0 first), and
+// the SiLU is unary_f32's instruction sequence, so the result is bit-identical to the unfused chain. f20/f21 (gather
+// offsets) and f22-f24 (constants) stay live across the asm statements; the code between them is integer-only.
+static int ssm_conv_state(const struct ggml_et_ssm_conv_params * p, int thread_id, int num_threads) {
+    const struct ggml_tensor * tab = &p->src0;
+    const struct ggml_tensor * w   = &p->src1;
+    const struct ggml_tensor * dst = &p->dst;
+    const struct ggml_tensor * x   = &p->x;
+    const int64_t              nr  = w->ne[1];
+    const int64_t              n_t = dst->ne[1];
+
+    if (tab->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        x->type != GGML_TYPE_F32 || p->ids.type != GGML_TYPE_I32 || !tab->data || !w->data || !dst->data ||
+        !x->data || !p->ids.data || w->ne[0] != 4 || nr % 16 != 0 || tab->ne[0] != 3 * nr ||
+        tab->nb[0] != sizeof(float) || w->nb[0] != sizeof(float) || w->nb[1] != 4 * sizeof(float) ||
+        dst->ne[0] != nr || dst->nb[0] != sizeof(float) || x->ne[0] != nr || x->ne[1] != n_t ||
+        x->nb[0] != sizeof(float) || n_t < 1 || n_t > SSMC_STATE_MAX_T || p->n_upd > SSMC_MAX_UPD) {
+        return -1;
+    }
+    for (uint32_t j = 0; j < p->n_upd; ++j) {
+        if (p->upd_off[j] < 0 || p->upd_off[j] > n_t || !p->upd_dst[j]) {
+            return -1;
+        }
+    }
+    const int32_t row = *(const volatile int32_t *) p->ids.data;
+    if (row < 0 || row >= tab->ne[1]) {
+        return -1;
+    }
+    const float * st = (const float *) ((const char *) tab->data + (int64_t) row * tab->nb[1]);
+
+    unsigned long saved_mask;
+    __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
+    __asm__ volatile("mov.m.x m0, x0, 0xFF");
+
+    int32_t __attribute__((aligned(32))) offs_s[8], offs_c[8];
+    for (int e = 0; e < 8; ++e) {
+        offs_s[e] = e * 3 * (int32_t) sizeof(float);
+        offs_c[e] = e * 4 * (int32_t) sizeof(float);
+    }
+    const float zero = 0.0f, one = 1.0f, log2e = 1.4426950408889634f;
+    __asm__ volatile("flw.ps f20, %[os]\n\t"
+                     "flw.ps f21, %[oc]\n\t"
+                     "fbc.ps f22, %[z]\n\t"
+                     "fbc.ps f23, %[one]\n\t"
+                     "fbc.ps f24, %[l2e]\n"
+                     :
+                     : [os] "m"(*(const int32_t (*)[8]) offs_s), [oc] "m"(*(const int32_t (*)[8]) offs_c),
+                       [z] "m"(zero), [one] "m"(one), [l2e] "m"(log2e)
+                     : "f20", "f21", "f22", "f23", "f24");
+
+    uint32_t __attribute__((aligned(32))) win[(3 + SSMC_STATE_MAX_T) * 8];
+    uint32_t __attribute__((aligned(32))) slot[24];
+    const int64_t n_line = nr / 16;
+
+    for (int64_t line = thread_id; line < n_line; line += num_threads) {
+        for (int64_t grp = 2 * line; grp < 2 * line + 2; ++grp) {
+            const float * sb = st + grp * 8 * 3;
+            const float * cb = (const float *) w->data + grp * 8 * 4;
+            const char *  xb = (const char *) x->data + grp * 8 * (int64_t) sizeof(float);
+            char *        ob = (char *) dst->data + grp * 8 * (int64_t) sizeof(float);
+
+            __asm__ volatile("fgw.ps f10, f20(%[s0])\n\t"
+                             "fgw.ps f11, f20(%[s1])\n\t"
+                             "fgw.ps f12, f20(%[s2])\n\t"
+                             "fsw.ps f10, 0(%[w])\n\t"
+                             "fsw.ps f11, 32(%[w])\n\t"
+                             "fsw.ps f12, 64(%[w])\n"
+                             :
+                             : [s0] "r"(sb), [s1] "r"(sb + 1), [s2] "r"(sb + 2), [w] "r"(win)
+                             : "f10", "f11", "f12", "memory");
+            for (int64_t t = 0; t < n_t; ++t) {
+                __asm__ volatile("flw.ps f10, 0(%[src])\n\t"
+                                 "fsw.ps f10, 0(%[w])\n"
+                                 :
+                                 : [src] "r"(xb + t * x->nb[1]), [w] "r"(win + (3 + t) * 8)
+                                 : "f10", "memory");
+            }
+            __asm__ volatile("fgw.ps f14, f21(%[c0])\n\t"
+                             "fgw.ps f15, f21(%[c1])\n\t"
+                             "fgw.ps f16, f21(%[c2])\n\t"
+                             "fgw.ps f17, f21(%[c3])\n"
+                             :
+                             : [c0] "r"(cb), [c1] "r"(cb + 1), [c2] "r"(cb + 2), [c3] "r"(cb + 3)
+                             : "f14", "f15", "f16", "f17", "memory");
+            for (int64_t t = 0; t < n_t; ++t) {
+                __asm__ volatile("flw.ps   f10, 0(%[w])\n\t"
+                                 "flw.ps   f11, 32(%[w])\n\t"
+                                 "flw.ps   f12, 64(%[w])\n\t"
+                                 "flw.ps   f13, 96(%[w])\n\t"
+                                 "fbci.pi  f18, 0\n\t"
+                                 "fmadd.ps f18, f10, f14, f18\n\t"
+                                 "fmadd.ps f18, f11, f15, f18\n\t"
+                                 "fmadd.ps f18, f12, f16, f18\n\t"
+                                 "fmadd.ps f18, f13, f17, f18\n\t"
+                                 "fsub.ps  f12, f22, f18\n\t"  // -x
+                                 "fmul.ps  f13, f12, f24\n\t"  // -x * log2(e)
+                                 "fexp.ps  f13, f13\n\t"       // exp(-x)
+                                 "fadd.ps  f13, f13, f23\n\t"  // 1 + exp(-x)
+                                 "frcp.ps  f13, f13\n\t"       // 1 / (1 + exp(-x))
+                                 "fmul.ps  f18, f18, f13\n\t"  // x * sigmoid(x)
+                                 "fsw.ps   f18, 0(%[o])\n"
+                                 :
+                                 : [w] "r"(win + t * 8), [o] "r"(ob + t * dst->nb[1])
+                                 : "f10", "f11", "f12", "f13", "f18", "memory");
+            }
+            for (uint32_t j = 0; j < p->n_upd; ++j) {
+                const uint32_t * src = win + p->upd_off[j] * 8;
+                for (int e = 0; e < 8; ++e) {
+                    slot[e * 3 + 0] = src[e];
+                    slot[e * 3 + 1] = src[8 + e];
+                    slot[e * 3 + 2] = src[16 + e];
+                }
+                uint64_t *       d = (uint64_t *) ((uintptr_t) p->upd_dst[j] + (uint64_t) grp * 8 * 3 * sizeof(float));
+                const uint64_t * s = (const uint64_t *) slot;
+                for (int q = 0; q < 12; ++q) {
+                    d[q] = s[q];
+                }
+            }
+        }
+    }
+
+    __asm__ volatile("mova.m.x %0" ::"r"(saved_mask));
+    return 0;
+}
 
 int entry_point(struct ggml_et_ssm_conv_params * params, void * env) {
     kernel_environment_t * kernel_env = (kernel_environment_t *) env;
@@ -25,6 +166,10 @@ int entry_point(struct ggml_et_ssm_conv_params * params, void * env) {
 
     if (params == 0 || ((uint64_t) params & 0x7) != 0) {
         return -1;
+    }
+
+    if (params->n_upd > 0) {
+        return ssm_conv_state(params, thread_id, num_threads);
     }
 
     struct ggml_tensor * src0 = &params->src0;

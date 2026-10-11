@@ -2433,7 +2433,7 @@ bool ggml_et_op_ssm_conv(ggml_backend_et_device_context * dev_ctx, const ggml_te
 
     const char * kernel_name = "ssm_conv_f32";
 
-    ggml_et_ssm_conv_params params;
+    ggml_et_ssm_conv_params params{};
     params.src0 = *node->src[0];
     params.src1 = *node->src[1];
     params.dst  = *node;
@@ -2458,6 +2458,46 @@ bool ggml_et_op_ssm_conv(ggml_backend_et_device_context * dev_ctx, const ggml_te
     }
 
     ET_PERF_END("SSM_CONV", kernel_name, node);
+    return kernel_result;
+}
+
+bool ggml_et_op_ssm_conv_state(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * table,
+                               const ggml_tensor * ids, const ggml_tensor * x_t, const ggml_tensor * weight,
+                               const ggml_tensor * act, const ggml_tensor * const * upd, const int64_t * upd_off,
+                               int n_upd) {
+    ET_PERF_START();
+
+    if (!dev_ctx || n_upd < 1 || n_upd > GGML_ET_SSMC_MAX_UPD) {
+        GGML_LOG_ERROR("ET: Invalid parameters for the SSM_CONV state mode\n");
+        return false;
+    }
+
+    const char * kernel_name = "ssm_conv_f32";
+
+    ggml_et_ssm_conv_params params{};
+    params.src0 = *table;
+    params.src1 = *weight;
+    params.dst  = *act;
+    params.ids  = *ids;
+    // x_t is the CONCAT operand [n_t, d_inner] (a transposed view); the kernel takes it as [d_inner, n_t].
+    params.x       = *x_t;
+    params.x.ne[0] = x_t->ne[1];
+    params.x.ne[1] = x_t->ne[0];
+    params.x.ne[2] = 1;
+    params.x.ne[3] = 1;
+    params.x.nb[0] = x_t->nb[1];
+    params.x.nb[1] = x_t->nb[0];
+    params.x.nb[2] = params.x.nb[1] * params.x.ne[1];
+    params.x.nb[3] = params.x.nb[2];
+    params.n_upd   = (uint32_t) n_upd;
+    for (int j = 0; j < n_upd; ++j) {
+        params.upd_dst[j] = (uint64_t) (uintptr_t) upd[j]->data;
+        params.upd_off[j] = upd_off[j];
+    }
+
+    bool kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &params, sizeof(params), 0xFFFFFFFF);
+
+    ET_PERF_END("SSM_CONV", kernel_name, act);
     return kernel_result;
 }
 

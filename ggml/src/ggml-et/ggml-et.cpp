@@ -1601,6 +1601,143 @@ static bool et_hadamard_match_signed(const ggml_cgraph * cgraph, int i, const gg
     return true;
 }
 
+// ---- Delta-net conv block in one instruction (ssm_conv_f32 state mode) -----------------------------------------
+// At one sequence and a few tokens the conv block is GET_ROWS (the state row) -> RESHAPE [3, d_inner] -> CONCAT(state,
+// x^T) -> one CPY per state slot of a 3-column view of the concat -> SSM_CONV -> SILU: five instructions of ~20-30 us of
+// dispatch each for ~1 us of work. The state mode computes all of it in one instruction, issued at the CONCAT; the
+// GET_ROWS (earlier in the graph, before x exists) is skipped once the whole block has matched. The CONCAT, the copies,
+// the conv and the SiLU must be consecutive work nodes, so issuing the copies and the SiLU output at the CONCAT's slot
+// changes no other node's inputs, and no node between the GET_ROWS and the CONCAT may write the state table.
+// Memory: the kernel reads the state row, x, the ids and the weights while it writes the SiLU output and the slots. x is
+// dead after the CONCAT in the unfused schedule, so the output may lie over it; only the same layout is safe (each hart
+// stages its window before writing). Any other overlap runs unfused. GGML_ET_NO_CONV_STATE=1 disables the path.
+struct et_ssmc_plan {
+    int                 i_cat  = -1;
+    int                 i_last = -1;
+    const ggml_tensor * get    = nullptr;
+    const ggml_tensor * cat    = nullptr;
+    const ggml_tensor * conv   = nullptr;
+    const ggml_tensor * act    = nullptr;
+    int                 n_upd  = 0;
+    const ggml_tensor * upd[GGML_ET_SSMC_MAX_UPD] = {};
+    int64_t             off[GGML_ET_SSMC_MAX_UPD] = {};
+};
+
+static int et_next_work(const ggml_cgraph * cgraph, int j) {
+    for (++j; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (!ggml_et_node_is_metadata_only(t) && !ggml_is_empty(t)) {
+            return j;
+        }
+    }
+    return cgraph->n_nodes;
+}
+
+static bool et_ssmc_match(const ggml_cgraph * cgraph, int ig, et_ssmc_plan * p) {
+    static const bool off = et_env_on("GGML_ET_NO_CONV_STATE");
+    const ggml_tensor * G = cgraph->nodes[ig];
+    if (off || G->op != GGML_OP_GET_ROWS || G->type != GGML_TYPE_F32 || !G->src[0] || !G->src[1]) {
+        return false;
+    }
+    const ggml_tensor * tab = G->src[0];
+    const ggml_tensor * ids = G->src[1];
+    if (tab->type != GGML_TYPE_F32 || tab->nb[0] != sizeof(float) || ids->type != GGML_TYPE_I32 ||
+        ggml_nelements(ids) != 1 || G->ne[0] != tab->ne[0] || ggml_nrows(G) != 1 || tab->ne[0] % 48 != 0 ||
+        et_use_count(cgraph, G) != 1 || (G->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int64_t       nr       = tab->ne[0] / 3;
+    const ggml_tensor * tab_base = tab->view_src ? tab->view_src : tab;  // build_rs gathers from a 2-D reshape of the cache
+    // the CONCAT whose first operand is the [3, d_inner] reshape of G
+    int ic = -1;
+    for (int j = ig + 1; j < cgraph->n_nodes && j <= ig + 64; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_CONCAT && t->src[0] && t->src[0]->view_src == G) {
+            ic = j;
+            break;
+        }
+    }
+    if (ic < 0) {
+        return false;
+    }
+    const ggml_tensor * C  = cgraph->nodes[ic];
+    const ggml_tensor * R  = C->src[0];
+    const ggml_tensor * xt = C->src[1];
+    if (R->op != GGML_OP_RESHAPE || R->src[0] != G || R->ne[0] != 3 || R->ne[1] != nr || R->ne[2] != 1 ||
+        et_use_count(cgraph, R) != 1 || ggml_get_op_params_i32(C, 0) != 0 || C->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(C) || C->ne[1] != nr || C->ne[2] != 1 || C->ne[3] != 1 || !xt ||
+        xt->type != GGML_TYPE_F32 || xt->ne[1] != nr || xt->ne[2] != 1 || xt->ne[3] != 1 || xt->nb[1] != sizeof(float) ||
+        (C->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const int64_t n_t = C->ne[0] - 3;
+    if (n_t < 1 || n_t > 8 || xt->ne[0] != n_t || xt->nb[0] % 32 != 0 || (uintptr_t) xt->data % 32 != 0) {
+        return false;
+    }
+    // the slot copies, then the conv and the SiLU, as consecutive work nodes
+    int n_upd = 0;
+    int j     = et_next_work(cgraph, ic);
+    for (; j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_CPY; j = et_next_work(cgraph, j)) {
+        const ggml_tensor * U = cgraph->nodes[j];
+        const ggml_tensor * v = U->src[0];
+        const ggml_tensor * d = U->src[1];
+        if (n_upd == GGML_ET_SSMC_MAX_UPD || !v || !d || v->op != GGML_OP_VIEW || v->view_src != C || v->type != GGML_TYPE_F32 ||
+            v->ne[0] != 3 || v->ne[1] != nr || v->ne[2] != 1 || v->ne[3] != 1 || v->nb[0] != sizeof(float) ||
+            v->nb[1] != C->nb[1] || v->view_offs % sizeof(float) != 0 || (int64_t) (v->view_offs / sizeof(float)) > n_t ||
+            d->type != GGML_TYPE_F32 || d->view_src != tab_base || d->nb[0] != sizeof(float) || ggml_nelements(d) != 3 * nr ||
+            d->ne[0] != 3 * nr || U->data != d->data || (uintptr_t) d->data % 64 != 0) {
+            return false;
+        }
+        p->upd[n_upd] = U;
+        p->off[n_upd] = (int64_t) (v->view_offs / sizeof(float));
+        ++n_upd;
+    }
+    if (n_upd == 0 || j >= cgraph->n_nodes || et_use_count(cgraph, C) != n_upd + 1) {
+        return false;
+    }
+    const ggml_tensor * S = cgraph->nodes[j];
+    const int           ia = et_next_work(cgraph, j);
+    if (S->op != GGML_OP_SSM_CONV || S->src[0] != C || !S->src[1] || S->src[1]->type != GGML_TYPE_F32 ||
+        S->src[1]->ne[0] != 4 || S->src[1]->ne[1] != nr || !ggml_is_contiguous(S->src[1]) || S->type != GGML_TYPE_F32 ||
+        S->ne[0] != nr || S->ne[1] != n_t || S->ne[2] != 1 || !ggml_node_has_n_uses(cgraph, j, 1) || ia >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * A = cgraph->nodes[ia];
+    if (A->op != GGML_OP_UNARY || ggml_get_unary_op(A) != GGML_UNARY_OP_SILU || A->src[0] != S || A->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(A, S) || !ggml_is_contiguous(A) || (uintptr_t) A->data % 64 != 0) {
+        return false;
+    }
+    // memory: output over x only with the same layout; nothing else may overlap an input or another output
+    if (et_ranges_overlap(A, xt) && !(A->data == xt->data && A->nb[1] == xt->nb[0])) {
+        return false;
+    }
+    for (const ggml_tensor * in : { tab, ids, (const ggml_tensor *) S->src[1] }) {
+        if (et_ranges_overlap(A, in)) {
+            return false;
+        }
+    }
+    for (int u = 0; u < n_upd; ++u) {
+        if (et_ranges_overlap(p->upd[u], xt) || et_ranges_overlap(p->upd[u], A) || et_ranges_overlap(p->upd[u], ids)) {
+            return false;
+        }
+    }
+    // the deferred state read: nothing between G and C writes the table
+    for (int k = ig + 1; k < ic; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (!ggml_et_node_is_metadata_only(t) && !ggml_is_empty(t) && et_ranges_overlap(t, tab)) {
+            return false;
+        }
+    }
+    p->i_cat  = ic;
+    p->i_last = ia;
+    p->get    = G;
+    p->cat    = C;
+    p->conv   = S;
+    p->act    = A;
+    p->n_upd  = n_upd;
+    return true;
+}
+
 // Token count of a graph. Primary source: a ROPE node, whose dst is [head_dim, n_head, n_tokens] in every llama
 // graph with attention layers. Fallback (graphs without rope): the widest activation operand of a plain MUL_MAT
 // (src[1]->ne[1]); that axis is not the token count for the fused Hadamard matmul, whose activation is reshaped to
@@ -1651,6 +1788,7 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
     int fused_groups           = 0;
     int fused_dispatches_saved = 0;
     const ggml_tensor * gdn_fold_skip = nullptr;
+    et_ssmc_plan        ssmc;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -1670,6 +1808,41 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
             continue;
         }
         ggml_et_uberkernel_set_node(node);
+
+        if (i == ssmc.i_cat) {
+            const et_ssmc_plan & P = ssmc;
+            auto fused = [&] {
+                return ggml_et_op_ssm_conv_state(dev_ctx, P.get->src[0], P.get->src[1], P.cat->src[1], P.conv->src[1],
+                                                 P.act, P.upd, P.off, P.n_upd);
+            };
+            if (et_fcheck_enabled()) {
+                std::vector<const ggml_tensor *> outs(P.upd, P.upd + P.n_upd);
+                outs.push_back(P.act);
+                et_fcheck_run(dev_ctx, "conv_state", { P.get->src[0], P.cat->src[1] }, outs, fused, [&] {
+                    bool ok = ggml_et_op_get_rows(dev_ctx, P.get) && ggml_et_op_concat(dev_ctx, P.cat);
+                    for (int u = 0; u < P.n_upd; ++u) {
+                        ok = ok && ggml_et_op_cpy(dev_ctx, P.upd[u]);
+                    }
+                    return ok && ggml_et_op_ssm_conv(dev_ctx, P.conv) && ggml_et_op_unary(dev_ctx, P.act);
+                });
+            } else {
+                fused();
+            }
+            static bool announced = false;
+            if (!announced) {
+                announced = true;
+                GGML_LOG_INFO("ET: delta-net conv block as one ssm_conv instruction (%lld tokens, %d state slots)\n",
+                              (long long) (P.cat->ne[0] - 3), P.n_upd);
+            }
+            fused_groups++;
+            fused_dispatches_saved += 3 + P.n_upd;
+            i    = P.i_last;
+            ssmc = et_ssmc_plan();
+            continue;
+        }
+        if (node->op == GGML_OP_GET_ROWS && ssmc.i_cat < 0 && et_ssmc_match(cgraph, i, &ssmc)) {
+            continue;  // issued at the CONCAT
+        }
 
         // --- Fusion checks (before regular dispatch) ---
         {

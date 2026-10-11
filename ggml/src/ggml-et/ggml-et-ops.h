@@ -207,10 +207,19 @@ struct ggml_et_diag_params {
     ggml_tensor dst;   // F32 output diagonal matrix
 };
 
+#define GGML_ET_SSMC_MAX_UPD 8
 struct ggml_et_ssm_conv_params {
-    ggml_tensor src0;  // conv_x: [d_conv - 1 + n_t, d_inner, n_seqs]
+    ggml_tensor src0;  // conv_x: [d_conv - 1 + n_t, d_inner, n_seqs]; state mode: the conv-state table [3 * d_inner, rows]
     ggml_tensor src1;  // conv1d.weight: [d_conv, d_inner]
     ggml_tensor dst;   // output: [d_inner, n_t, n_seqs]
+    // State mode (n_upd > 0; one sequence, d_conv = 4): conv_x is state row ids[0] of src0 followed by x, dst is
+    // silu(conv), and state slot j (upd_dst[j], d_inner x 3 floats) receives conv_x columns upd_off[j] .. upd_off[j] + 2.
+    ggml_tensor ids;   // I32 [1]
+    ggml_tensor x;     // new inputs [d_inner, n_t], unit channel stride
+    uint32_t    n_upd;
+    uint32_t    reserved;
+    uint64_t    upd_dst[GGML_ET_SSMC_MAX_UPD];
+    int64_t     upd_off[GGML_ET_SSMC_MAX_UPD];
 };
 
 struct ggml_et_ssm_scan_params {
@@ -508,6 +517,12 @@ bool ggml_et_op_solve_tri(ggml_backend_et_device_context * dev_ctx, const ggml_t
 bool ggml_et_op_pad(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_set(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 bool ggml_et_op_ssm_conv(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
+// State mode of ssm_conv_f32: reads state row ids[0] of `table` and the new inputs x ([d_inner, n_t], unit channel
+// stride), writes silu(conv) to `act` and conv_x columns upd_off[j] .. +2 to the state slots upd_dst[j].
+bool ggml_et_op_ssm_conv_state(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * table,
+                               const ggml_tensor * ids, const ggml_tensor * x_t, const ggml_tensor * weight,
+                               const ggml_tensor * act, const ggml_tensor * const * upd, const int64_t * upd_off,
+                               int n_upd);
 bool ggml_et_op_ssm_scan(ggml_backend_et_device_context * dev_ctx, const ggml_tensor * node);
 // add_node (optional): rms_norm_node->src[0] == add_node; the kernel also computes and writes the ADD.
 bool ggml_et_op_rms_norm_mul(ggml_backend_et_device_context * dev_ctx,
