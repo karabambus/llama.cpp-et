@@ -330,6 +330,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
         evict_to_l2((const void *) ready_ctr, 1, 64);    WAIT_CACHEOPS;
         evict_to_l2((const void *) consumed_ctr, 1, 64); WAIT_CACHEOPS;
 
+        const int64_t tile_rot = (int64_t) shire_id;
         uint32_t wid = 0;
         for (int64_t unit = my_start; unit < base_units; unit += tiles_stride) {
             const int64_t batch_idx = unit / units_pb;
@@ -358,7 +359,11 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                 const int is_last = (kw == n_windows - 1);
                 float *cf = (float *) cache_buf[buf];
 
-                for (int64_t r = 0; r < r_count; ++r) {
+                // Each shire starts the window's N-tiles at its own offset: with every consumer on the same tile, all 32
+                // shires waited on the same activation lines at every step; within a shire the minions still share them
+                // through L2. Every tile keeps its K order and its C scratch slot (bit-identical).
+                for (int64_t rr = 0; rr < r_count; ++rr) {
+                    const int64_t r  = (rr + tile_rot) % r_count;
                     const int64_t nb = (nb_base_t + r) * TILE_N;
                     const int64_t n_cur = (nb + TILE_N <= N) ? TILE_N : (N - nb);
                     const int64_t arows_fma = (n_cur == 4) ? 4 : (n_cur - 1);
