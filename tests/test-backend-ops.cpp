@@ -4593,7 +4593,9 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err() override {
-        return 5e-4;
+        // ET: GGML_ET_TBO_MM_NMSE tightens the bound (an int8 path that matches the CPU's Q8_K products should sit near 1e-14)
+        static const double lim = [] { const char * e = getenv("GGML_ET_TBO_MM_NMSE"); return e && *e ? atof(e) : 5e-4; }();
+        return lim;
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
