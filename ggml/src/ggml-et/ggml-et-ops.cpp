@@ -984,11 +984,12 @@ static void ggml_et_pq2_tail_scratch(ggml_backend_et_device_context * dev_ctx, g
 }
 
 // Small-M F32 matvecs (the delta-net alpha/beta projections, [48,5120] at N = 1) run as a K-split over all harts whose
-// rows meet in per-row records (mul_mat_f32.c): 128 rows x 68 words, zeroed once and left zeroed by every launch.
-// GGML_ET_F32_KSPLIT=0 keeps the matrix-engine kernel.
+// rows meet in per-row records (mul_mat_f32.c): one 64-byte line per row for F32KS_MAX_ROWS rows, zeroed once and left
+// zeroed by every launch (mallocDevice aligns to a cache line). GGML_ET_F32_KSPLIT=0 keeps the matrix-engine kernel.
+constexpr int64_t ET_F32KS_MAX_ROWS = 128;  // = F32KS_MAX_ROWS in mul_mat_f32.c (the kernel rejects larger M)
 static std::byte * ggml_et_f32_ksplit_scratch(ggml_backend_et_device_context * dev_ctx) {
     static const bool on = [] { const char * e = getenv("GGML_ET_F32_KSPLIT"); return !(e && *e && strcmp(e, "0") == 0); }();
-    constexpr size_t  bytes = 128 * 68 * 4;
+    constexpr size_t  bytes = ET_F32KS_MAX_ROWS * 64;
     if (!on) {
         return nullptr;
     }
@@ -1146,7 +1147,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
         src0_type_name = "F16";
 
     } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
-               node->src[1]->ne[1] == 1 && ggml_nrows(node->src[1]) == 1 && node->src[0]->ne[1] <= 128 &&
+               node->src[1]->ne[1] == 1 && ggml_nrows(node->src[1]) == 1 && node->src[0]->ne[1] <= ET_F32KS_MAX_ROWS &&
                node->src[0]->ne[0] >= 1024 && node->src[0]->ne[0] % 128 == 0 && ggml_nrows(node->src[0]) == node->src[0]->ne[1] &&
                ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) && !bias_tensor &&
                (f32_ksplit = ggml_et_f32_ksplit_scratch(dev_ctx)) != nullptr) {

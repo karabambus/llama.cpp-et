@@ -12,9 +12,12 @@
 // split into C chunks over M * C harts. Each chunk hart publishes its partial with a global atomic, fences, and counts in
 // on the row's counter; the one that completes the count sums the C partials in chunk order (deterministic), stores
 // dst[m] and resets the counter, so the records are clean for the next launch (launches are separated by a barrier).
-// Records: row m at extra + m * F32KS_REC_WORDS words {count, p[0 .. 63], -}; every access is a global atomic.
-#define F32KS_REC_WORDS 68
-#define F32KS_MAX_C     64
+// Records: row m is the 64-byte line extra + m * 64 = {count, p[0 .. 14]}; every access is a global atomic. A partial and
+// the counter share one line, the data-then-flag layout the PQ2 tail combine runs on the board (KB 04 Y17); C <= 15.
+// The host allocates F32KS_MAX_ROWS lines (ggml_et_f32_ksplit_scratch) and routes only M <= F32KS_MAX_ROWS here.
+#define F32KS_REC_WORDS 16
+#define F32KS_MAX_C     15
+#define F32KS_MAX_ROWS  128
 
 static inline float f32ks_dot128(const float * a, const float * b, int64_t nblk) {
     float r;
@@ -46,7 +49,10 @@ static int mul_mat_f32_ksplit(struct ggml_et_binary_params * params, int thread_
     const int64_t K   = params->src0.ne[0];
     const int64_t M   = params->src0.ne[1];
     const int64_t nkb = K / 128;
-    int64_t       C   = num_threads / M;
+    if (M < 1 || M > F32KS_MAX_ROWS || nkb < 1) {
+        return -1;
+    }
+    int64_t C = num_threads / M;
     if (C > F32KS_MAX_C) C = F32KS_MAX_C;
     if (C > nkb) C = nkb;
     const int64_t bpc = (nkb + C - 1) / C;
