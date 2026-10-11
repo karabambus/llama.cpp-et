@@ -35,7 +35,8 @@
 #define REUSE_MAX 32
 #endif
 
-#define A0_L1  0       // A buffers (8 lines each): pass 0 / pass 1 of a group
+#define A0_L1  0       // A buffers (8 lines each): pass 0 of even / odd groups of a window, pass 1 of every group
+#define A0B_L1 8
 #define A1_L1  32
 #define SC_L1  16      // token-scale line (MUL_COL), weight-scale line at SC_L1 + 1 (MUL_ROW)
 
@@ -279,6 +280,8 @@ int entry_point(struct ggml_et_pq2_i8_params *params, void *env) {
                 if (n_cur == 4) {
                     tensor_load(false, false, A0_L1 + 4, TENSOR_LOAD_PLAIN, 0, (uint64_t) zero_line, 0, 0, 64, 0);
                     tensor_wait(TENSOR_LOAD_WAIT_0);
+                    tensor_load(false, false, A0B_L1 + 4, TENSOR_LOAD_PLAIN, 0, (uint64_t) zero_line, 0, 0, 64, 0);
+                    tensor_wait(TENSOR_LOAD_WAIT_0);
                     tensor_load(false, false, A1_L1 + 4, TENSOR_LOAD_PLAIN, 0, (uint64_t) zero_line, 0, 0, 64, 0);
                     tensor_wait(TENSOR_LOAD_WAIT_0);
                 }
@@ -286,8 +289,11 @@ int entry_point(struct ggml_et_pq2_i8_params *params, void *env) {
                 const char *arow = a8 + tok0 * nb1_a;
                 tensor_load(false, false, A0_L1, TENSOR_LOAD_PLAIN, 0, (uint64_t) (arow + g0 * GK), 0, n_cur - 1,
                             (uint64_t) nb1_a, 0);
+                // Pass 0 of the next group loads into the other pass-0 buffer while this group's second FMA runs (one
+                // id-0 load in flight at a time: it is issued once pass 1 of this group has arrived).
                 for (int64_t i = 0; i < kgn; ++i) {
-                    const int64_t g = g0 + i;
+                    const int64_t g    = g0 + i;
+                    const uint64_t a0  = (i & 1) ? A0B_L1 : A0_L1;
                     tensor_wait(TENSOR_LOAD_WAIT_0);
                     tensor_load(false, false, A1_L1, TENSOR_LOAD_PLAIN, 0, (uint64_t) (arow + g * GK + 64), 0, n_cur - 1,
                                 (uint64_t) nb1_a, 0);
@@ -296,16 +302,16 @@ int entry_point(struct ggml_et_pq2_i8_params *params, void *env) {
                     tensor_load(false, false, SC_L1 + 1, TENSOR_LOAD_PLAIN, 0, (uint64_t) (pw + WIN_PANELS + i * 64), 0,
                                 0, 64, 1);
                     tensor_load_setup_b(false, (uint64_t) (pw + i * PANEL_BYTES), 15, 64, 1);
-                    tensor_fma(false, 3, arows, 15, 0, false, false, false, true, 16, A0_L1, 3, true);
+                    tensor_fma(false, 3, arows, 15, 0, false, false, false, true, 16, a0, 3, true);
                     tensor_wait(TENSOR_FMA_WAIT);
                     tensor_wait(TENSOR_LOAD_WAIT_0);
+                    if (i + 1 < kgn) {
+                        tensor_load(false, false, (i & 1) ? A0_L1 : A0B_L1, TENSOR_LOAD_PLAIN, 0,
+                                    (uint64_t) (arow + (g + 1) * GK), 0, n_cur - 1, (uint64_t) nb1_a, 0);
+                    }
                     tensor_load_setup_b(false, (uint64_t) (pw + i * PANEL_BYTES + 16 * 64), 15, 64, 1);
                     tensor_fma(false, 3, arows, 15, 0, true, false, false, true, 16, A1_L1, 3, false);
                     tensor_wait(TENSOR_FMA_WAIT);
-                    if (i + 1 < kgn) {
-                        tensor_load(false, false, A0_L1, TENSOR_LOAD_PLAIN, 0, (uint64_t) (arow + (g + 1) * GK), 0,
-                                    n_cur - 1, (uint64_t) nb1_a, 0);
-                    }
                     tensor_wait(TENSOR_LOAD_WAIT_1);
                     tensor_quant(0, 3, arows, SC_L1, QUANT_LAST_TRANS, QUANT_LAST_TRANS, QUANT_LAST_TRANS,
                                  QUANT_LAST_TRANS, QUANT_LAST_TRANS, QUANT_LAST_TRANS, QUANT_LAST_TRANS,
