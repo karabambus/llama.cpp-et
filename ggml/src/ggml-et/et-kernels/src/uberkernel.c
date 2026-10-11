@@ -149,7 +149,7 @@ static uint32_t uk_flags_all;
     } while (0)
 
 // Chip-wide barrier between instructions, with a tree release. FLB elects one hart per shire; the elected harts count
-// in on a global counter; the last one resets it and credits the root shire only, and every released shire's hart 0
+// in on a global counter; the last one resets it and credits the root shire only, and every released shire's hart 63
 // then credits up to UK_TREE_FANOUT (2; 3, 4 and 8 measured within 0.6 %, r296) child shires (ranks K*r+1 .. K*r+K of the
 // 32 launch shires). The flat release of
 // et_barrier_global has one hart issue 66 fcc_send stores in a row (33 shires x 2 threads, the master shire included)
@@ -161,6 +161,7 @@ static uint32_t uk_flags_all;
 #ifndef UK_TREE_FANOUT
 #define UK_TREE_FANOUT 2
 #endif
+_Static_assert(UK_TREE_FANOUT >= 1 && UK_TREE_FANOUT < 32, "a fan-out of 0 never releases the children");
 #define UK_LAUNCH_SHIRES 32ULL
 // Pinned to .data so it starts at zero (KB 04 U1: .bss is NOLOAD).
 static uint32_t __attribute__((aligned(64), section(".data"))) uk_barrier_count[64 / sizeof(uint32_t)] = { 0 };
@@ -176,8 +177,10 @@ static inline void __attribute__((always_inline)) uk_barrier_tree(void) {
             fcc_send(0, THREAD_1, FCC_1, 0xFFFFFFFF);
         }
     }
-    // Children of this shire's rank (= shire id: the launch covers shires 0..31), resolved before blocking.
-    const int      forwarder   = (get_hart_id() & 0x3Fu) == 0u;
+    // Children of this shire's rank (= shire id: the launch covers shires 0..31), resolved before blocking. The forwarder
+    // is local hart 63 (minion 31, thread 1): the tree delays it after every release, and minion 0's own minion barrier
+    // shares FLB 0 with this barrier (KB 04 Y4), so the delayed hart stays out of minion 0.
+    const int      forwarder   = (get_hart_id() & 0x3Fu) == 0x3Fu;
     const uint64_t first_child = (uint64_t) UK_TREE_FANOUT * shire_id + 1ULL;
     fcc_consume(FCC_1);
     __asm__ __volatile__("" ::: "memory");  // keep the forwarding stores after the credit wait
