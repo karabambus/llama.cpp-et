@@ -150,7 +150,8 @@ static uint32_t uk_flags_all;
 
 // Chip-wide barrier between instructions, with a tree release. FLB elects one hart per shire; the elected harts count
 // in on a global counter; the last one resets it and credits the root shire only, and every released shire's hart 0
-// then credits up to UK_TREE_FANOUT child shires (ranks K*r+1 .. K*r+K of the 32 launch shires). The flat release of
+// then credits up to UK_TREE_FANOUT (2; 3, 4 and 8 measured within 0.6 %, r296) child shires (ranks K*r+1 .. K*r+K of the
+// 32 launch shires). The flat release of
 // et_barrier_global has one hart issue 66 fcc_send stores in a row (33 shires x 2 threads, the master shire included)
 // while all harts wait, and it measured 16 us per barrier (r295: tg128 4.88 -> 4.33 with every barrier doubled).
 // Every launch shire gets exactly one credit per barrier: the root from the last arriver, every other rank from its
@@ -158,7 +159,7 @@ static uint32_t uk_flags_all;
 // shire early; a missing one hangs. Shires outside the launch (the master shire) get none. Uses FLB 0 and FCC_1 like
 // et_barrier_global; kernels' intra-minion semaphores use FCC_0.
 #ifndef UK_TREE_FANOUT
-#define UK_TREE_FANOUT 3
+#define UK_TREE_FANOUT 2
 #endif
 #define UK_LAUNCH_SHIRES 32ULL
 // Pinned to .data so it starts at zero (KB 04 U1: .bss is NOLOAD).
