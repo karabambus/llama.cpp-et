@@ -7,6 +7,86 @@
 #include <stdint.h>
 #include <stdio.h>
 
+// Small-M matvec (N = 1, M <= 128, one batch, F32 x F32, K % 128 == 0; the host sets dst.extra to the records): the
+// matrix-engine kernel ran it on M / 16 minions that each streamed whole rows (≈ 85 µs for [48,5120]). Here row m is
+// split into C chunks over M * C harts. Each chunk hart publishes its partial with a global atomic, fences, and counts in
+// on the row's counter; the one that completes the count sums the C partials in chunk order (deterministic), stores
+// dst[m] and resets the counter, so the records are clean for the next launch (launches are separated by a barrier).
+// Records: row m at extra + m * F32KS_REC_WORDS words {count, p[0 .. 63], -}; every access is a global atomic.
+#define F32KS_REC_WORDS 68
+#define F32KS_MAX_C     64
+
+static inline float f32ks_dot128(const float * a, const float * b, int64_t nblk) {
+    float r;
+    __asm__ volatile("fbci.pi f10, 0\n\t" ::: "f10");
+    for (int64_t i = 0; i < nblk * 128; i += 8) {
+        __asm__ volatile(
+            "flw.ps   f11, %[a]\n\t"
+            "flw.ps   f12, %[b]\n\t"
+            "fmadd.ps f10, f11, f12, f10, rne\n\t"
+            :
+            : [a] "m"(*(const float (*)[8]) (a + i)), [b] "m"(*(const float (*)[8]) (b + i))
+            : "f10", "f11", "f12");
+    }
+    __asm__ volatile(
+        "fswizz.ps f1, f10, 0xB1 \n\t"
+        "fadd.ps   f2, f10, f1, rne \n\t"
+        "fswizz.ps f3, f2, 0x4E \n\t"
+        "fadd.ps   f4, f2, f3, rne \n\t"
+        "fmvz.x.ps t0, f4, 4 \n\t"
+        "fbcx.ps   f5, t0 \n\t"
+        "fadd.ps   %[r], f4, f5, rne \n\t"
+        : [r] "=f"(r)
+        :
+        : "t0", "f1", "f2", "f3", "f4", "f5", "f10");
+    return r;
+}
+
+static int mul_mat_f32_ksplit(struct ggml_et_binary_params * params, int thread_id, int num_threads) {
+    const int64_t K   = params->src0.ne[0];
+    const int64_t M   = params->src0.ne[1];
+    const int64_t nkb = K / 128;
+    int64_t       C   = num_threads / M;
+    if (C > F32KS_MAX_C) C = F32KS_MAX_C;
+    if (C > nkb) C = nkb;
+    const int64_t bpc = (nkb + C - 1) / C;
+    C                 = (nkb + bpc - 1) / bpc;
+    const int64_t m   = thread_id / C;
+    const int64_t c   = thread_id % C;
+    if (m >= M) {
+        return 0;
+    }
+    const int64_t kb0  = c * bpc;
+    const int64_t kb1  = (kb0 + bpc < nkb) ? kb0 + bpc : nkb;
+    const float * a    = (const float *) ((const char *) params->src0.data + m * params->src0.nb[1]) + kb0 * 128;
+    const float * b    = (const float *) params->src1.data + kb0 * 128;
+
+    unsigned long old_mask;
+    __asm__ volatile("mova.x.m %0\n\tmov.m.x m0, x0, 0xFF" : "=r"(old_mask));
+    const float part = f32ks_dot128(a, b, kb1 - kb0);
+    __asm__ volatile("mova.m.x %0" ::"r"(old_mask));
+
+    volatile uint32_t * rec = (volatile uint32_t *) params->dst.extra + m * F32KS_REC_WORDS;
+    uint32_t            bits;
+    __builtin_memcpy(&bits, &part, sizeof bits);
+    et_global_swap_w(rec + 1 + c, bits);
+    FENCE;
+    if (et_global_add_w(rec, 1) != (uint32_t) (C - 1)) {
+        return 0;
+    }
+    float sum = 0.0f;
+    for (int64_t j = 0; j < C; j++) {
+        const uint32_t pb = et_global_add_w(rec + 1 + j, 0);
+        float          pj;
+        __builtin_memcpy(&pj, &pb, sizeof pj);
+        sum += pj;
+    }
+    atomic_store_f32((volatile float *) ((char *) params->dst.data + m * params->dst.nb[0]), sum);
+    et_global_swap_w(rec, 0);
+    FENCE;
+    return 0;
+}
+
 int entry_point(struct ggml_et_binary_params * params, void * env) {
     kernel_environment_t * kernel_env = (kernel_environment_t *) env;
 
@@ -18,7 +98,13 @@ int entry_point(struct ggml_et_binary_params * params, void * env) {
     int thread_id   = get_relative_thread_id(kernel_env->shire_mask);
     int num_threads = get_num_threads(kernel_env->shire_mask);
 
-    if (thread_id < 0 || (thread_id & 1)) {
+    if (thread_id < 0) {
+        return 0;
+    }
+    if (params->dst.extra) {
+        return mul_mat_f32_ksplit(params, thread_id, num_threads);
+    }
+    if (thread_id & 1) {
         return 0;  // Skip odd threads to avoid resource contention
     }
 

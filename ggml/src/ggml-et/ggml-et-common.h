@@ -91,6 +91,7 @@ struct ggml_backend_et_device_context {
     std::byte * moe_w_scratch = nullptr;
     std::byte * pq2_tail_scratch = nullptr;  // PQ2_0 GEMV K-split tail records (zeroed once), see mul_mat_PQ2_0.c
     uint32_t    pq2_tail_gen     = 0;        // generation of the last launch that used it
+    std::byte * f32_ksplit_scratch = nullptr;  // mul_mat_f32 K-split row records (zeroed once), see mul_mat_f32.c
 
     bool                               uberkernel_enabled = false;
     // Set per graph by graph_compute: batching is enabled AND the graph is decode-sized (token count at or under

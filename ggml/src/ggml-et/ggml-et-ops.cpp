@@ -983,6 +983,32 @@ static void ggml_et_pq2_tail_scratch(ggml_backend_et_device_context * dev_ctx, g
     p->tail_gen     = dev_ctx->pq2_tail_gen;
 }
 
+// Small-M F32 matvecs (the delta-net alpha/beta projections, [48,5120] at N = 1) run as a K-split over all harts whose
+// rows meet in per-row records (mul_mat_f32.c): 128 rows x 68 words, zeroed once and left zeroed by every launch.
+// GGML_ET_F32_KSPLIT=0 keeps the matrix-engine kernel.
+static std::byte * ggml_et_f32_ksplit_scratch(ggml_backend_et_device_context * dev_ctx) {
+    static const bool on = [] { const char * e = getenv("GGML_ET_F32_KSPLIT"); return !(e && *e && strcmp(e, "0") == 0); }();
+    constexpr size_t  bytes = 128 * 68 * 4;
+    if (!on) {
+        return nullptr;
+    }
+    if (!dev_ctx->f32_ksplit_scratch) {
+        std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+        if (!runtime) {
+            return nullptr;
+        }
+        std::byte * buf = runtime->mallocDevice(dev_ctx->rtid, bytes);
+        if (!buf) {
+            return nullptr;
+        }
+        static const std::vector<std::byte> zeros(bytes);
+        rt::EventId ev = runtime->memcpyHostToDevice(dev_ctx->default_stream, zeros.data(), buf, bytes, true);
+        runtime->waitForEvent(ev);
+        dev_ctx->f32_ksplit_scratch = buf;
+    }
+    return dev_ctx->f32_ksplit_scratch;
+}
+
 bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
                         const ggml_tensor *              node,
                         const ggml_tensor *              add_node) {
@@ -1009,6 +1035,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
     }
 
     const char * kernel_name;
+    std::byte *  f32_ksplit     = nullptr;  // mul_mat_f32 K-split records (only on that path)
     const char * src0_type_name;
 
     if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_Q4_0 && node->src[1]->type == GGML_TYPE_F32 &&
@@ -1118,6 +1145,13 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
         kernel_name    = "mul_mat_f16";
         src0_type_name = "F16";
 
+    } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+               node->src[1]->ne[1] == 1 && ggml_nrows(node->src[1]) == 1 && node->src[0]->ne[1] <= 128 &&
+               node->src[0]->ne[0] >= 1024 && node->src[0]->ne[0] % 128 == 0 && ggml_nrows(node->src[0]) == node->src[0]->ne[1] &&
+               ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) && !bias_tensor &&
+               (f32_ksplit = ggml_et_f32_ksplit_scratch(dev_ctx)) != nullptr) {
+        kernel_name    = "mul_mat_f32";  // K-split matvec, see ggml_et_f32_ksplit_scratch
+        src0_type_name = "F32";
     } else if (node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
                node->src[1]->type == GGML_TYPE_F32 && node->ne[0] % 16 == 0 && node->src[0]->ne[0] % 16 == 0 &&
                node->src[0]->ne[1] % 16 == 0 && node->src[1]->ne[0] != 1) {  // GEMV is faster with the generic path
@@ -1139,6 +1173,7 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
     params.src0 = *node->src[0];  // weight matrix
     params.src1 = *node->src[1];  // activation matrix
     params.dst  = *fused_dst;     // output (= add_node when fused, else node)
+    params.dst.extra = f32_ksplit;  // the device takes the K-split path exactly when this is set (mul_mat_f32.c)
 
     // GGML_ET_DEBUG_MM=1: print the device addresses of every MUL_MAT launch (Exp 049 / W24: tensor_load and
     // tensor_store silently truncate addresses to 64 B / 16 B, so operand placement matters for engine kernels).
