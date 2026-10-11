@@ -1779,6 +1779,7 @@ static int64_t et_graph_n_tokens(const ggml_cgraph * cgraph) {
 
 static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *) backend->device->context;
+    dev_ctx->graph_seq++;
     const auto                       ht_entry = std::chrono::steady_clock::now();
     double                           ht_gap   = 0;
     if (g_et_ht.on && g_et_ht.graphs > 0) {

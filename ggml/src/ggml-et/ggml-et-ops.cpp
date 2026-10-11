@@ -965,6 +965,7 @@ static bool ggml_et_pq2_i8_scratch(ggml_backend_et_device_context * dev_ctx, int
         return false;
     }
     ggml_et_wait_stream(dev_ctx, "pq2-i8 scratch");
+    dev_ctx->pq2_i8_src = nullptr;
     for (std::byte ** b : { &dev_ctx->pq2_i8_a8, &dev_ctx->pq2_i8_sc }) {
         if (*b) {
             runtime->freeDevice(dev_ctx->rtid, *b);
@@ -1266,9 +1267,25 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
         ip.a8   = a8;
         ip.sc   = sc;
         ip.dst  = *fused_dst;
-        kernel_name   = "mul_mat_PQ2_0_i8_engine";
-        kernel_result = ggml_et_launch_kernel(dev_ctx, "quantize_q8k_f32", &qp, sizeof(qp), 0xFFFFFFFF) &&
-                        ggml_et_launch_kernel(dev_ctx, kernel_name, &ip, sizeof(ip), 0xFFFFFFFF);
+        kernel_name = "mul_mat_PQ2_0_i8_engine";
+        // Sibling projections of one activation (gate/up, qkv/z, q/k/v) reuse its quantisation: the scratch still
+        // holds this tensor's values when it is the same node of the same graph with the same data and shape (the
+        // graph keeps an operand alive until its last consumer, and only this path writes the scratch).
+        static const bool no_reuse = [] { const char * e = getenv("GGML_ET_PQ2_I8_NO_REUSE"); return e && *e && strcmp(e, "0") != 0; }();
+        const bool reuse = !no_reuse && dev_ctx->pq2_i8_src == x8 && dev_ctx->pq2_i8_src_data == x8->data &&
+                           dev_ctx->pq2_i8_src_ne[0] == K && dev_ctx->pq2_i8_src_ne[1] == N &&
+                           dev_ctx->pq2_i8_src_nb1 == x8->nb[1] && dev_ctx->pq2_i8_src_seq == dev_ctx->graph_seq;
+        bool qok = true;
+        if (!reuse) {
+            qok = ggml_et_launch_kernel(dev_ctx, "quantize_q8k_f32", &qp, sizeof(qp), 0xFFFFFFFF);
+            dev_ctx->pq2_i8_src       = qok ? x8 : nullptr;
+            dev_ctx->pq2_i8_src_data  = x8->data;
+            dev_ctx->pq2_i8_src_ne[0] = K;
+            dev_ctx->pq2_i8_src_ne[1] = N;
+            dev_ctx->pq2_i8_src_nb1   = x8->nb[1];
+            dev_ctx->pq2_i8_src_seq   = dev_ctx->graph_seq;
+        }
+        kernel_result = qok && ggml_et_launch_kernel(dev_ctx, kernel_name, &ip, sizeof(ip), 0xFFFFFFFF);
     } else if (node->src[0]->type == GGML_TYPE_Q8_0 || strcmp(kernel_name, "mul_mat_PQ2_0") == 0 ||
         (node->src[0]->type == GGML_TYPE_Q4_0 && strcmp(kernel_name, "mul_mat_Q4_0") == 0)) {
         // Q8_0 kernel always takes the extended struct. bias.data is non-NULL

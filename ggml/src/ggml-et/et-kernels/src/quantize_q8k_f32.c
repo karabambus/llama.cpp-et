@@ -139,6 +139,59 @@ static float q8k_quant(const float * x, int8_t * qs, int16_t * bsums) {
     return q8k_div_rn(1.0f, iscale);
 }
 
+// Vector form of q8k_quant for the engine layout (no bsums), the same values: |x| max over 32 vectors (abs bits are
+// ordered like the floats for finite values), the FIRST element with that |x| found by a scalar scan, the scales by the
+// same integer divisions, then per 8 lanes fmul.ps (rne) and fcvt.pw.ps (rne), which equals the scalar product plus the
+// +12582912 trick; MIN(127, v) never binds (|RN(iscale * x)| <= 127 + 1 ulp rounds to 127), and fscb.ps stores the low
+// bytes. Expects m0 = all lanes. Every asm statement loads the constants it uses (the compiler keeps its own float
+// constants in callee-saved registers between statements), and f10 carries the running max between the max steps.
+static const int32_t __attribute__((aligned(32))) q8k_byte_offs[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+
+static float q8k_quant_vec(const float * x, int8_t * qs) {
+    __asm__ volatile("fbci.pi f10, 0\n" ::: "f10");
+    for (int v = 0; v < Q8K_QK; v += 8) {
+        __asm__ volatile("fbcx.ps f12, %[m]\n\t"
+                         "flw.ps  f11, 0(%[x])\n\t"
+                         "fand.pi f11, f11, f12\n\t"
+                         "fmax.ps f10, f10, f11\n"
+                         : : [x] "r"(x + v), [m] "r"(0x7fffffffull) : "f10", "f11", "f12", "memory");
+    }
+    uint64_t lo, hi;
+    __asm__ volatile("fswizz.ps f12, f10, 0xB1\n\t"
+                     "fmax.ps   f10, f10, f12\n\t"
+                     "fswizz.ps f12, f10, 0x4E\n\t"
+                     "fmax.ps   f10, f10, f12\n\t"
+                     "fmvz.x.ps %[lo], f10, 0\n\t"
+                     "fmvz.x.ps %[hi], f10, 4\n"
+                     : [lo] "=r"(lo), [hi] "=r"(hi) : : "f10", "f12");
+    const uint32_t best = (uint32_t) lo > (uint32_t) hi ? (uint32_t) lo : (uint32_t) hi;
+    if (best == 0) {
+        for (int j = 0; j < Q8K_QK; j += 8) ((volatile uint64_t *) qs)[j / 8] = 0;
+        return 0.0f;
+    }
+    uint32_t maxbits = 0;
+    for (int j = 0; j < Q8K_QK; ++j) {
+        const uint32_t u = q8k_f2u(x[j]);
+        if ((u & 0x7fffffffu) == best) {
+            maxbits = u;
+            break;
+        }
+    }
+    const float    iscale = q8k_div_rn(-127.0f, q8k_u2f(maxbits));
+    const uint64_t isb    = q8k_f2u(iscale);
+    for (int v = 0; v < Q8K_QK; v += 8) {
+        __asm__ volatile("fbcx.ps    f12, %[is]\n\t"
+                         "flw.ps     f13, %[o]\n\t"
+                         "flw.ps     f11, 0(%[x])\n\t"
+                         "fmul.ps    f11, f11, f12, rne\n\t"
+                         "fcvt.pw.ps f11, f11, rne\n\t"
+                         "fscb.ps    f11, f13(%[q])\n"
+                         : : [x] "r"(x + v), [q] "r"(qs + v), [is] "r"(isb), [o] "m"(*(const int32_t (*)[8]) q8k_byte_offs)
+                         : "f11", "f12", "f13", "memory");
+    }
+    return q8k_div_rn(1.0f, iscale);
+}
+
 // Engine layout (mul_mat_PQ2_0_i8_engine.c): work item = (8-token tile, 256-block); it owns the 4 lines of each of its
 // tokens' int8 rows and the tile's scale line, so every line has one writer.
 static int q8k_engine(const struct ggml_et_q8k_params * p, int thread_id, int num_threads) {
@@ -152,6 +205,8 @@ static int q8k_engine(const struct ggml_et_q8k_params * p, int thread_id, int nu
     const int64_t kb_n  = K / Q8K_QK;
     const int64_t t_n   = (N + 7) / 8;
     const int64_t items = t_n * kb_n;
+    unsigned long saved_mask;
+    __asm__ volatile("mova.x.m %0\n\tmov.m.x m0, x0, 0xFF" : "=r"(saved_mask));
     for (int64_t it = thread_id; it < items; it += num_threads) {
         const int64_t t8 = it / kb_n, kb = it % kb_n;
         uint32_t      line[16];
@@ -160,11 +215,12 @@ static int q8k_engine(const struct ggml_et_q8k_params * p, int thread_id, int nu
             const int64_t tok = t8 * 8 + tt;
             const float * x   = (const float *) ((const char *) src->data + tok * src->nb[1]) + kb * Q8K_QK;
             int8_t *      qs  = (int8_t *) ((char *) a8->data + tok * a8->nb[1]) + kb * Q8K_QK;
-            line[tt]          = q8k_f2u(q8k_quant(x, qs, (int16_t *) 0));
+            line[tt]          = q8k_f2u(q8k_quant_vec(x, qs));
         }
         volatile uint32_t * out = (volatile uint32_t *) ((char *) p->sc.data + (t8 * kb_n + kb) * 64);
         for (int i = 0; i < 16; ++i) out[i] = line[i];
     }
+    __asm__ volatile("mova.m.x %0" : : "r"(saved_mask));
     return 0;
 }
 

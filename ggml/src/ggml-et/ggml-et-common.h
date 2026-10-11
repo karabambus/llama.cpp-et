@@ -96,6 +96,13 @@ struct ggml_backend_et_device_context {
     size_t      pq2_i8_a8_bytes = 0;
     std::byte * pq2_i8_sc = nullptr;  // their per-(8-token, 256-K) scale lines
     size_t      pq2_i8_sc_bytes = 0;
+    uint64_t    graph_seq = 0;            // incremented by every graph_compute
+    // what the int8 scratch holds: the activation tensor, its data and shape, and the graph it was quantised in
+    const ggml_tensor * pq2_i8_src = nullptr;
+    const void *        pq2_i8_src_data = nullptr;
+    int64_t             pq2_i8_src_ne[2] = { 0, 0 };
+    size_t              pq2_i8_src_nb1 = 0;
+    uint64_t            pq2_i8_src_seq = 0;
 
     bool                               uberkernel_enabled = false;
     // Set per graph by graph_compute: batching is enabled AND the graph is decode-sized (token count at or under
