@@ -2886,6 +2886,11 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
                 } else if (op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op)) {
                     // F32 -> F16 conversion copy
                     supported = true;
+                } else if (op->type == GGML_TYPE_Q8_K && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+                           op->src[0]->nb[0] == sizeof(float) && op->src[0]->ne[0] % 256 == 0 &&
+                           ggml_are_same_shape(op, op->src[0])) {
+                    // F32 -> Q8_K activation quantiser (quantize_q8k_f32)
+                    supported = true;
                 } else {
                     supported = false;
                 }

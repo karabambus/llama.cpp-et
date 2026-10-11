@@ -166,6 +166,11 @@ struct ggml_et_cont_params {
     ggml_tensor dst;   // F32 output tensor (contiguous)
 };
 
+struct ggml_et_q8k_params {
+    ggml_tensor src0;  // F32, ne0 % 256 == 0
+    ggml_tensor dst;   // Q8_K, contiguous (quantize_q8k_f32.c)
+};
+
 struct ggml_et_concat_params {
     ggml_tensor src0;  // F32 input tensor 0
     ggml_tensor src1;  // F32 input tensor 1

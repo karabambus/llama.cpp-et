@@ -2965,8 +2965,8 @@ struct test_cpy : public test_case {
     }
 
     double max_nmse_err() override {
-        if (type_src == type_dst) {
-            return 0.0;
+        if (type_src == type_dst || type_dst == GGML_TYPE_Q8_K) {
+            return 0.0;  // Q8_K: the backend must reproduce quantize_row_q8_K exactly
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
@@ -9678,6 +9678,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 4, 96, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 1, true));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
+    // ET: F32 -> Q8_K (the CPU's activation quantiser) on the backend, exact: GGML_ET_TBO_Q8K=1
+    if (getenv("GGML_ET_TBO_Q8K")) {
+        for (auto ne : std::vector<std::array<int64_t, 4>>{ { 5120, 512, 1, 1 }, { 17408, 64, 1, 1 }, { 6144, 33, 1, 1 },
+                                                            { 256, 7, 1, 1 }, { 12288, 3, 2, 1 } }) {
+            test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q8_K, ne));
+        }
+    }
+
     // ET: extra MUL_MAT shapes from the environment — GGML_ET_TBO_MM_SHAPES="m,n,k[,bs0,bs1];..."
     // (type_a from GGML_ET_TBO_MM_TYPE, default q4_0). Gate for kernel paths the fixed list never
     // reaches: the Q4_0 matrix-engine REUSE (ru_n>=2) vs ORIGINAL split, partial N-tiles, deep C-scratch.

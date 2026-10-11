@@ -2246,6 +2246,16 @@ bool ggml_et_op_cpy(ggml_backend_et_device_context * dev_ctx, const ggml_tensor 
         return true;
     }
 
+    // F32 -> Q8_K: the CPU's activation quantiser, bit-exact (quantize_q8k_f32.c)
+    if (node->type == GGML_TYPE_Q8_K && node->src[0]->type == GGML_TYPE_F32) {
+        ggml_et_q8k_params qp;
+        qp.src0 = *node->src[0];
+        qp.dst  = *node;
+        const bool ok = ggml_et_launch_kernel(dev_ctx, "quantize_q8k_f32", &qp, sizeof(qp), 0xFFFFFFFF);
+        ET_PERF_END("CPY", "quantize_q8k_f32", node);
+        return ok;
+    }
+
     // Only F32 and F16 supported for dst
     if (node->type != GGML_TYPE_F32 && node->type != GGML_TYPE_F16) {
         GGML_LOG_ERROR("ET: CPY unsupported dst type: %s\n", ggml_type_name(node->type));
