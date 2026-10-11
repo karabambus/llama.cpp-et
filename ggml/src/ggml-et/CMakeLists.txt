@@ -41,6 +41,7 @@ set(KERNELS
     mul_mat_Q8_0_matrix_engine
     mul_mat_PQ2_0
     mul_mat_PQ2_0_matrix_engine
+    mul_mat_PQ2_0_i8_engine
     hadamard_f32
     mul_mat_Q4_0
     mul_mat_Q4_0_group

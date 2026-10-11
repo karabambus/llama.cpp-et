@@ -168,7 +168,15 @@ struct ggml_et_cont_params {
 
 struct ggml_et_q8k_params {
     ggml_tensor src0;  // F32, ne0 % 256 == 0
-    ggml_tensor dst;   // Q8_K, contiguous (quantize_q8k_f32.c)
+    ggml_tensor dst;   // Q8_K, contiguous (quantize_q8k_f32.c); engine mode: I8 [K, N] rows
+    ggml_tensor sc;    // engine mode: F32 scale lines, line (t8 * K/256 + kb) = tokens 8*t8 .. +7 of 256-block kb
+};
+
+struct ggml_et_pq2_i8_params {
+    ggml_tensor src0;  // PQ2_0 weights [K, M]
+    ggml_tensor a8;    // I8 activations [K, N] (quantize_q8k_f32 engine mode)
+    ggml_tensor sc;    // their scale lines
+    ggml_tensor dst;   // F32 [M, N]
 };
 
 struct ggml_et_concat_params {

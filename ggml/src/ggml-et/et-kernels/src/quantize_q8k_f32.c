@@ -24,7 +24,9 @@
 
 struct ggml_et_q8k_params {
     struct ggml_tensor src0;  // F32, ne0 % 256 == 0, unit element stride
-    struct ggml_tensor dst;   // Q8_K, contiguous, same shape
+    struct ggml_tensor dst;   // Q8_K, contiguous, same shape; engine mode: I8 [K, N] rows (64-byte aligned rows)
+    struct ggml_tensor sc;    // engine mode only: F32 lines, line (t8 * K/256 + kb) = the scales d of tokens 8*t8 .. +7
+                              // for 256-block kb (lanes past the last token zero)
 };
 
 static inline uint32_t q8k_f2u(float f) {
@@ -103,7 +105,8 @@ static inline int32_t q8k_round(float iscale, float x) {
     return (int32_t) (i & 0x007fffffu) - 0x00400000;
 }
 
-static void q8k_block(const float * x, uint8_t * blk) {
+// One 256-element block: the quants into qs, the scale returned; bsums (16 sums of 16) when bsums != NULL.
+static float q8k_quant(const float * x, int8_t * qs, int16_t * bsums) {
     uint32_t best = 0, maxbits = 0;
     for (int j = 0; j < Q8K_QK; ++j) {
         const uint32_t u = q8k_f2u(x[j]);
@@ -113,14 +116,12 @@ static void q8k_block(const float * x, uint8_t * blk) {
             maxbits = u;
         }
     }
-    float *   d     = (float *) blk;
-    int8_t *  qs    = (int8_t *) (blk + 4);
-    int16_t * bsums = (int16_t *) (blk + 4 + Q8K_QK);
     if (best == 0) {
-        *d = 0.0f;
         for (int j = 0; j < Q8K_QK; ++j) qs[j] = 0;
-        for (int j = 0; j < Q8K_QK / 16; ++j) bsums[j] = 0;
-        return;
+        if (bsums) {
+            for (int j = 0; j < Q8K_QK / 16; ++j) bsums[j] = 0;
+        }
+        return 0.0f;
     }
     const float iscale = q8k_div_rn(-127.0f, q8k_u2f(maxbits));
     for (int j = 0; j < Q8K_QK / 16; ++j) {
@@ -131,9 +132,45 @@ static void q8k_block(const float * x, uint8_t * blk) {
             qs[j * 16 + i] = (int8_t) v;
             sum += v;
         }
-        bsums[j] = (int16_t) sum;
+        if (bsums) {
+            bsums[j] = (int16_t) sum;
+        }
     }
-    *d = q8k_div_rn(1.0f, iscale);
+    return q8k_div_rn(1.0f, iscale);
+}
+
+// Engine layout (mul_mat_PQ2_0_i8_engine.c): work item = (8-token tile, 256-block); it owns the 4 lines of each of its
+// tokens' int8 rows and the tile's scale line, so every line has one writer.
+static int q8k_engine(const struct ggml_et_q8k_params * p, int thread_id, int num_threads) {
+    const struct ggml_tensor * src = &p->src0;
+    const struct ggml_tensor * a8  = &p->dst;
+    const int64_t K = src->ne[0], N = src->ne[1];
+    if (a8->ne[0] != K || a8->ne[1] != N || src->ne[2] != 1 || src->ne[3] != 1 || (a8->nb[1] % 64) != 0 ||
+        ((uint64_t) a8->data % 64) != 0 || !p->sc.data || ((uint64_t) p->sc.data % 64) != 0) {
+        return -1;
+    }
+    const int64_t kb_n  = K / Q8K_QK;
+    const int64_t t_n   = (N + 7) / 8;
+    const int64_t items = t_n * kb_n;
+    for (int64_t it = thread_id; it < items; it += num_threads) {
+        const int64_t t8 = it / kb_n, kb = it % kb_n;
+        uint32_t      line[16];
+        for (int i = 0; i < 16; ++i) line[i] = 0;
+        for (int64_t tt = 0; tt < 8 && t8 * 8 + tt < N; ++tt) {
+            const int64_t tok = t8 * 8 + tt;
+            const float * x   = (const float *) ((const char *) src->data + tok * src->nb[1]) + kb * Q8K_QK;
+            int8_t *      qs  = (int8_t *) ((char *) a8->data + tok * a8->nb[1]) + kb * Q8K_QK;
+            line[tt]          = q8k_f2u(q8k_quant(x, qs, (int16_t *) 0));
+        }
+        volatile uint32_t * out = (volatile uint32_t *) ((char *) p->sc.data + (t8 * kb_n + kb) * 64);
+        for (int i = 0; i < 16; ++i) out[i] = line[i];
+    }
+    return 0;
+}
+
+static void q8k_block(const float * x, uint8_t * blk) {
+    const float d = q8k_quant(x, (int8_t *) (blk + 4), (int16_t *) (blk + 4 + Q8K_QK));
+    *(float *) blk = d;
 }
 
 int entry_point(struct ggml_et_q8k_params * params, void * env) {
@@ -149,6 +186,10 @@ int entry_point(struct ggml_et_q8k_params * params, void * env) {
 
     const struct ggml_tensor * src = &params->src0;
     const struct ggml_tensor * dst = &params->dst;
+    if (src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I8 && src->nb[0] == sizeof(float) && src->ne[0] % Q8K_QK == 0 &&
+        src->data && dst->data) {
+        return q8k_engine(params, thread_id, num_threads);
+    }
     if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_Q8_K || !src->data || !dst->data ||
         src->nb[0] != sizeof(float) || src->ne[0] % Q8K_QK != 0 || dst->ne[0] != src->ne[0] ||
         dst->ne[1] != src->ne[1] || dst->ne[2] != src->ne[2] || dst->ne[3] != src->ne[3] ||

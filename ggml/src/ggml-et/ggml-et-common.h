@@ -92,6 +92,10 @@ struct ggml_backend_et_device_context {
     std::byte * pq2_tail_scratch = nullptr;  // PQ2_0 GEMV K-split tail records (zeroed once), see mul_mat_PQ2_0.c
     uint32_t    pq2_tail_gen     = 0;        // generation of the last launch that used it
     std::byte * f32_ksplit_scratch = nullptr;  // mul_mat_f32 K-split row records (zeroed once), see mul_mat_f32.c
+    std::byte * pq2_i8_a8 = nullptr;  // int8 activations of the PQ2_0 int8 engine (quantize_q8k_f32 engine mode)
+    size_t      pq2_i8_a8_bytes = 0;
+    std::byte * pq2_i8_sc = nullptr;  // their per-(8-token, 256-K) scale lines
+    size_t      pq2_i8_sc_bytes = 0;
 
     bool                               uberkernel_enabled = false;
     // Set per graph by graph_compute: batching is enabled AND the graph is decode-sized (token count at or under

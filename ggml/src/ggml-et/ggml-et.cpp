@@ -588,6 +588,13 @@ static void ggml_backend_et_free(ggml_backend_t backend) {
                 runtime->freeDevice(dev_ctx->rtid, dev_ctx->f32_ksplit_scratch);
                 dev_ctx->f32_ksplit_scratch = nullptr;
             }
+            for (std::byte ** b : { &dev_ctx->pq2_i8_a8, &dev_ctx->pq2_i8_sc }) {
+                if (*b) {
+                    runtime->freeDevice(dev_ctx->rtid, *b);
+                    *b = nullptr;
+                }
+            }
+            dev_ctx->pq2_i8_a8_bytes = dev_ctx->pq2_i8_sc_bytes = 0;
             for (auto & slot : dev_ctx->uberkernel.slots) {
                 if (slot.device_insts) {
                     runtime->freeDevice(dev_ctx->rtid, slot.device_insts);

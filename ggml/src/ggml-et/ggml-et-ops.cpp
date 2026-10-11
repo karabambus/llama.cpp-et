@@ -945,6 +945,45 @@ static bool ggml_et_engine_operand_aligned(const ggml_tensor * t) {
 // Token count from which PQ2_0 matmuls run on the tensor engine instead of the vector GEMV. The GEMV costs one weight pass
 // per column pair, the engine about the same at any N below a few tiles; they cross at N = 21-22 on the Bonsai shapes
 // (r288: [17408,5120] 3.49 vs 4.66 ms at 16, 5.21 vs 4.81 at 24).
+// PQ2_0 int8 engine (PP100_PLAN.md F2): the activation is quantised to the CPU's Q8_K values (quantize_q8k_f32 engine
+// mode) into device scratch, then mul_mat_PQ2_0_i8_engine multiplies the int8 values on the tensor engine. Both are
+// standalone launches, so the firmware publishes the quantised activation between them. GGML_ET_PQ2_I8=0 keeps the
+// fp32 engine. The scratch grows to the largest [K, N] seen (after draining the stream, so no launch still uses it).
+static bool ggml_et_pq2_i8_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_ET_PQ2_I8"); return !(e && *e && strcmp(e, "0") == 0); }();
+    return on;
+}
+
+static bool ggml_et_pq2_i8_scratch(ggml_backend_et_device_context * dev_ctx, int64_t K, int64_t N) {
+    const size_t a8_bytes = (size_t) K * (size_t) N;
+    const size_t sc_bytes = (size_t) ((N + 7) / 8) * (size_t) (K / 256) * 64;
+    if (dev_ctx->pq2_i8_a8 && dev_ctx->pq2_i8_a8_bytes >= a8_bytes && dev_ctx->pq2_i8_sc_bytes >= sc_bytes) {
+        return true;
+    }
+    std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+    if (!runtime) {
+        return false;
+    }
+    ggml_et_wait_stream(dev_ctx, "pq2-i8 scratch");
+    for (std::byte ** b : { &dev_ctx->pq2_i8_a8, &dev_ctx->pq2_i8_sc }) {
+        if (*b) {
+            runtime->freeDevice(dev_ctx->rtid, *b);
+            *b = nullptr;
+        }
+    }
+    const size_t a8_cap = std::max(a8_bytes, (size_t) 17408 * 512);
+    const size_t sc_cap = std::max(sc_bytes, (size_t) 64 * 68 * 64);
+    dev_ctx->pq2_i8_a8  = runtime->mallocDevice(dev_ctx->rtid, a8_cap);
+    dev_ctx->pq2_i8_sc  = runtime->mallocDevice(dev_ctx->rtid, sc_cap);
+    if (!dev_ctx->pq2_i8_a8 || !dev_ctx->pq2_i8_sc) {
+        dev_ctx->pq2_i8_a8_bytes = dev_ctx->pq2_i8_sc_bytes = 0;
+        return false;
+    }
+    dev_ctx->pq2_i8_a8_bytes = a8_cap;
+    dev_ctx->pq2_i8_sc_bytes = sc_cap;
+    return true;
+}
+
 static int64_t ggml_et_pq2_engine_min_n() {
     static const int64_t v = [] {
         const char * e = getenv("GGML_ET_PQ2_ENGINE_MIN_N");
@@ -1201,7 +1240,36 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
     }
 
     bool kernel_result;
-    if (node->src[0]->type == GGML_TYPE_Q8_0 || strcmp(kernel_name, "mul_mat_PQ2_0") == 0 ||
+    const ggml_tensor * w8 = node->src[0];
+    const ggml_tensor * x8 = node->src[1];
+    if (strcmp(kernel_name, "mul_mat_PQ2_0_matrix_engine") == 0 && ggml_et_pq2_i8_enabled() && !bias_tensor &&
+        w8->ne[0] % 256 == 0 && w8->ne[2] == 1 && w8->ne[3] == 1 && x8->ne[2] == 1 && x8->ne[3] == 1 &&
+        x8->nb[0] == sizeof(float) && fused_dst->nb[0] == sizeof(float) &&
+        ggml_et_pq2_i8_scratch(dev_ctx, w8->ne[0], x8->ne[1])) {
+        const int64_t K = w8->ne[0], N = x8->ne[1];
+        ggml_tensor   a8 = *x8;
+        a8.type  = GGML_TYPE_I8;
+        a8.data  = dev_ctx->pq2_i8_a8;
+        a8.ne[0] = K; a8.ne[1] = N; a8.ne[2] = 1; a8.ne[3] = 1;
+        a8.nb[0] = 1; a8.nb[1] = (size_t) K; a8.nb[2] = a8.nb[3] = (size_t) K * N;
+        ggml_tensor sc = *x8;
+        sc.type  = GGML_TYPE_F32;
+        sc.data  = dev_ctx->pq2_i8_sc;
+        sc.ne[0] = 16; sc.ne[1] = ((N + 7) / 8) * (K / 256); sc.ne[2] = 1; sc.ne[3] = 1;
+        sc.nb[0] = 4; sc.nb[1] = 64; sc.nb[2] = sc.nb[3] = 64 * (size_t) sc.ne[1];
+        ggml_et_q8k_params qp{};
+        qp.src0 = *x8;
+        qp.dst  = a8;
+        qp.sc   = sc;
+        ggml_et_pq2_i8_params ip{};
+        ip.src0 = *w8;
+        ip.a8   = a8;
+        ip.sc   = sc;
+        ip.dst  = *fused_dst;
+        kernel_name   = "mul_mat_PQ2_0_i8_engine";
+        kernel_result = ggml_et_launch_kernel(dev_ctx, "quantize_q8k_f32", &qp, sizeof(qp), 0xFFFFFFFF) &&
+                        ggml_et_launch_kernel(dev_ctx, kernel_name, &ip, sizeof(ip), 0xFFFFFFFF);
+    } else if (node->src[0]->type == GGML_TYPE_Q8_0 || strcmp(kernel_name, "mul_mat_PQ2_0") == 0 ||
         (node->src[0]->type == GGML_TYPE_Q4_0 && strcmp(kernel_name, "mul_mat_Q4_0") == 0)) {
         // Q8_0 kernel always takes the extended struct. bias.data is non-NULL
         // only on the fused path; otherwise the kernel skips the add entirely.
@@ -2248,7 +2316,7 @@ bool ggml_et_op_cpy(ggml_backend_et_device_context * dev_ctx, const ggml_tensor 
 
     // F32 -> Q8_K: the CPU's activation quantiser, bit-exact (quantize_q8k_f32.c)
     if (node->type == GGML_TYPE_Q8_K && node->src[0]->type == GGML_TYPE_F32) {
-        ggml_et_q8k_params qp;
+        ggml_et_q8k_params qp{};
         qp.src0 = *node->src[0];
         qp.dst  = *node;
         const bool ok = ggml_et_launch_kernel(dev_ctx, "quantize_q8k_f32", &qp, sizeof(qp), 0xFFFFFFFF);
