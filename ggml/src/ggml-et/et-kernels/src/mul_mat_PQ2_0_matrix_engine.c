@@ -71,84 +71,71 @@
 // Dequantize 32 elements (panel kb_panel = quarter kb_panel % 4 of block kb_panel / 4) of TILE_M weight rows into
 // the FP32 panel, written directly in TenB [k][m] order: panel[k*TILE_M + m].
 //
-// Per row: four groups of 8 elements; a byte gather with the pattern {0,0,0,0,1,1,1,1} puts code bytes 2g and 2g+1
-// into lanes 0..3 and 4..7, a per-lane shift by {0,2,4,6,0,2,4,6} and a mask of 3 leave each lane's 2-bit code,
-// (q - 1) * d gives the weight, and fscw.ps scatters the 8 values down 8 panel lines (stride 64 B) at column m.
+// Per half-tile of 8 rows and per code byte b (elements 4b..4b+3): one byte gather across the 8 rows (offsets
+// l * nb1_0), then for each 2-bit field a shift, a mask of 3, (q - 1) * d with the rows' own scales in the lanes, and one
+// contiguous 32-byte store into panel line 4b + j, columns 8h..8h+7. Every panel line is written by two whole-half
+// stores; a column-wise scatter down 8 lines per 8 values cost far more (the engine step is producer-bound, r276).
 // The fp16 scale is converted in integer code (fcvt.ps.f16 flushes subnormal halves, KB 02 section 5.1).
 static inline void __attribute__((always_inline))
 dequant_pq2_0_panel(float *panel, const char *src0_batch,
                     int64_t mb, int64_t kb_panel, int64_t nb1_0) {
-    static const int32_t __attribute__((aligned(32))) scatter_idx[8] = {
-        0, 64, 128, 192, 256, 320, 384, 448   // byte offsets: 8 lines apart
-    };
-    static const int32_t __attribute__((aligned(32))) gather_idx[8] = {
-        0, 0, 0, 0, 1, 1, 1, 1                 // two code bytes, four elements each
-    };
-    static const int32_t __attribute__((aligned(32))) shift_amt[8] = {
-        0, 2, 4, 6, 0, 2, 4, 6
-    };
+    int32_t  __attribute__((aligned(32))) row_off[8];
+    uint32_t __attribute__((aligned(32))) scale_bits[8];
+    for (int l = 0; l < 8; ++l) {
+        row_off[l] = (int32_t) (l * nb1_0);
+    }
 
     unsigned long old_mask;
     __asm__ volatile(
         "mova.x.m  %[ms]            \n\t"
         "mov.m.x   m0, x0, 0xFF     \n\t"   // all 8 lanes active
-        "flw.ps    f1, (%[sidx])    \n\t"   // f1 = scatter offsets
-        "flw.ps    f2, (%[gidx])    \n\t"   // f2 = gather offsets
-        "flw.ps    f7, (%[shft])    \n\t"   // f7 = per-lane shift amounts
         : [ms] "=&r"(old_mask)
-        : [sidx] "r"(scatter_idx), [gidx] "r"(gather_idx), [shft] "r"(shift_amt)
-        : "f1", "f2", "f7"
     );
 
-    char *pbase = (char *) panel;
-    for (int j = 0; j < TILE_M; ++j) {
-        const block_pq2_0 *blk =
-            (const block_pq2_0 *)(src0_batch + (mb + j) * nb1_0) + (kb_panel >> 2);
-        const uint32_t scale_bits = fp16_to_fp32_bits(blk->d);
-        const uint8_t *qs = blk->qs + (kb_panel & 3) * 8;
-        char *col = pbase + j * 4;           // column m=j of the panel
+    for (int h = 0; h < 2; ++h) {
+        const block_pq2_0 *blk0 = (const block_pq2_0 *)(src0_batch + (mb + 8 * h) * nb1_0) + (kb_panel >> 2);
+        for (int l = 0; l < 8; ++l) {
+            scale_bits[l] = fp16_to_fp32_bits(((const block_pq2_0 *)((const char *) blk0 + l * nb1_0))->d);
+        }
+        const uint8_t *qs  = blk0->qs + (kb_panel & 3) * 8;
+        char          *col = (char *) panel + h * 32;
+        for (int b = 0; b < 8; ++b) {
+            __asm__ volatile(
+                "flw.ps      f1, (%[ro])    \n\t"   // f1 = row offsets l * nb1_0
+                "flw.ps      f3, (%[sc])    \n\t"   // f3 = the 8 rows' scales
+                "fgb.ps      f4, f1(%[q])   \n\t"   // code byte b of each row (4 elements)
 
-        __asm__ volatile(
-            "fbcx.ps     f3, %[sb]      \n\t"   // broadcast d (fp32 bits) to all 8 lanes
+                "fandi.pi    f5, f4, 3      \n\t"   // element 4b
+                "faddi.pi    f5, f5, -1     \n\t"
+                "fcvt.ps.pw  f5, f5, rne    \n\t"
+                "fmul.ps     f5, f5, f3     \n\t"
+                "fsw.ps      f5, 0(%[c])    \n\t"
 
-            "fgb.ps      f4, f2(%[q0])  \n\t"   // elements 0..7  (bytes 0, 1)
-            "fsrl.pi     f5, f4, f7     \n\t"
-            "fandi.pi    f5, f5, 3      \n\t"
-            "faddi.pi    f5, f5, -1     \n\t"
-            "fcvt.ps.pw  f5, f5, rne    \n\t"
-            "fmul.ps     f5, f5, f3     \n\t"
-            "fscw.ps     f5, f1(%[c0])  \n\t"   // k=0..7   -> lines 0..7
+                "fsrli.pi    f5, f4, 2      \n\t"   // element 4b+1
+                "fandi.pi    f5, f5, 3      \n\t"
+                "faddi.pi    f5, f5, -1     \n\t"
+                "fcvt.ps.pw  f5, f5, rne    \n\t"
+                "fmul.ps     f5, f5, f3     \n\t"
+                "fsw.ps      f5, 64(%[c])   \n\t"
 
-            "fgb.ps      f4, f2(%[q2])  \n\t"   // elements 8..15 (bytes 2, 3)
-            "fsrl.pi     f5, f4, f7     \n\t"
-            "fandi.pi    f5, f5, 3      \n\t"
-            "faddi.pi    f5, f5, -1     \n\t"
-            "fcvt.ps.pw  f5, f5, rne    \n\t"
-            "fmul.ps     f5, f5, f3     \n\t"
-            "fscw.ps     f5, f1(%[c8])  \n\t"   // k=8..15  -> lines 8..15
+                "fsrli.pi    f5, f4, 4      \n\t"   // element 4b+2
+                "fandi.pi    f5, f5, 3      \n\t"
+                "faddi.pi    f5, f5, -1     \n\t"
+                "fcvt.ps.pw  f5, f5, rne    \n\t"
+                "fmul.ps     f5, f5, f3     \n\t"
+                "fsw.ps      f5, 128(%[c])  \n\t"
 
-            "fgb.ps      f4, f2(%[q4])  \n\t"   // elements 16..23 (bytes 4, 5)
-            "fsrl.pi     f5, f4, f7     \n\t"
-            "fandi.pi    f5, f5, 3      \n\t"
-            "faddi.pi    f5, f5, -1     \n\t"
-            "fcvt.ps.pw  f5, f5, rne    \n\t"
-            "fmul.ps     f5, f5, f3     \n\t"
-            "fscw.ps     f5, f1(%[c16]) \n\t"   // k=16..23 -> lines 16..23
-
-            "fgb.ps      f4, f2(%[q6])  \n\t"   // elements 24..31 (bytes 6, 7)
-            "fsrl.pi     f5, f4, f7     \n\t"
-            "fandi.pi    f5, f5, 3      \n\t"
-            "faddi.pi    f5, f5, -1     \n\t"
-            "fcvt.ps.pw  f5, f5, rne    \n\t"
-            "fmul.ps     f5, f5, f3     \n\t"
-            "fscw.ps     f5, f1(%[c24]) \n\t"   // k=24..31 -> lines 24..31
-            :
-            : [sb] "r"(scale_bits),
-              [q0] "r"(qs), [q2] "r"(qs + 2), [q4] "r"(qs + 4), [q6] "r"(qs + 6),
-              [c0] "r"(col), [c8] "r"(col + 8 * 64),
-              [c16] "r"(col + 16 * 64), [c24] "r"(col + 24 * 64)
-            : "f3", "f4", "f5", "memory"
-        );
+                "fsrli.pi    f5, f4, 6      \n\t"   // element 4b+3
+                "fandi.pi    f5, f5, 3      \n\t"
+                "faddi.pi    f5, f5, -1     \n\t"
+                "fcvt.ps.pw  f5, f5, rne    \n\t"
+                "fmul.ps     f5, f5, f3     \n\t"
+                "fsw.ps      f5, 192(%[c])  \n\t"
+                :
+                : [ro] "r"(row_off), [sc] "r"(scale_bits), [q] "r"(qs + b), [c] "r"(col + b * 4 * 64)
+                : "f1", "f3", "f4", "f5", "memory"
+            );
+        }
     }
 
     __asm__ volatile("mova.m.x %0" :: "r"(old_mask));
