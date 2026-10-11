@@ -153,7 +153,7 @@ struct ggml_et_flash_attn_ext_params {
     ggml_tensor dst;       // Output tensor (F32)
     float       scale;     // Scale factor applied to QK
     int32_t     has_mask;  // nonzero if mask is present
-    int32_t     gqa_tiles; // nonzero: batches of >= 16 queries may take the GQA tile path (GGML_ET_FA_GQA=0 disables)
+    int32_t     gqa_tiles; // nonzero: batches of >= 64 queries may take the GQA tile path (GGML_ET_FA_GQA=0 disables)
 };
 
 struct ggml_et_get_rows_params {

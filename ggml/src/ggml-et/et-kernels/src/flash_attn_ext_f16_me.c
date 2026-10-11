@@ -388,7 +388,9 @@ static inline void __attribute__((always_inline)) merge_rescale_add_asm(float * 
 //******************************************************************************
 
 #define GQ_LANES  8   // lanes of one position's half of the tile (b_num_col 3: 16 columns = two halves)
-#define GQ_MIN_NQ 16  // smaller batches (decode, MTP verification) keep the row path and its KV split
+#define GQ_MIN_NQ 64  // smaller batches keep the row path and its KV split: without a split the GQA path walks a
+                      // team's whole KV on one minion, which loses below about 48 queries (r324: N = 16 at 8.7 k positions 46 ms
+                      // against the row path's 15.6)
 
 // L1 scratchpad lines
 #define GQ_KB0 0   // K chunk buffer 0 (A, load id 0)
