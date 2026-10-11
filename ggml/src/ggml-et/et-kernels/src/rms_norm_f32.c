@@ -85,9 +85,14 @@ int entry_point(struct ggml_et_rms_norm_params * params, void * env) {
 
     if (total_rows >= shire_threads) {
         // Row-parallel: each thread processes whole rows
-        for (int64_t i3 = 0; i3 < ne3; i3++) {
-            for (int64_t i2 = 0; i2 < ne2; i2++) {
-                for (int64_t i1 = thread_id; i1 < ne1; i1 += num_threads) {
+        // One flat row index over every hart: striding ne1 alone left a per-head norm ([d, heads, tokens]) on as many
+        // harts as heads, each walking all tokens (9 ms per prefill launch with 24 heads).
+        for (int64_t row = thread_id; row < (int64_t) total_rows; row += num_threads) {
+            {
+                {
+                    const int64_t i1 = row % ne1;
+                    const int64_t i2 = (row / ne1) % ne2;
+                    const int64_t i3 = row / (ne1 * ne2);
                     const float * src_ptr =
                         (const float *) ((const char *) src0_data + i3 * nb03 + i2 * nb02 + i1 * nb01);
                     float * dst_ptr = (float *) ((char *) dst_data + i3 * nb3 + i2 * nb2 + i1 * nb1);
