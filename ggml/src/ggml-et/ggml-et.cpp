@@ -1661,6 +1661,7 @@ static ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, ggml_cg
             gdn_fold_skip = nullptr;
             continue;
         }
+        ggml_et_uberkernel_set_node(node);
 
         // --- Fusion checks (before regular dispatch) ---
         {

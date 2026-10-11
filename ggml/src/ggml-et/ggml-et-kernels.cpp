@@ -46,6 +46,34 @@ static std::map<std::string, std::pair<uint64_t, uint64_t>> g_uk_prof;  // kerne
 static uint64_t g_uk_prof_bad = 0;  // segments whose stamps were unwritten or not monotonic
 static_assert(sizeof(ggml_et_uberkernel_params) == 40, "host/device params layout");
 static const bool g_uk_stats_on = [] { const char * e = getenv("GGML_ET_UBERKERNEL_STATS"); return e && *e && strcmp(e, "0") != 0; }();
+static const bool g_uk_prof_on = [] { const char * e = getenv("GGML_ET_UK_PROFILE"); return e && *e && strcmp(e, "0") != 0; }();
+// GGML_ET_UK_PROFILE_NODES=1 appends "@<node>" to each profile row (the layer suffix "-<il>" dropped; 2 keeps it).
+// GGML_ET_UK_PROFILE_SEQ=1 also prints every instruction of every profiled segment in issue order, with the layer.
+static const int g_uk_prof_nodes = [] { const char * e = getenv("GGML_ET_UK_PROFILE_NODES"); return (e && *e) ? atoi(e) : 0; }();
+static const bool g_uk_prof_seq = [] { const char * e = getenv("GGML_ET_UK_PROFILE_SEQ"); return e && *e && strcmp(e, "0") != 0; }();
+static const bool g_uk_names_on = g_uk_prof_on && (g_uk_prof_nodes > 0 || g_uk_prof_seq);
+static const ggml_tensor * g_uk_cur_node = nullptr;
+static uint64_t g_uk_prof_graph = 0;
+
+void ggml_et_uberkernel_set_node(const ggml_tensor * node) {
+    g_uk_cur_node = node;
+}
+
+static std::string ggml_et_uk_node_name() {
+    std::string n = (g_uk_cur_node && g_uk_cur_node->name[0]) ? g_uk_cur_node->name : "?";
+    for (auto & c : n) {
+        if (c == ' ') { c = '_'; }
+    }
+    return n;
+}
+
+static std::string ggml_et_uk_strip_layer(std::string n) {
+    const size_t d = n.find_last_of('-');
+    if (d != std::string::npos && d + 1 < n.size() && n.find_first_not_of("0123456789", d + 1) == std::string::npos) {
+        n.resize(d);
+    }
+    return n;
+}
 
 static ggml_backend_et_uberkernel_slot & ggml_et_uberkernel_current_slot(ggml_backend_et_uberkernel_context * uk_ctx) {
     return uk_ctx->slots[uk_ctx->current_slot];
@@ -75,6 +103,7 @@ static void ggml_et_uberkernel_reset_segment(ggml_backend_et_uberkernel_context 
     ggml_et_uberkernel_slot_wait(slot, ggml_et_runtime());
     slot.insts.clear();
     slot.params_blob.clear();
+    slot.inst_names.clear();
 }
 
 static bool ggml_et_uberkernel_ensure_slot_capacity(ggml_backend_et_uberkernel_slot & slot,
@@ -438,6 +467,7 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
             // host vectors into the next graph.
             slot.insts.clear();
             slot.params_blob.clear();
+            slot.inst_names.clear();
             uk_ctx->shire_mask = 0;
             return false;
         }
@@ -451,10 +481,7 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
         runtime->memcpyHostToDevice(dev_ctx->default_stream, slot.params_blob.data(), slot.device_params, params_size,
                                     true);
 
-        static const bool uk_prof_on = [] {
-            const char * e = getenv("GGML_ET_UK_PROFILE");
-            return e && *e && strcmp(e, "0") != 0;
-        }();
+        const bool uk_prof_on = g_uk_prof_on;
         const size_t prof_size = (slot.insts.size() + 1) * sizeof(uint64_t);
         if (uk_prof_on && (slot.device_prof == nullptr || prof_size > slot.device_prof_capacity)) {
             const size_t new_capacity = ggml_et_next_capacity(slot.device_prof_capacity, prof_size);
@@ -521,6 +548,13 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
                         key += "[" + std::to_string(gp->src0.ne[1]) + "x" + std::to_string(gp->src0.ne[0]) + "," +
                                std::to_string(gp->src1.ne[0] * gp->src1.ne[1] * gp->src1.ne[2]) + "]";
                     }
+                    if (g_uk_prof_seq && i < slot.inst_names.size()) {
+                        fprintf(stderr, "ET-UK-SEQ g=%llu i=%zu cycles=%llu %s@%s\n", (unsigned long long) g_uk_prof_graph, i,
+                                (unsigned long long) (stamps[i + 1] - stamps[i]), key.c_str(), slot.inst_names[i].c_str());
+                    }
+                    if (g_uk_prof_nodes > 0 && i < slot.inst_names.size()) {
+                        key += "@" + (g_uk_prof_nodes < 2 ? ggml_et_uk_strip_layer(slot.inst_names[i]) : slot.inst_names[i]);
+                    }
                     auto & acc = g_uk_prof[key];
                     acc.first++;
                     acc.second += stamps[i + 1] - stamps[i];
@@ -546,9 +580,11 @@ static bool ggml_et_launch_uberkernel_segment(ggml_backend_et_device_context *  
         ggml_et_uberkernel_slot_wait(next, runtime);
         next.insts.clear();
         next.params_blob.clear();
+        next.inst_names.clear();
     } else {
         slot.insts.clear();
         slot.params_blob.clear();
+        slot.inst_names.clear();
     }
     uk_ctx->shire_mask = 0;
     return ok;
@@ -602,6 +638,9 @@ bool ggml_et_uberkernel_add_input_copy(ggml_backend_et_device_context * dev_ctx,
     ggml_et_uberkernel_inst inst = { (uint16_t) GGML_ET_UBERKERNEL_INPUT_COPY, 0, (uint32_t) params_offset,
                                      (uint32_t) blob.size() };
     slot.insts.push_back(inst);
+    if (g_uk_names_on) {
+        slot.inst_names.push_back("input_copy");
+    }
     uk_ctx->shire_mask = 0xFFFFFFFFULL;
     g_uk_stats.insts++;
     return true;
@@ -702,6 +741,9 @@ static bool ggml_et_launch_uberkernel(ggml_backend_et_device_context * dev_ctx,
         static_cast<uint32_t>(params_size),
     };
     slot.insts.push_back(inst);
+    if (g_uk_names_on) {
+        slot.inst_names.push_back(ggml_et_uk_node_name());
+    }
 
     if (slot.insts.size() == 1) {
         uk_ctx->shire_mask = shire_mask;
@@ -764,6 +806,7 @@ bool ggml_et_uberkernel_end_graph(ggml_backend_et_device_context * dev_ctx) {
         }
         g_uk_prof.clear();
         g_uk_prof_bad = 0;
+        g_uk_prof_graph++;
     }
     return ok;
 }

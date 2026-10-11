@@ -47,6 +47,7 @@ struct ggml_backend_et_uberkernel_slot {
     size_t      device_params_capacity = 0;
     std::byte * device_prof            = nullptr;  // GGML_ET_UK_PROFILE stamps, (num_insts + 1) * 8 bytes
     size_t      device_prof_capacity   = 0;
+    std::vector<std::string> inst_names;  // graph node of each instruction (GGML_ET_UK_PROFILE_NODES only)
 
     rt::EventId pending_event{};
     bool        has_pending = false;
