@@ -73,7 +73,7 @@ struct ggml_et_flash_attn_ext_params {
     struct ggml_tensor dst;   // Output (F32)
     float              scale;
     int32_t            has_mask;
-    int32_t            gqa_tiles;  // nonzero: batches of >= GQ_MIN_NQ queries may take the GQA tile path
+    int32_t            gqa_tiles;  // GQA tile path: 0 off, 1 batches >= GQ_MIN_NQ, 2 >= 2 queries with KV split, 3 every batch
 };
 
 static inline float get_mask_val(const struct ggml_tensor * mask, int64_t iq1, int64_t ik1, int64_t iq2, int64_t iq3) {
@@ -436,7 +436,10 @@ static inline int fa_gqa_eligible(const struct ggml_et_flash_attn_ext_params * p
         return 0;
     }
     const int64_t gqa = q->ne[2] / k->ne[2];
-    if (gqa < 2 || gqa > GQ_LANES || (p->gqa_tiles != 2 && q->ne[1] < GQ_MIN_NQ)) {
+    // mode 1: >= GQ_MIN_NQ queries; mode 2: >= 2 (single-token decode keeps the row path, which spreads one position
+    // over 24 shires where the split GQA path would use 4); mode 3: every batch
+    const int64_t min_nq = p->gqa_tiles == 3 ? 1 : p->gqa_tiles == 2 ? 2 : GQ_MIN_NQ;
+    if (gqa < 2 || gqa > GQ_LANES || q->ne[1] < min_nq) {
         return 0;
     }
     if (q->ne[0] % TILE_K != 0 || q->ne[0] > FA_DK_MAX || v->ne[0] % 16 != 0 || v->ne[0] > FA_DV_MAX) {
@@ -1399,7 +1402,7 @@ static int fa_gqa_tiles(struct ggml_et_flash_attn_ext_params * params, uint64_t 
     // ks members per team, as the row path picks its split: minimise passes x (tiles per member + one for the merge).
     // Mode 1 keeps ks = 1 (each team's whole KV on one minion: no merge, no barrier).
     int64_t ks = 1;
-    if (params->gqa_tiles == 2) {
+    if (params->gqa_tiles >= 2) {
         int64_t best = -1;
         for (int64_t s = 1; s <= MINIONS_PER_SHIRE && s <= nk_tiles; s *= 2) {
             const int64_t passes = (n_teams * s + NUM_COMPUTE_SHIRES * MINIONS_PER_SHIRE - 1) /
