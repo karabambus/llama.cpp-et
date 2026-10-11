@@ -148,6 +148,46 @@ static uint32_t uk_flags_all;
         }                                                                   \
     } while (0)
 
+// Chip-wide barrier between instructions, with a tree release. FLB elects one hart per shire; the elected harts count
+// in on a global counter; the last one resets it and credits the root shire only, and every released shire's hart 0
+// then credits up to UK_TREE_FANOUT child shires (ranks K*r+1 .. K*r+K of the 32 launch shires). The flat release of
+// et_barrier_global has one hart issue 66 fcc_send stores in a row (33 shires x 2 threads, the master shire included)
+// while all harts wait, and it measured 16 us per barrier (r295: tg128 4.88 -> 4.33 with every barrier doubled).
+// Every launch shire gets exactly one credit per barrier: the root from the last arriver, every other rank from its
+// parent, each parent only after its own release. A surplus credit would survive into the next barrier and release a
+// shire early; a missing one hangs. Shires outside the launch (the master shire) get none. Uses FLB 0 and FCC_1 like
+// et_barrier_global; kernels' intra-minion semaphores use FCC_0.
+#ifndef UK_TREE_FANOUT
+#define UK_TREE_FANOUT 3
+#endif
+#define UK_LAUNCH_SHIRES 32ULL
+// Pinned to .data so it starts at zero (KB 04 U1: .bss is NOLOAD).
+static uint32_t __attribute__((aligned(64), section(".data"))) uk_barrier_count[64 / sizeof(uint32_t)] = { 0 };
+
+static inline void __attribute__((always_inline)) uk_barrier_tree(void) {
+    const uint64_t shire_id = get_shire_id();
+    if (flbarrier(0, SOC_MINIONS_PER_SHIRE * NUM_HARTS_PER_MINION - 1)) {
+        if (et_global_add_w(uk_barrier_count, 1) == UK_LAUNCH_SHIRES - 1) {
+            // Reset before any release: a released shire can reach the next barrier's add while the tree still fans out.
+            et_global_swap_w(uk_barrier_count, 0);
+            FENCE;
+            fcc_send(0, THREAD_0, FCC_1, 0xFFFFFFFF);
+            fcc_send(0, THREAD_1, FCC_1, 0xFFFFFFFF);
+        }
+    }
+    // Children of this shire's rank (= shire id: the launch covers shires 0..31), resolved before blocking.
+    const int      forwarder   = (get_hart_id() & 0x3Fu) == 0u;
+    const uint64_t first_child = (uint64_t) UK_TREE_FANOUT * shire_id + 1ULL;
+    fcc_consume(FCC_1);
+    __asm__ __volatile__("" ::: "memory");  // keep the forwarding stores after the credit wait
+    if (forwarder) {
+        for (uint64_t c = first_child; c < first_child + UK_TREE_FANOUT && c < UK_LAUNCH_SHIRES; ++c) {
+            fcc_send(c, THREAD_0, FCC_1, 0xFFFFFFFF);
+            fcc_send(c, THREAD_1, FCC_1, 0xFFFFFFFF);
+        }
+    }
+}
+
 static inline void uk_evict_region(const void * addr, size_t bytes) {
     if (!addr || bytes == 0 || (uk_flags_all & 2u)) {
         return;
@@ -397,7 +437,7 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
     // incoherent (L2 is per shire), so before every instruction EVERY hart (1) drains its store buffer, (2) evicts
     // the instruction's *writable* inputs from its own L1+L2 to L3/DRAM - on the producing shires this writes back
     // what they computed, on the consuming shires it drops stale copies of a reused buffer - (3) waits for its
-    // cache ops, and (4) takes the chip-wide barrier, so no shire reads before every shire has published.
+    // cache ops, and (4) takes the chip-wide barrier (uk_barrier_tree), so no shire reads before every shire has published.
     // Weights are never evicted (read-only in a segment). UK_SYNC() is steps 3+4, called by every case after its
     // evictions; the barrier count is 32 = every launch is chip-wide (the host refuses to batch a narrowed one).
     // A hart whose instruction failed keeps taking the barriers (it must never leave the loop while the others
@@ -405,9 +445,9 @@ int entry_point(struct ggml_et_uberkernel_params * params, void * env) {
 #define UK_SYNC()                       \
     do {                                \
         WAIT_CACHEOPS;                  \
-        et_barrier_global(32ULL);       \
+        uk_barrier_tree();              \
         if (uk_flags_all & 4u) {        \
-            et_barrier_global(32ULL);   \
+            uk_barrier_tree();          \
         }                               \
         UK_STAMP(i);                    \
     } while (0)
