@@ -942,10 +942,13 @@ static bool ggml_et_engine_operand_aligned(const ggml_tensor * t) {
 
 // GGML_ET_PQ2_ENGINE_MIN_N: smallest token count N for which PQ2_0 MUL_MAT runs on the tensor engine (default 53,
 // as for Q4_0); 0 keeps every N on the vector-lane kernel.
+// Token count from which PQ2_0 matmuls run on the tensor engine instead of the vector GEMV. The GEMV costs one weight pass
+// per column pair, the engine about the same at any N below a few tiles; they cross at N = 21-22 on the Bonsai shapes
+// (r288: [17408,5120] 3.49 vs 4.66 ms at 16, 5.21 vs 4.81 at 24).
 static int64_t ggml_et_pq2_engine_min_n() {
     static const int64_t v = [] {
         const char * e = getenv("GGML_ET_PQ2_ENGINE_MIN_N");
-        return (e && *e) ? (int64_t) atoll(e) : (int64_t) 53;
+        return (e && *e) ? (int64_t) atoll(e) : (int64_t) 22;
     }();
     return v;
 }
