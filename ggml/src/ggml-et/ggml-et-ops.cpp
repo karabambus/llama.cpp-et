@@ -942,11 +942,11 @@ static bool ggml_et_engine_operand_aligned(const ggml_tensor * t) {
     return ((uintptr_t) t->data % 64) == 0 && t->nb[1] % 64 == 0 && t->nb[2] % 64 == 0 && t->nb[3] % 64 == 0;
 }
 
-// GGML_ET_PQ2_ENGINE_MIN_N: smallest token count N for which PQ2_0 MUL_MAT runs on the tensor engine (default 53,
-// as for Q4_0); 0 keeps every N on the vector-lane kernel.
-// Token count from which PQ2_0 matmuls run on the tensor engine instead of the vector GEMV. The GEMV costs one weight pass
-// per column pair, the engine about the same at any N below a few tiles; they cross at N = 21-22 on the Bonsai shapes
-// (r288: [17408,5120] 3.49 vs 4.66 ms at 16, 5.21 vs 4.81 at 24).
+// GGML_ET_PQ2_ENGINE_MIN_N: smallest token count N for which PQ2_0 matmuls run on the tensor engine (int8 path) instead of
+// the vector GEMV; 0 keeps every N on the GEMV. The GEMV costs one weight pass per column pair; the int8 engine pass costs
+// about the same at any N below a few tiles. On Bonsai the whole forward pass is cheaper on the engine from N = 10 (r325:
+// 901 vs 1,014 ms at 10, 928 vs 1,487 at 16); graphs of 9 or more tokens launch standalone anyway (the uberkernel has
+// no engine instruction), so the engine takes every such graph.
 // PQ2_0 int8 engine (PP100_PLAN.md F2): the activation is quantised to the CPU's Q8_K values (quantize_q8k_f32 engine
 // mode) into device scratch, then mul_mat_PQ2_0_i8_engine multiplies the int8 values on the tensor engine. Both are
 // standalone launches, so the firmware publishes the quantised activation between them. GGML_ET_PQ2_I8=0 keeps the
@@ -990,7 +990,7 @@ static bool ggml_et_pq2_i8_scratch(ggml_backend_et_device_context * dev_ctx, int
 static int64_t ggml_et_pq2_engine_min_n() {
     static const int64_t v = [] {
         const char * e = getenv("GGML_ET_PQ2_ENGINE_MIN_N");
-        return (e && *e) ? (int64_t) atoll(e) : (int64_t) 22;
+        return (e && *e) ? (int64_t) atoll(e) : (int64_t) 9;
     }();
     return v;
 }
