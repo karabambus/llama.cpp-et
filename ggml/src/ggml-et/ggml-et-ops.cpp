@@ -953,12 +953,12 @@ static int64_t ggml_et_pq2_engine_min_n() {
     return v;
 }
 
-// The N = 1 GEMV splits each leftover row (at most 1,024 after the whole rounds of 4,096) over two harts that meet in a
-// 16-byte record per row (mul_mat_PQ2_0.c). The records are zeroed once; every launch gets a new nonzero generation, so a
+// The N = 1-3 GEMV splits each leftover row (at most 1,024 after the whole rounds of 4,096) over two harts that meet in a
+// 32-byte record per row (mul_mat_PQ2_0.c). The records are zeroed once; every launch gets a new nonzero generation, so a
 // flag left by an earlier launch never matches. GGML_ET_PQ2_TAIL_SPLIT=0 keeps the single-row tail.
 static void ggml_et_pq2_tail_scratch(ggml_backend_et_device_context * dev_ctx, ggml_et_mm_q8_params * p) {
     static const bool on = [] { const char * e = getenv("GGML_ET_PQ2_TAIL_SPLIT"); return !(e && *e && strcmp(e, "0") == 0); }();
-    constexpr size_t  bytes = 1024 * 16;
+    constexpr size_t  bytes = 1024 * 32;
     if (!on) {
         return;
     }
