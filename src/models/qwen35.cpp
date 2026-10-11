@@ -487,7 +487,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // GPU device in the model is Metal or ET.
     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
 
-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
+    // Without rollback slots (n_rs_seq == 0) rows mode is the K = 1 case: it reads the live row and writes the final
+    // state back to the same rows as the gathered path, without the 3 MB gather and copy per layer. Single-sequence
+    // contexts only: the extra-row relocation in build_rs_cache_view is not ordered after the in-op read.
+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok &&
+                                (cparams.n_rs_seq > 0 || cparams.n_seq_max == 1);
 
     ggml_tensor * state;
     if (gdn_state_rows) {

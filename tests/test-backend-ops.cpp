@@ -10618,6 +10618,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 const int64_t ch = 2 * 16 * 128 + hv * 128;
                 test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {3 + n, ch, 1, 1}, {4, ch, 1, 1}));
                 test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, (int) (hv / 16)));
+                // rows mode with raw gates, as the model runs it: K = 1 (plain decode) and K = 3 (MTP, n_max 2)
+                for (int64_t K : {1, 3}) {
+                    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, (int) (hv / 16),
+                                                                     false, false, K, true, -1, true));
+                }
             }
         }
     }
