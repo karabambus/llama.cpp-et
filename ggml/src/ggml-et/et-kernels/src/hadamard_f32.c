@@ -29,9 +29,15 @@ struct ggml_et_hadamard_params {
     struct ggml_tensor signs;  // F32 [W], or data == NULL for no sign flip
     struct ggml_tensor dst;    // F32 [n, R], dim 0 contiguous
     int64_t            width;  // W
-    int64_t            blk;    // n
-    float              scale;  // 1/sqrt(n), computed on the host (no sqrt on the device)
+    int64_t            blk;        // n
+    float              scale;      // 1/sqrt(n), computed on the host (no sqrt on the device)
+    int32_t            rows_mode;  // nonzero: launches of >= HAD_ROWS_MIN rows give each hart whole rows
 };
+
+// From this many rows (prefill: 512 tokens x W/n blocks) every hart owns whole rows and runs all stages on them in its
+// own L1, in the same order as the shared-row path (bit-identical), with no barriers. Fewer rows (decode, MTP
+// verification) keep the shared-row path, where 64 harts split one row.
+#define HAD_ROWS_MIN 256
 
 // Byte-offset lane patterns for the three in-vector stages, over a 16-element group.
 static const int32_t __attribute__((aligned(64))) pat_u4[8] = { 0, 4, 8, 12, 32, 36, 40, 44 };
@@ -248,11 +254,60 @@ int entry_point(struct ggml_et_hadamard_params * params, void * env) {
     __asm__ volatile("mova.x.m %0" : "=r"(saved_mask));
     __asm__ volatile("mov.m.x m0, x0, 0xFF");
 
+    const int64_t groups = n >= 32 ? n / 32 : 1;  // 32-float groups per row (one 16-float group when n == 16)
+    const int64_t rows32 = n / 32;
+
+    if (params->rows_mode && R >= HAD_ROWS_MIN) {
+        // The decision depends on launch parameters only: every hart takes this path, so none waits at a barrier.
+        for (int64_t j = shire * 64 + h; j < R; j += 32 * 64) {
+            const int64_t d1  = j % dst->ne[1];
+            const int64_t d23 = j / dst->ne[1];
+            const int64_t d2  = d23 % dst->ne[2];
+            const int64_t d3  = d23 / dst->ne[2];
+            float *       row = (float *) (d_base + d1 * dst->nb[1] + d2 * dst->nb[2] + d3 * dst->nb[3]);
+            const int64_t r   = j / blocks_per_row;
+            const int64_t b   = j % blocks_per_row;
+            const int64_t i1  = r % src->ne[1];
+            const int64_t r23 = r / src->ne[1];
+            const int64_t i2  = r23 % src->ne[2];
+            const int64_t i3  = r23 / src->ne[2];
+            const float * xp  = (const float *) (x_base + i1 * src->nb[1] + i2 * src->nb[2] + i3 * src->nb[3]) + b * n;
+            const float * sp  = s_base ? (const float *) s_base + b * n : (const float *) 0;
+
+            if (n >= 32) {
+                for (int64_t g = 0; g < groups; g++) {
+                    pass_a32(row + g * 32, xp + g * 32, sp ? sp + g * 32 : (const float *) 0, &scale);
+                    stage_gather(row + g * 32, 32, pat_u4, pat_w4);
+                }
+            } else {
+                pass_a16(row, xp, sp, &scale);
+                stage_gather(row, 16, pat_u4, pat_w4);
+            }
+            for (int64_t cl = 0; rows32 >= 2 && cl < 2; cl++) {
+                if (rows32 >= 16) {
+                    for (int64_t len = 512; len < n; len <<= 1) {
+                        col_stage(row, n, len, cl);
+                    }
+                    for (int64_t r0 = 0; r0 < rows32; r0 += 16) {
+                        pass_b16(row + r0 * 32 + cl * 16);
+                        pass_b16(row + r0 * 32 + cl * 16 + 8);
+                    }
+                } else {
+                    for (int64_t len = 32; len < n; len <<= 1) {
+                        col_stage(row, n, len, cl);
+                    }
+                }
+            }
+            publish_l2(row, n >= 16 ? n / 16 : 1, 64);
+        }
+        WAIT_CACHEOPS;
+        __asm__ volatile("mova.m.x %0" ::"r"(saved_mask));
+        return 0;
+    }
+
     // Row j belongs to shire j % 32; the 64 harts of the shire share it. Every shire runs the same number of row
     // slots and every hart takes the two shire barriers of each slot, work or no work (a slot past R is empty).
     const int64_t slots  = (R + 31) / 32;
-    const int64_t groups = n >= 32 ? n / 32 : 1;  // 32-float groups per row (one 16-float group when n == 16)
-    const int64_t rows32 = n / 32;
 
     for (int64_t t = 0; t < slots; t++) {
         const int64_t j    = shire + 32 * t;

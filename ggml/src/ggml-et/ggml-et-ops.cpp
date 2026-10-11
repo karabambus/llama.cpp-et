@@ -298,6 +298,8 @@ bool ggml_et_op_hadamard(ggml_backend_et_device_context * dev_ctx, const ggml_te
     params.width = W;
     params.blk   = n;
     params.scale = 1.0f / sqrtf((float) n);
+    static const int rows_mode = [] { const char * e = getenv("GGML_ET_HAD_ROWS"); return (e && *e) ? atoi(e) : 1; }();
+    params.rows_mode = rows_mode;
 
     const bool ok = ggml_et_launch_kernel(dev_ctx, "hadamard_f32", &params, sizeof(params), 0xFFFFFFFF);
     if (!ok) {

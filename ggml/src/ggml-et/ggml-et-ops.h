@@ -392,6 +392,7 @@ struct ggml_et_hadamard_params {
     int64_t     width;
     int64_t     blk;
     float       scale;
+    int32_t     rows_mode;  // nonzero: launches of >= 256 rows give each hart whole rows (GGML_ET_HAD_ROWS=0 disables)
 };
 
 struct ggml_et_scale_params {
