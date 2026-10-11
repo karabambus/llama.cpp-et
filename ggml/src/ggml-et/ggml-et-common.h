@@ -89,6 +89,8 @@ struct ggml_backend_et_device_context {
 
     // private copy of moe_sum routing weights when the graph allocator placed the fused output over them
     std::byte * moe_w_scratch = nullptr;
+    std::byte * pq2_tail_scratch = nullptr;  // PQ2_0 GEMV K-split tail records (zeroed once), see mul_mat_PQ2_0.c
+    uint32_t    pq2_tail_gen     = 0;        // generation of the last launch that used it
 
     bool                               uberkernel_enabled = false;
     // Set per graph by graph_compute: batching is enabled AND the graph is decode-sized (token count at or under

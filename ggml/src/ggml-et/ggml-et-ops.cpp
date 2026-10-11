@@ -953,6 +953,36 @@ static int64_t ggml_et_pq2_engine_min_n() {
     return v;
 }
 
+// The N = 1 GEMV splits each leftover row (at most 1,024 after the whole rounds of 4,096) over two harts that meet in a
+// 16-byte record per row (mul_mat_PQ2_0.c). The records are zeroed once; every launch gets a new nonzero generation, so a
+// flag left by an earlier launch never matches. GGML_ET_PQ2_TAIL_SPLIT=0 keeps the single-row tail.
+static void ggml_et_pq2_tail_scratch(ggml_backend_et_device_context * dev_ctx, ggml_et_mm_q8_params * p) {
+    static const bool on = [] { const char * e = getenv("GGML_ET_PQ2_TAIL_SPLIT"); return !(e && *e && strcmp(e, "0") == 0); }();
+    constexpr size_t  bytes = 1024 * 16;
+    if (!on) {
+        return;
+    }
+    if (!dev_ctx->pq2_tail_scratch) {
+        std::shared_ptr<rt::IRuntime> runtime = ggml_et_runtime();
+        if (!runtime) {
+            return;
+        }
+        std::byte * buf = runtime->mallocDevice(dev_ctx->rtid, bytes);
+        if (!buf) {
+            return;
+        }
+        static const std::vector<std::byte> zeros(bytes);
+        rt::EventId ev = runtime->memcpyHostToDevice(dev_ctx->default_stream, zeros.data(), buf, bytes, true);
+        runtime->waitForEvent(ev);
+        dev_ctx->pq2_tail_scratch = buf;
+    }
+    if (++dev_ctx->pq2_tail_gen == 0) {
+        ++dev_ctx->pq2_tail_gen;
+    }
+    p->tail_scratch = reinterpret_cast<uint64_t>(dev_ctx->pq2_tail_scratch);
+    p->tail_gen     = dev_ctx->pq2_tail_gen;
+}
+
 bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
                         const ggml_tensor *              node,
                         const ggml_tensor *              add_node) {
@@ -1146,6 +1176,9 @@ bool ggml_et_op_mul_mat(ggml_backend_et_device_context * dev_ctx,
         q8_params.dst                  = params.dst;
         if (bias_tensor) {
             q8_params.bias = *bias_tensor;
+        }
+        if (strcmp(kernel_name, "mul_mat_PQ2_0") == 0) {
+            ggml_et_pq2_tail_scratch(dev_ctx, &q8_params);
         }
         kernel_result = ggml_et_launch_kernel(dev_ctx, kernel_name, &q8_params, sizeof(q8_params), 0xFFFFFFFF);
     } else {

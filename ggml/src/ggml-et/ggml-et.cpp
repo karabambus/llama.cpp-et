@@ -580,6 +580,10 @@ static void ggml_backend_et_free(ggml_backend_t backend) {
                 runtime->freeDevice(dev_ctx->rtid, dev_ctx->moe_w_scratch);
                 dev_ctx->moe_w_scratch = nullptr;
             }
+            if (dev_ctx->pq2_tail_scratch) {
+                runtime->freeDevice(dev_ctx->rtid, dev_ctx->pq2_tail_scratch);
+                dev_ctx->pq2_tail_scratch = nullptr;
+            }
             for (auto & slot : dev_ctx->uberkernel.slots) {
                 if (slot.device_insts) {
                     runtime->freeDevice(dev_ctx->rtid, slot.device_insts);

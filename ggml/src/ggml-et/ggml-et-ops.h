@@ -59,6 +59,9 @@ struct ggml_et_mm_q8_params {
     ggml_tensor src1;
     ggml_tensor dst;
     ggml_tensor bias;
+    uint64_t    tail_scratch;  // PQ2_0 GEMV: per-row records for the K-split tail (0 = off)
+    uint32_t    tail_gen;      // this launch's generation, unique per launch and never 0
+    uint32_t    tail_pad;
 };
 
 struct ggml_et_im2col_params {

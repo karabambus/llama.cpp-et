@@ -69,6 +69,49 @@ static inline void __attribute__((always_inline)) pq2_rows23(const char * src0_p
     atomic_store_f32((volatile float *) (d_c2 + r1), r1c2);
 }
 
+// K-split tail (N = 1): tail row t (row tail0 + t, t < rem) is computed as two K halves, half 0 on hart t and half 1 on
+// hart t + rem. Each half publishes its partial in the row's record with a global atomic, then swaps the record's flag to
+// this launch's generation; the half that finds the generation already there is the second, and it stores p0 + p1 (+ bias)
+// in that fixed order, so the result does not depend on which half finished first. Records are 16 bytes {flag, p0, p1, -};
+// every access is a global atomic, and a flag left by an earlier launch never equals a later generation.
+static inline void pq2_tail_ksplit(const struct ggml_et_mm_q8_params * params, const char * src0_ptr2, size_t nb01,
+                                   const float * b_col, const float * bias_n, float * c_col, int64_t tail0, int64_t rem,
+                                   int64_t K_blocks, int windowed, uint64_t hart_id) {
+    const int64_t h = (int64_t) hart_id;
+    if (h >= 2 * rem) {
+        return;
+    }
+    const int64_t t    = h % rem;
+    const int64_t half = h / rem;
+    const int64_t kb_h = (K_blocks + 1) / 2;
+    const int64_t kb0  = half ? kb_h : 0;
+    const int64_t nkb  = half ? K_blocks - kb_h : kb_h;
+    const int64_t row  = tail0 + t;
+
+    const block_pq2_0 * q_part = (const block_pq2_0 *) (src0_ptr2 + row * nb01) + kb0;
+    const float *       b_part = b_col + kb0 * QK_PQ2_0;
+    const float part = windowed ? pq2_dot_compute_w(q_part, b_part, nkb) : pq2_dot_compute(q_part, b_part, nkb);
+
+    volatile uint32_t * rec = (volatile uint32_t *) (uintptr_t) (params->tail_scratch + (uint64_t) t * 16);
+    uint32_t            bits;
+    __builtin_memcpy(&bits, &part, sizeof bits);
+    et_global_swap_w(rec + 1 + half, bits);
+    FENCE;
+    if (et_global_swap_w(rec, params->tail_gen) != params->tail_gen) {
+        return;  // first half: the other one combines
+    }
+    const uint32_t b0 = et_global_add_w(rec + 1, 0);
+    const uint32_t b1 = et_global_add_w(rec + 2, 0);
+    float          p0, p1;
+    __builtin_memcpy(&p0, &b0, sizeof p0);
+    __builtin_memcpy(&p1, &b1, sizeof p1);
+    float sum = p0 + p1;
+    if (bias_n) {
+        sum += bias_n[row];
+    }
+    atomic_store_f32((volatile float *) (c_col + row), sum);
+}
+
 int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     (void) env;
     const uint64_t hart_id = get_hart_id();
@@ -258,6 +301,14 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                     }
                     atomic_store_f32((volatile float *) (c_col + m), s0);
                     atomic_store_f32((volatile float *) (c_col + m + STRIDE_M), s1);
+                }
+                // Tail rows: when at most STRIDE_M / 2 rows are left after the whole rounds, the old schedule ran them as single
+                // rows on harts 0..rem-1 while the rest idled, and a lone hart's time follows its instruction count (KB 08
+                // lesson 38). Each such row is split into two K halves on harts t and t + rem.
+                const int64_t rem = M % (2 * STRIDE_M);
+                if (params->tail_scratch && N == 1 && ne12 * ne13 == 1 && K_blocks >= 2 && rem > 0 && rem <= STRIDE_M / 2) {
+                    pq2_tail_ksplit(params, src0_ptr2, nb01, b_col, bias_n, c_col, M - rem, rem, K_blocks, windowed, hart_id);
+                    m = M;
                 }
                 for (; m < M; m += STRIDE_M) {
                     const block_pq2_0 * q_row = (const block_pq2_0 *) (src0_ptr2 + m * nb01);
