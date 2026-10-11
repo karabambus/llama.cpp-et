@@ -388,9 +388,9 @@ static inline void __attribute__((always_inline)) merge_rescale_add_asm(float * 
 //******************************************************************************
 
 #define GQ_LANES  8   // lanes of one position's half of the tile (b_num_col 3: 16 columns = two halves)
-#define GQ_MIN_NQ 64  // smaller batches keep the row path and its KV split: without a split the GQA path walks a
-                      // team's whole KV on one minion, which loses below about 48 queries (r324: N = 16 at 8.7 k positions 46 ms
-                      // against the row path's 15.6)
+#define GQ_MIN_NQ 64  // mode 1: smaller batches keep the row path and its KV split: without a split the GQA path walks
+                      // a team's whole KV on one minion, which loses below about 48 queries (r324: N = 16 at 8.7 k positions
+                      // 46 ms against the row path's 15.6)
 
 // L1 scratchpad lines
 #define GQ_KB0 0   // K chunk buffer 0 (A, load id 0)
@@ -436,7 +436,7 @@ static inline int fa_gqa_eligible(const struct ggml_et_flash_attn_ext_params * p
         return 0;
     }
     const int64_t gqa = q->ne[2] / k->ne[2];
-    if (gqa < 2 || gqa > GQ_LANES || q->ne[1] < GQ_MIN_NQ) {
+    if (gqa < 2 || gqa > GQ_LANES || (p->gqa_tiles != 2 && q->ne[1] < GQ_MIN_NQ)) {
         return 0;
     }
     if (q->ne[0] % TILE_K != 0 || q->ne[0] > FA_DK_MAX || v->ne[0] % 16 != 0 || v->ne[0] > FA_DV_MAX) {
@@ -1152,150 +1152,319 @@ static inline void __attribute__((always_inline)) gq_spill_scores(float * sc) {
         : "memory");
 }
 
-static int fa_gqa_tiles(struct ggml_et_flash_attn_ext_params * params, uint64_t shire_id, uint64_t local_minion) {
+struct gq_team {
+    int64_t iq3, ik2, p0;
+    int     p1_valid;
+};
+
+static inline struct gq_team gq_team_of(int64_t t, int64_t nq, int64_t nhk) {
+    const int64_t tpb = (nq + 1) / 2;  // teams per (batch, KV head)
+    struct gq_team tm;
+    tm.iq3      = t / (nhk * tpb);
+    tm.ik2      = (t / tpb) % nhk;
+    tm.p0       = 2 * (t % tpb);
+    tm.p1_valid = tm.p0 + 1 < nq;
+    return tm;
+}
+
+// Accumulate KV tiles [tile_lo, tile_hi) of team tm into this minion's L2-scratchpad slot: per lane the running max M
+// and sum S, per query row the unnormalised accumulator. An empty range leaves M at the sentinel and S, acc at 0.
+static void gq_team_slab(struct ggml_et_flash_attn_ext_params * params, char * scp, struct gq_team tm, int64_t tile_lo,
+                         int64_t tile_hi) {
     const struct ggml_tensor * q    = &params->src0;
     const struct ggml_tensor * k    = &params->src1;
     const struct ggml_tensor * v    = &params->src2;
-    const struct ggml_tensor * dst  = &params->dst;
     const struct ggml_tensor * mask = params->has_mask ? &params->mask : (const struct ggml_tensor *) 0;
 
-    const int64_t dk  = q->ne[0];
-    const int64_t nq  = q->ne[1];
-    const int64_t nhq = q->ne[2];
-    const int64_t no  = q->ne[3];
-    const int64_t nk  = k->ne[1];
-    const int64_t nhk = k->ne[2];
-    const int64_t dv  = v->ne[0];
-    const int64_t gqa = nhq / nhk;
-    const int64_t nc  = dk / TILE_K;
+    const int64_t dk    = q->ne[0];
+    const int64_t dv    = v->ne[0];
+    const int64_t gqa   = q->ne[2] / k->ne[2];
+    const int64_t nc    = dk / TILE_K;
     const float   scale = params->scale;
+    const int64_t iq3 = tm.iq3, ik2 = tm.ik2, p0 = tm.p0;
+    const int     p1_valid = tm.p1_valid;
 
     // P x V in one FMA of 2*gqa rows when the outputs leave f30/f31 free for the accumulator, else one per position
     const int64_t pv_rows   = (2 * gqa <= 12) ? 2 * gqa : gqa;
     const int64_t pv_groups = (2 * gqa) / pv_rows;
 
-    char *  scp = (char *) et_shire_l2scp_local(local_minion * GQ_PER_MINION);
     char *  qt  = scp + GQ_QT_OFF;
     float * acc = (float *) (scp + GQ_ACC_OFF);
     float * st  = (float *) (scp + GQ_ST_OFF);
     float * sc  = (float *) (scp + GQ_SC_OFF);
 
-    const int64_t tpb     = (nq + 1) / 2;  // teams per (batch, KV head)
-    const int64_t n_teams = no * nhk * tpb;
-    const int64_t g       = (int64_t) shire_id * MINIONS_PER_SHIRE + (int64_t) local_minion;
+    for (int64_t i = 0; i < 2 * GQ_LANES; ++i) {
+        st[GQ_ST_M + i] = ET_NEG_INF_F;
+        st[GQ_ST_S + i] = 0.0f;
+    }
+    for (int64_t r = 0; r < 2 * gqa; ++r) {
+        zero_acc_vec(acc + r * (GQ_ACC_ROW / sizeof(float)), dv);
+    }
+    if (tile_lo >= tile_hi) {
+        return;
+    }
 
-    for (int64_t t = g; t < n_teams; t += (int64_t) NUM_COMPUTE_SHIRES * MINIONS_PER_SHIRE) {
-        const int64_t iq3      = t / (nhk * tpb);
-        const int64_t ik2      = (t / tpb) % nhk;
-        const int64_t p0       = 2 * (t % tpb);
-        const int     p1_valid = p0 + 1 < nq;
+    gq_build_qt(qt, (const char *) q->data, q, dk, gqa, ik2, p0, p1_valid, iq3);
 
-        gq_build_qt(qt, (const char *) q->data, q, dk, gqa, ik2, p0, p1_valid, iq3);
+    const char * mrow[2] = { 0, 0 };
+    if (mask) {
+        const char * mb = (const char *) mask->data + (iq3 % mask->ne[3]) * mask->nb[3];
+        mrow[0]         = mb + p0 * mask->nb[1];
+        mrow[1]         = p1_valid ? mb + (p0 + 1) * mask->nb[1] : 0;
+    }
+    const char *   k_head = (const char *) k->data + ik2 * k->nb[2] + iq3 * k->nb[3];
+    const char *   v_head = (const char *) v->data + ik2 * v->nb[2] + iq3 * v->nb[3];
+    const uint64_t nb1_k  = (uint64_t) k->nb[1];
+    const uint64_t nb1_v  = (uint64_t) v->nb[1];
 
-        for (int64_t i = 0; i < 2 * GQ_LANES; ++i) {
-            st[GQ_ST_M + i] = ET_NEG_INF_F;
-            st[GQ_ST_S + i] = 0.0f;
+    for (int64_t kv_base = tile_lo * TILE_KV; kv_base < tile_hi * TILE_KV; kv_base += TILE_KV) {
+        const int cls0 = gq_mask_class(mrow[0], kv_base);
+        const int cls1 = p1_valid ? gq_mask_class(mrow[1], kv_base) : GQ_MASKED;
+        if (cls0 == GQ_MASKED && cls1 == GQ_MASKED) {
+            continue;
         }
-        for (int64_t r = 0; r < 2 * gqa; ++r) {
-            zero_acc_vec(acc + r * (GQ_ACC_ROW / sizeof(float)), dv);
-        }
 
-        const char * mrow[2] = { 0, 0 };
-        if (mask) {
-            const char * mb = (const char *) mask->data + (iq3 % mask->ne[3]) * mask->nb[3];
-            mrow[0]         = mb + p0 * mask->nb[1];
-            mrow[1]         = p1_valid ? mb + (p0 + 1) * mask->nb[1] : 0;
-        }
-        const char * k_head = (const char *) k->data + ik2 * k->nb[2] + iq3 * k->nb[3];
-        const char * v_head = (const char *) v->data + ik2 * v->nb[2] + iq3 * v->nb[3];
-        const uint64_t nb1_k = (uint64_t) k->nb[1];
-        const uint64_t nb1_v = (uint64_t) v->nb[1];
-
-        for (int64_t kv_base = 0; kv_base < nk; kv_base += TILE_KV) {
-            const int cls0 = gq_mask_class(mrow[0], kv_base);
-            const int cls1 = p1_valid ? gq_mask_class(mrow[1], kv_base) : GQ_MASKED;
-            if (cls0 == GQ_MASKED && cls1 == GQ_MASKED) {
-                continue;
+        // QK^T: A = 16 K rows of chunk c (load id 0, double-buffered), B = Q^T chunk c through TenB
+        const char * kt = k_head + kv_base * (int64_t) nb1_k;
+        tensor_load(false, false, GQ_KB0, TENSOR_LOAD_PLAIN, 0, (uint64_t) kt, 0, 15, nb1_k, 0);
+        for (int64_t c = 0; c < nc; ++c) {
+            tensor_wait(TENSOR_LOAD_WAIT_0);
+            if (c + 1 < nc) {
+                tensor_load(false, false, ((c + 1) & 1) ? GQ_KB1 : GQ_KB0, TENSOR_LOAD_PLAIN, 0,
+                            (uint64_t) (kt + (c + 1) * 64), 0, 15, nb1_k, 0);
             }
+            tensor_load_setup_b(false, (uint64_t) (qt + c * GQ_QT_CHUNK), 15, 64, 1);
+            tensor_fma(false, 3, 15, 15, 0, false, false, false, true, 0, (c & 1) ? GQ_KB1 : GQ_KB0,
+                       TENSOR_FMA_OP_FP16, c == 0);
+            GQ_CLOBBER_F;
+            tensor_wait(TENSOR_FMA_WAIT);
+            GQ_CLOBBER_F;
+        }
+        gq_spill_scores(sc);
+        GQ_CLOBBER_F;
 
-            // QK^T: A = 16 K rows of chunk c (load id 0, double-buffered), B = Q^T chunk c through TenB
-            const char * kt = k_head + kv_base * (int64_t) nb1_k;
-            tensor_load(false, false, GQ_KB0, TENSOR_LOAD_PLAIN, 0, (uint64_t) kt, 0, 15, nb1_k, 0);
-            for (int64_t c = 0; c < nc; ++c) {
-                tensor_wait(TENSOR_LOAD_WAIT_0);
-                if (c + 1 < nc) {
-                    tensor_load(false, false, ((c + 1) & 1) ? GQ_KB1 : GQ_KB0, TENSOR_LOAD_PLAIN, 0,
-                                (uint64_t) (kt + (c + 1) * 64), 0, 15, nb1_k, 0);
-                }
-                tensor_load_setup_b(false, (uint64_t) (qt + c * GQ_QT_CHUNK), 15, 64, 1);
-                tensor_fma(false, 3, 15, 15, 0, false, false, false, true, 0, (c & 1) ? GQ_KB1 : GQ_KB0,
-                           TENSOR_FMA_OP_FP16, c == 0);
+        gq_softmax_half(scp, 0, cls0, mrow[0], kv_base, gqa, scale, dv);
+        gq_softmax_half(scp, 1, cls1, mrow[1], kv_base, gqa, scale, dv);
+
+        // P x V: A = the 2*gqa probability rows, B = V by INTERLEAVE16 (load id 1, double-buffered)
+        FENCE;
+        flush_to_l2(scp + GQ_P_OFF, (uint64_t) (2 * gqa), 64);
+        WAIT_CACHEOPS;
+        tensor_load(false, false, GQ_PL1, TENSOR_LOAD_PLAIN, 0, (uint64_t) (scp + GQ_P_OFF), 0,
+                    (uint64_t) (2 * gqa - 1), 64, 0);
+        const uintptr_t v_base = (uintptr_t) v_head + kv_base * (int64_t) nb1_v;
+        uint64_t        b_cur  = GQ_VB0;
+        tensor_load(false, false, b_cur, TENSOR_LOAD_INTERLEAVE16, 0, (uint64_t) v_base, 0, 7, nb1_v, 1);
+        tensor_wait(TENSOR_LOAD_WAIT_0);
+        tensor_wait(TENSOR_LOAD_WAIT_1);
+
+        unsigned long ms;
+        __asm__ volatile("mova.x.m  %[ms]          \n\t"
+                         "mov.m.x   m0, x0, 0xFF   \n\t"
+                         : [ms] "=&r"(ms));
+        for (int64_t dv_off = 0; dv_off < dv; dv_off += 16) {
+            const uint64_t b_nxt = (b_cur == GQ_VB0) ? GQ_VB1 : GQ_VB0;
+            if (dv_off + 16 < dv) {
+                tensor_load(false, false, b_nxt, TENSOR_LOAD_INTERLEAVE16, 0, (uint64_t) (v_base + (dv_off + 16) * 2),
+                            0, 7, nb1_v, 1);
+            }
+            for (int64_t grp = 0; grp < pv_groups; ++grp) {
+                tensor_fma(false, 3, (uint64_t) (pv_rows - 1), 7, 0, false, false, false, false, b_cur,
+                           (uint64_t) (GQ_PL1 + grp * pv_rows), TENSOR_FMA_OP_FP16, true);
                 GQ_CLOBBER_F;
                 tensor_wait(TENSOR_FMA_WAIT);
                 GQ_CLOBBER_F;
+                gq_acc_add(acc + grp * pv_rows * (GQ_ACC_ROW / sizeof(float)) + dv_off, pv_rows);
+                GQ_CLOBBER_F;
             }
-            gq_spill_scores(sc);
-            GQ_CLOBBER_F;
-
-            gq_softmax_half(scp, 0, cls0, mrow[0], kv_base, gqa, scale, dv);
-            gq_softmax_half(scp, 1, cls1, mrow[1], kv_base, gqa, scale, dv);
-
-            // P x V: A = the 2*gqa probability rows, B = V by INTERLEAVE16 (load id 1, double-buffered)
-            FENCE;
-            flush_to_l2(scp + GQ_P_OFF, (uint64_t) (2 * gqa), 64);
-            WAIT_CACHEOPS;
-            tensor_load(false, false, GQ_PL1, TENSOR_LOAD_PLAIN, 0, (uint64_t) (scp + GQ_P_OFF), 0,
-                        (uint64_t) (2 * gqa - 1), 64, 0);
-            const uintptr_t v_base = (uintptr_t) v_head + kv_base * (int64_t) nb1_v;
-            uint64_t        b_cur  = GQ_VB0;
-            tensor_load(false, false, b_cur, TENSOR_LOAD_INTERLEAVE16, 0, (uint64_t) v_base, 0, 7, nb1_v, 1);
-            tensor_wait(TENSOR_LOAD_WAIT_0);
-            tensor_wait(TENSOR_LOAD_WAIT_1);
-
-            unsigned long ms;
-            __asm__ volatile("mova.x.m  %[ms]          \n\t"
-                             "mov.m.x   m0, x0, 0xFF   \n\t"
-                             : [ms] "=&r"(ms));
-            for (int64_t dv_off = 0; dv_off < dv; dv_off += 16) {
-                const uint64_t b_nxt = (b_cur == GQ_VB0) ? GQ_VB1 : GQ_VB0;
-                if (dv_off + 16 < dv) {
-                    tensor_load(false, false, b_nxt, TENSOR_LOAD_INTERLEAVE16, 0, (uint64_t) (v_base + (dv_off + 16) * 2),
-                                0, 7, nb1_v, 1);
-                }
-                for (int64_t grp = 0; grp < pv_groups; ++grp) {
-                    tensor_fma(false, 3, (uint64_t) (pv_rows - 1), 7, 0, false, false, false, false, b_cur,
-                               (uint64_t) (GQ_PL1 + grp * pv_rows), TENSOR_FMA_OP_FP16, true);
-                    GQ_CLOBBER_F;
-                    tensor_wait(TENSOR_FMA_WAIT);
-                    GQ_CLOBBER_F;
-                    gq_acc_add(acc + grp * pv_rows * (GQ_ACC_ROW / sizeof(float)) + dv_off, pv_rows);
-                    GQ_CLOBBER_F;
-                }
-                if (dv_off + 16 < dv) {
-                    tensor_wait(TENSOR_LOAD_WAIT_1);
-                    b_cur = b_nxt;
-                }
+            if (dv_off + 16 < dv) {
+                tensor_wait(TENSOR_LOAD_WAIT_1);
+                b_cur = b_nxt;
             }
-            __asm__ volatile("mova.m.x  %[ms]          \n\t" : : [ms] "r"(ms));
         }
-
-        // normalise and store each query row (whole 64-byte lines of its dst row, one writer)
-        for (int64_t r = 0; r < 2 * gqa; ++r) {
-            const int64_t h = r / gqa;
-            if (h == 1 && !p1_valid) {
-                break;
-            }
-            const int64_t lane  = r % gqa;
-            const int64_t iq1   = p0 + h;
-            const int64_t iq2   = ik2 * gqa + lane;
-            float *       out   = (float *) ((char *) dst->data + iq2 * dst->nb[1] + iq1 * dst->nb[2] + iq3 * dst->nb[3]);
-            const float   S     = st[GQ_ST_S + h * GQ_LANES + lane];
-            const float   S_inv = S == 0.0f ? 0.0f : et_fdiv(1.0f, S);
-            normalize_store_vec(out, acc + r * (GQ_ACC_ROW / sizeof(float)), dv, S_inv, 1);
-        }
+        __asm__ volatile("mova.m.x  %[ms]          \n\t" : : [ms] "r"(ms));
     }
 
-    FENCE;
+}
+
+// Normalise and store each query row of a team whose whole KV ran on this minion (whole 64-byte lines, one writer).
+static void gq_store_rows(struct ggml_et_flash_attn_ext_params * params, char * scp, struct gq_team tm) {
+    const struct ggml_tensor * dst = &params->dst;
+    const int64_t              gqa = params->src0.ne[2] / params->src1.ne[2];
+    const int64_t              dv  = params->src2.ne[0];
+    float *                    acc = (float *) (scp + GQ_ACC_OFF);
+    const float *              st  = (const float *) (scp + GQ_ST_OFF);
+    for (int64_t r = 0; r < 2 * gqa; ++r) {
+        const int64_t h = r / gqa;
+        if (h == 1 && !tm.p1_valid) {
+            break;
+        }
+        const int64_t lane  = r % gqa;
+        float *       out   = (float *) ((char *) dst->data + (tm.ik2 * gqa + lane) * dst->nb[1] + (tm.p0 + h) * dst->nb[2] +
+                                       tm.iq3 * dst->nb[3]);
+        const float   S     = st[GQ_ST_S + h * GQ_LANES + lane];
+        const float   S_inv = S == 0.0f ? 0.0f : et_fdiv(1.0f, S);
+        normalize_store_vec(out, acc + r * (GQ_ACC_ROW / sizeof(float)), dv, S_inv, 1);
+    }
+}
+
+// One output line (row r, 16 floats at chunk c) of a team split over ks members: the members' partials are combined
+// with the softmax rule (M* = max M_m, alpha_m = exp2((M_m - M*) log2e), S* = sum alpha_m S_m, acc* = sum alpha_m acc_m)
+// and normalised. Members whose range saw no unmasked score (M_m at the sentinel) contribute nothing.
+static void gq_merge_line(struct ggml_et_flash_attn_ext_params * params, struct gq_team tm, int64_t slot0, int64_t ks,
+                          int64_t r, int64_t c) {
+    const struct ggml_tensor * dst  = &params->dst;
+    const int64_t              gqa  = params->src0.ne[2] / params->src1.ne[2];
+    const int64_t              h    = r / gqa;
+    const int64_t              lane = r % gqa;
+    const int64_t              k    = h * GQ_LANES + lane;
+    const float                log2e = 1.4426950408889634f;
+
+    // drop this minion's L1 copies of the peers' stats and accumulator lines (16 members per evict, slots GQ_PER_MINION apart)
+    for (int64_t m0 = 0; m0 < ks; m0 += 16) {
+        const int64_t cnt  = ks - m0 < 16 ? ks - m0 : 16;
+        char *        base = (char *) et_shire_l2scp_local((slot0 + m0) * GQ_PER_MINION);
+        evict_to_l2(base + GQ_ST_OFF, (uint64_t) cnt, GQ_PER_MINION);
+        evict_to_l2(base + GQ_ST_OFF + 64, (uint64_t) cnt, GQ_PER_MINION);
+        evict_to_l2(base + GQ_ACC_OFF + r * GQ_ACC_ROW + c * 64, (uint64_t) cnt, GQ_PER_MINION);
+    }
+    WAIT_CACHEOPS;
+
+    float Mx = ET_NEG_INF_F;
+    for (int64_t m = 0; m < ks; ++m) {
+        const float * st = (const float *) ((char *) et_shire_l2scp_local((slot0 + m) * GQ_PER_MINION) + GQ_ST_OFF);
+        const float   Mm = st[GQ_ST_M + k];
+        Mx               = Mm > Mx ? Mm : Mx;
+    }
+
+    // running sum of alpha_m * acc_m in memory: compiler float code (exp2) runs between the asm statements
+    float         sum[16] __attribute__((aligned(64)));
+    float         Sx = 0.0f;
+    unsigned long ms;
+    zero_acc_vec(sum, 16);
+    for (int64_t m = 0; m < ks; ++m) {
+        const char *  slot = (const char *) et_shire_l2scp_local((slot0 + m) * GQ_PER_MINION);
+        const float * st   = (const float *) (slot + GQ_ST_OFF);
+        const float   Mm   = st[GQ_ST_M + k];
+        if (!(Mm > ET_NEG_INF_F)) {
+            continue;
+        }
+        const float alpha = et_exp2f((Mm - Mx) * log2e);
+        Sx += alpha * st[GQ_ST_S + k];
+        const float * a = (const float *) (slot + GQ_ACC_OFF + r * GQ_ACC_ROW + c * 64);
+        __asm__ volatile("mova.x.m  %[ms]              \n\t"
+                         "mov.m.x   m0, x0, 0xFF       \n\t"
+                         "fbc.ps    f22, 0(%[al])      \n\t"
+                         "flw.ps    f20, 0(%[s])       \n\t"
+                         "flw.ps    f21, 32(%[s])      \n\t"
+                         "flw.ps    f23, 0(%[a])       \n\t"
+                         "flw.ps    f24, 32(%[a])      \n\t"
+                         "fmadd.ps  f20, f23, f22, f20 \n\t"
+                         "fmadd.ps  f21, f24, f22, f21 \n\t"
+                         "fsw.ps    f20, 0(%[s])       \n\t"
+                         "fsw.ps    f21, 32(%[s])      \n\t"
+                         "mova.m.x  %[ms]              \n\t"
+                         : [ms] "=&r"(ms)
+                         : [al] "r"(&alpha), [a] "r"(a), [s] "r"(sum)
+                         : "f20", "f21", "f22", "f23", "f24", "memory");
+    }
+    const float inv = Sx == 0.0f ? 0.0f : et_fdiv(1.0f, Sx);
+    float *     out = (float *) ((char *) dst->data + (tm.ik2 * gqa + lane) * dst->nb[1] + (tm.p0 + h) * dst->nb[2] +
+                             tm.iq3 * dst->nb[3]) + c * 16;
+    __asm__ volatile("mova.x.m  %[ms]            \n\t"
+                     "mov.m.x   m0, x0, 0xFF     \n\t"
+                     "fbc.ps    f22, 0(%[iv])    \n\t"
+                     "flw.ps    f20, 0(%[s])     \n\t"
+                     "flw.ps    f21, 32(%[s])    \n\t"
+                     "fmul.ps   f20, f20, f22    \n\t"
+                     "fmul.ps   f21, f21, f22    \n\t"
+                     "fsw.ps    f20, 0(%[o])     \n\t"
+                     "fsw.ps    f21, 32(%[o])    \n\t"
+                     "mova.m.x  %[ms]            \n\t"
+                     : [ms] "=&r"(ms)
+                     : [iv] "r"(&inv), [o] "r"(out), [s] "r"(sum)
+                     : "f20", "f21", "f22", "memory");
+}
+
+static int fa_gqa_tiles(struct ggml_et_flash_attn_ext_params * params, uint64_t shire_id, uint64_t local_minion,
+                        int is_hart1) {
+    const int64_t nq       = params->src0.ne[1];
+    const int64_t no       = params->src0.ne[3];
+    const int64_t nhk      = params->src1.ne[2];
+    const int64_t gqa      = params->src0.ne[2] / nhk;
+    const int64_t dv       = params->src2.ne[0];
+    const int64_t nk_tiles = params->src1.ne[1] / TILE_KV;
+    const int64_t n_teams  = no * nhk * ((nq + 1) / 2);
+
+    // ks members per team, as the row path picks its split: minimise passes x (tiles per member + one for the merge).
+    // Mode 1 keeps ks = 1 (each team's whole KV on one minion: no merge, no barrier).
+    int64_t ks = 1;
+    if (params->gqa_tiles == 2) {
+        int64_t best = -1;
+        for (int64_t s = 1; s <= MINIONS_PER_SHIRE && s <= nk_tiles; s *= 2) {
+            const int64_t passes = (n_teams * s + NUM_COMPUTE_SHIRES * MINIONS_PER_SHIRE - 1) /
+                                   (NUM_COMPUTE_SHIRES * MINIONS_PER_SHIRE);
+            const int64_t cost   = passes * ((nk_tiles + s - 1) / s + (s > 1 ? 1 : 0));
+            if (best < 0 || cost < best) {
+                best = cost;
+                ks   = s;
+            }
+        }
+    }
+    const int64_t tps    = MINIONS_PER_SHIRE / ks;  // teams per shire per pass
+    const int64_t passes = (n_teams + NUM_COMPUTE_SHIRES * tps - 1) / (NUM_COMPUTE_SHIRES * tps);
+    const int64_t ts     = (int64_t) local_minion / ks;  // team slot in the shire
+    const int64_t km     = (int64_t) local_minion % ks;  // member within the team
+    char *        scp    = (char *) et_shire_l2scp_local(local_minion * GQ_PER_MINION);
+
+    if (ks == 1) {
+        if (is_hart1) {
+            return 0;
+        }
+        for (int64_t p = 0; p < passes; ++p) {
+            const int64_t t = (p * NUM_COMPUTE_SHIRES + (int64_t) shire_id) * tps + ts;
+            if (t < n_teams) {
+                const struct gq_team tm = gq_team_of(t, nq, nhk);
+                gq_team_slab(params, scp, tm, 0, nk_tiles);
+                gq_store_rows(params, scp, tm);
+            }
+        }
+        FENCE;
+        return 0;
+    }
+
+    // Split teams: every hart of the shire takes both shire barriers of every pass, work or no work.
+    const int64_t per = (nk_tiles + ks - 1) / ks;
+    for (int64_t p = 0; p < passes; ++p) {
+        const int64_t t    = (p * NUM_COMPUTE_SHIRES + (int64_t) shire_id) * tps + ts;
+        const int     have = t < n_teams;
+        struct gq_team tm  = { 0, 0, 0, 0 };
+        if (have) {
+            tm = gq_team_of(t, nq, nhk);
+        }
+        if (!is_hart1 && have) {
+            const int64_t lo = km * per;
+            const int64_t hi = lo + per < nk_tiles ? lo + per : nk_tiles;
+            gq_team_slab(params, scp, tm, lo, hi);
+            // publish this member's partial to the shire's L2 for the merge
+            FENCE;
+            evict_to_l2(scp + GQ_ST_OFF, 2, 64);
+            for (int64_t r = 0; r < 2 * gqa; ++r) {
+                evict_range_to_l2(scp + GQ_ACC_OFF + r * GQ_ACC_ROW, dv * (int64_t) sizeof(float));
+            }
+            WAIT_CACHEOPS;
+        }
+        et_barrier(ET_BARRIER_SHIRE);  // A: every member's partial is in L2
+        if (!is_hart1 && have) {
+            const int64_t rows   = tm.p1_valid ? 2 * gqa : gqa;
+            const int64_t chunks = dv / 16;
+            for (int64_t piece = km; piece < rows * chunks; piece += ks) {
+                gq_merge_line(params, tm, ts * ks, ks, piece / chunks, piece % chunks);
+            }
+            FENCE;
+        }
+        et_barrier(ET_BARRIER_SHIRE);  // B: the merge has read every slot before the next pass rewrites them
+    }
     return 0;
 }
 
@@ -1450,7 +1619,7 @@ int entry_point(struct ggml_et_flash_attn_ext_params * params, void * env) {
 
     // The decision depends on launch parameters only, so every hart takes the same path.
     if (fa_gqa_eligible(params)) {
-        return is_hart1 ? 0 : fa_gqa_tiles(params, shire_id, local_minion);
+        return fa_gqa_tiles(params, shire_id, local_minion, is_hart1);
     }
 
     if (is_hart1) {
