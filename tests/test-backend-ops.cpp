@@ -253,6 +253,13 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
                         tv.push_back((float)*(int16_t *) &buf[i]);
                     } else if (t->type == GGML_TYPE_I8) {
                         tv.push_back((float)*(int8_t *) &buf[i]);
+                    } else if (t->type == GGML_TYPE_Q8_K) {
+                        // no to_float in the type traits: block = { float d; int8 qs[256]; int16 bsums[16] }
+                        float d;
+                        memcpy(&d, &buf[i], sizeof(d));
+                        for (size_t j = 0; j < bs; ++j) {
+                            tv.push_back(d * (float) (int8_t) buf[i + sizeof(float) + j]);
+                        }
                     } else if (quantized) {
                         tt->to_float(&buf[i], vq.data(), bs);
                         tv.insert(tv.end(), vq.begin(), vq.end());
