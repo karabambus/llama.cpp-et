@@ -2102,7 +2102,9 @@ bool ggml_et_op_flash_attn_ext(ggml_backend_et_device_context * dev_ctx, const g
     }
     params.dst   = *node;
     params.scale = scale;
-    static const int gqa_tiles = [] { const char * e = getenv("GGML_ET_FA_GQA"); return (e && *e) ? atoi(e) : 1; }();
+    // Default 2: batches of 2-63 queries (prefill tails, speculative verifications) take the GQA path with a KV split;
+    // single-query decode keeps the row path, which already splits the KV and is as fast there.
+    static const int gqa_tiles = [] { const char * e = getenv("GGML_ET_FA_GQA"); return (e && *e) ? atoi(e) : 2; }();
     params.gqa_tiles = gqa_tiles;
 
     // Use matrix engine kernel when K/V are F16 and dk is a multiple of 32
