@@ -2100,6 +2100,8 @@ bool ggml_et_op_flash_attn_ext(ggml_backend_et_device_context * dev_ctx, const g
     }
     params.dst   = *node;
     params.scale = scale;
+    static const int gqa_tiles = [] { const char * e = getenv("GGML_ET_FA_GQA"); return (e && *e) ? atoi(e) : 1; }();
+    params.gqa_tiles = gqa_tiles;
 
     // Use matrix engine kernel when K/V are F16 and dk is a multiple of 32
     const char * kernel_name;

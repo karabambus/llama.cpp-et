@@ -73,6 +73,7 @@ struct ggml_et_flash_attn_ext_params {
     struct ggml_tensor dst;   // Output (F32)
     float              scale;
     int32_t            has_mask;
+    int32_t            gqa_tiles;  // nonzero: batches of >= GQ_MIN_NQ queries may take the GQA tile path
 };
 
 static inline float get_mask_val(const struct ggml_tensor * mask, int64_t iq1, int64_t ik1, int64_t iq2, int64_t iq3) {
@@ -345,6 +346,843 @@ static inline void __attribute__((always_inline)) merge_rescale_add_asm(float * 
     __asm__ volatile("mova.m.x %0" ::"r"(old_mask));
 }
 
+//******************************************************************************
+// GQA tile path (batches of >= GQ_MIN_NQ queries, no KV split)
+//
+// A team is (batch, KV head, two consecutive query positions p0, p1) and runs on one minion's hart 0. The 16 tile
+// columns are the GQA query heads of the two positions: column j < 8 is head ik2*gqa + j at p0, column 8 + j the same
+// head at p1 (lanes >= gqa are zero padding). QK^T takes K as the A operand (16 KV rows by plain loads straight from
+// the cache) and Q^T as B (a panel built once per team in the L2 scratchpad and streamed through TenB), so the score
+// of KV row i, column j lands in f(2i) lane j (p0) or f(2i+1) lane j - 8 (p1) and the softmax runs lane-wise, one lane
+// per query row, with no horizontal reductions. P x V takes the 2*gqa probability rows as A and V by INTERLEAVE16 as
+// B, as the row path does. Each query row sees the row path's arithmetic in the row path's order: the same fp16
+// products in the same pair order, scale, mask, max, exp2, the same sum tree, rescale and accumulation.
+//
+// The row path re-reads K and V once per query row and packs K on hart 1; here a K/V tile is read once per 2*gqa
+// rows and hart 1 has no work.
+//******************************************************************************
+
+#define GQ_LANES  8   // lanes of one position's half of the tile (b_num_col 3: 16 columns = two halves)
+#define GQ_MIN_NQ 16  // smaller batches (decode, MTP verification) keep the row path and its KV split
+
+// L1 scratchpad lines
+#define GQ_KB0 0   // K chunk buffer 0 (A, load id 0)
+#define GQ_KB1 16  // K chunk buffer 1 (A, load id 0)
+#define GQ_VB0 0   // V buffer 0 (B, INTERLEAVE16, load id 1), P x V phase only
+#define GQ_VB1 8   // V buffer 1
+#define GQ_PL1 32  // probability rows (A), up to 16 lines
+
+// L2 scratchpad per minion
+#define GQ_QT_OFF     0                                    // Q^T panel: dk/32 chunks x 16 lines
+#define GQ_QT_CHUNK   (16 * 64)
+#define GQ_ACC_OFF    (GQ_QT_OFF + (FA_DK_MAX / TILE_K) * GQ_QT_CHUNK)
+#define GQ_ACC_ROW    (FA_DV_MAX * sizeof(float))          // one accumulator row per query row
+#define GQ_P_OFF      (GQ_ACC_OFF + 2 * GQ_LANES * GQ_ACC_ROW)  // probability staging, 16 lines
+#define GQ_SC_OFF     (GQ_P_OFF + 16 * 64)                 // spilled QK^T registers f0..f31
+#define GQ_ST_OFF     (GQ_SC_OFF + 32 * 32)                // per lane: M, S, alpha, tile max / tile sum
+#define GQ_ST_M       0
+#define GQ_ST_S       (2 * GQ_LANES)
+#define GQ_ST_A       (4 * GQ_LANES)
+#define GQ_ST_T       (6 * GQ_LANES)
+#define GQ_PER_MINION (GQ_ST_OFF + 8 * GQ_LANES * sizeof(float))
+_Static_assert(GQ_PER_MINION % 64 == 0, "per-minion slices start on cache lines");
+_Static_assert(MINIONS_PER_SHIRE * GQ_PER_MINION <= 2621440, "L2 scratchpad per shire");
+
+#define GQ_OPEN   0  // mask all +0 (or no mask): scores unchanged
+#define GQ_MIXED  1  // per-element mask
+#define GQ_MASKED 2  // mask all -inf (or the position does not exist): the half contributes nothing
+
+// All f registers: the tensor engine writes them behind the compiler's back. Placed right after every FMA issue and
+// every FMA wait, so no compiler-held float value lives across the window in which the engine writes.
+#define GQ_CLOBBER_F                                                                                              \
+    __asm__ volatile("" ::: "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", \
+                     "f14", "f15", "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23", "f24", "f25", "f26", "f27", \
+                     "f28", "f29", "f30", "f31", "memory")
+
+static inline int fa_gqa_eligible(const struct ggml_et_flash_attn_ext_params * p) {
+    const struct ggml_tensor * q = &p->src0;
+    const struct ggml_tensor * k = &p->src1;
+    const struct ggml_tensor * v = &p->src2;
+    const struct ggml_tensor * m = &p->mask;
+
+    if (!p->gqa_tiles || k->ne[2] <= 0 || q->ne[2] % k->ne[2] != 0) {
+        return 0;
+    }
+    const int64_t gqa = q->ne[2] / k->ne[2];
+    if (gqa < 2 || gqa > GQ_LANES || q->ne[1] < GQ_MIN_NQ) {
+        return 0;
+    }
+    if (q->ne[0] % TILE_K != 0 || q->ne[0] > FA_DK_MAX || v->ne[0] % 16 != 0 || v->ne[0] > FA_DV_MAX) {
+        return 0;
+    }
+    if (k->ne[1] % TILE_KV != 0) {
+        return 0;
+    }
+    if ((((uint64_t) k->data) | k->nb[1] | k->nb[2] | k->nb[3]) & 63) {
+        return 0;
+    }
+    if ((((uint64_t) v->data) | v->nb[1] | v->nb[2] | v->nb[3]) & 63) {
+        return 0;
+    }
+    if (p->has_mask) {
+        if (m->type != GGML_TYPE_F16 || m->nb[0] != 2 || m->ne[2] != 1 || m->ne[0] < k->ne[1] ||
+            m->ne[1] < q->ne[1]) {
+            return 0;
+        }
+        if ((((uint64_t) m->data) | m->nb[1] | m->nb[3]) & 7) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static inline int gq_mask_class(const char * mrow, int64_t kv_base) {
+    if (!mrow) {
+        return GQ_OPEN;
+    }
+    const volatile uint64_t * w = (const volatile uint64_t *) (mrow + kv_base * 2);
+    const uint64_t            a = w[0], b = w[1], c = w[2], d = w[3];
+    if ((a | b | c | d) == 0) {
+        return GQ_OPEN;
+    }
+    const uint64_t ninf = 0xFC00FC00FC00FC00ULL;
+    if (a == ninf && b == ninf && c == ninf && d == ninf) {
+        return GQ_MASKED;
+    }
+    return GQ_MIXED;
+}
+
+// Q^T panel: chunk c, line l, word j = (Q_j[32c + 2l], Q_j[32c + 2l + 1]) as fp16, Q_j = the query row of column j.
+static void gq_build_qt(char * qt, const char * q_data, const struct ggml_tensor * q, int64_t dk, int64_t gqa,
+                        int64_t ik2, int64_t p0, int p1_valid, int64_t iq3) {
+    static const int32_t __attribute__((aligned(32))) offs[8] = { 0, 2, 64, 66, 128, 130, 192, 194 };
+
+    zero_acc_vec((float *) qt, (dk / TILE_K) * 16 * 16);
+
+    unsigned long old_mask;
+    __asm__ volatile(
+        "mova.x.m  %[ms]          \n\t"
+        "mov.m.x   m0, x0, 0xFF   \n\t"
+        "flw.ps    f1, 0(%[o])    \n\t"
+        : [ms] "=&r"(old_mask)
+        : [o] "r"(offs)
+        : "f1");
+    for (int h = 0; h < 2; ++h) {
+        if (h == 1 && !p1_valid) {
+            break;
+        }
+        for (int64_t lane = 0; lane < gqa; ++lane) {
+            const float * src = (const float *) (q_data + (p0 + h) * q->nb[1] + (ik2 * gqa + lane) * q->nb[2] +
+                                                 iq3 * q->nb[3]);
+            char * col = qt + (h * GQ_LANES + lane) * 4;
+            for (int64_t d0 = 0; d0 < dk; d0 += 8) {
+                char * dst = col + (d0 / TILE_K) * GQ_QT_CHUNK + ((d0 % TILE_K) / 2) * 64;
+                __asm__ volatile(
+                    "flw.ps      f2, 0(%[s])    \n\t"
+                    "fcvt.f16.ps f3, f2         \n\t"
+                    "fsch.ps     f3, f1(%[d])   \n\t"
+                    :
+                    : [s] "r"(src + d0), [d] "r"(dst)
+                    : "f2", "f3", "memory");
+            }
+        }
+    }
+    __asm__ volatile("mova.m.x  %[ms]          \n\t" : : [ms] "r"(old_mask));
+
+    FENCE;
+    for (int64_t c = 0; c < dk / TILE_K; ++c) {
+        flush_to_l2(qt + c * GQ_QT_CHUNK, 16, 64);
+    }
+    WAIT_CACHEOPS;
+}
+
+// One position's half of the tile, after QK^T: scale, mask, lane max, rescale, exp2, probability rows, lane sums.
+// sc holds the spilled QK^T registers (f(2i + h) at sc + (2i + h) * 32).
+static void gq_softmax_half(char * scp, int h, int cls, const char * mrow, int64_t kv_base, int64_t gqa, float scale,
+                            int64_t dv) {
+    float *       sc   = (float *) (scp + GQ_SC_OFF) + h * GQ_LANES;  // row i at sc + i * 16 floats
+    float *       st   = (float *) (scp + GQ_ST_OFF);
+    float *       M    = st + GQ_ST_M + h * GQ_LANES;
+    float *       S    = st + GQ_ST_S + h * GQ_LANES;
+    float *       T    = st + GQ_ST_T + h * GQ_LANES;
+    char *        prow = scp + GQ_P_OFF + h * gqa * 64;
+    const float   log2e = 1.4426950408889634f;
+    unsigned long ms;
+
+    if (cls == GQ_MASKED) {
+        // exp2(-inf) everywhere: zero probabilities, M and S unchanged (the row path skips such a tile).
+        for (int64_t r = 0; r < gqa; ++r) {
+            volatile uint64_t * w = (volatile uint64_t *) (prow + r * 64);
+            w[0] = 0;
+            w[1] = 0;
+            w[2] = 0;
+            w[3] = 0;
+        }
+        return;
+    }
+
+    // scale, in place
+    __asm__ volatile(
+        "mova.x.m  %[ms]            \n\t"
+        "mov.m.x   m0, x0, 0xFF     \n\t"
+        "fbc.ps    f16, 0(%[ps])    \n\t"
+        "flw.ps    f0, 0(%[sc])     \n\t"
+        "flw.ps    f1, 64(%[sc])    \n\t"
+        "flw.ps    f2, 128(%[sc])   \n\t"
+        "flw.ps    f3, 192(%[sc])   \n\t"
+        "flw.ps    f4, 256(%[sc])   \n\t"
+        "flw.ps    f5, 320(%[sc])   \n\t"
+        "flw.ps    f6, 384(%[sc])   \n\t"
+        "flw.ps    f7, 448(%[sc])   \n\t"
+        "flw.ps    f8, 512(%[sc])   \n\t"
+        "flw.ps    f9, 576(%[sc])   \n\t"
+        "flw.ps    f10, 640(%[sc])  \n\t"
+        "flw.ps    f11, 704(%[sc])  \n\t"
+        "flw.ps    f12, 768(%[sc])  \n\t"
+        "flw.ps    f13, 832(%[sc])  \n\t"
+        "flw.ps    f14, 896(%[sc])  \n\t"
+        "flw.ps    f15, 960(%[sc])  \n\t"
+        "fmul.ps   f0, f0, f16      \n\t"
+        "fmul.ps   f1, f1, f16      \n\t"
+        "fmul.ps   f2, f2, f16      \n\t"
+        "fmul.ps   f3, f3, f16      \n\t"
+        "fmul.ps   f4, f4, f16      \n\t"
+        "fmul.ps   f5, f5, f16      \n\t"
+        "fmul.ps   f6, f6, f16      \n\t"
+        "fmul.ps   f7, f7, f16      \n\t"
+        "fmul.ps   f8, f8, f16      \n\t"
+        "fmul.ps   f9, f9, f16      \n\t"
+        "fmul.ps   f10, f10, f16    \n\t"
+        "fmul.ps   f11, f11, f16    \n\t"
+        "fmul.ps   f12, f12, f16    \n\t"
+        "fmul.ps   f13, f13, f16    \n\t"
+        "fmul.ps   f14, f14, f16    \n\t"
+        "fmul.ps   f15, f15, f16    \n\t"
+        "fsw.ps    f0, 0(%[sc])     \n\t"
+        "fsw.ps    f1, 64(%[sc])    \n\t"
+        "fsw.ps    f2, 128(%[sc])   \n\t"
+        "fsw.ps    f3, 192(%[sc])   \n\t"
+        "fsw.ps    f4, 256(%[sc])   \n\t"
+        "fsw.ps    f5, 320(%[sc])   \n\t"
+        "fsw.ps    f6, 384(%[sc])   \n\t"
+        "fsw.ps    f7, 448(%[sc])   \n\t"
+        "fsw.ps    f8, 512(%[sc])   \n\t"
+        "fsw.ps    f9, 576(%[sc])   \n\t"
+        "fsw.ps    f10, 640(%[sc])  \n\t"
+        "fsw.ps    f11, 704(%[sc])  \n\t"
+        "fsw.ps    f12, 768(%[sc])  \n\t"
+        "fsw.ps    f13, 832(%[sc])  \n\t"
+        "fsw.ps    f14, 896(%[sc])  \n\t"
+        "fsw.ps    f15, 960(%[sc])  \n\t"
+        "mova.m.x  %[ms]            \n\t"
+        : [ms] "=&r"(ms)
+        : [sc] "r"(sc), [ps] "r"(&scale)
+        : "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15", "f16",
+          "memory");
+
+    // mask, the row path's rule: a value equal to its -FLT_MAX sentinel or NaN sets the score to the sentinel,
+    // anything else is added (an all-zero tile adds +0 everywhere, which changes no exp2 result: skipped)
+    if (cls == GQ_MIXED) {
+        for (int64_t i = 0; i < TILE_KV; ++i) {
+            float mv = fp16_to_fp32(*(const uint16_t *) (mrow + (kv_base + i) * 2));
+            float * row = sc + i * 16;
+            if (mv == ET_NEG_INF_F || mv != mv) {
+                const float sent = ET_NEG_INF_F;
+                __asm__ volatile(
+                    "mova.x.m  %[ms]          \n\t"
+                    "mov.m.x   m0, x0, 0xFF   \n\t"
+                    "fbc.ps    f0, 0(%[v])    \n\t"
+                    "fsw.ps    f0, 0(%[r])    \n\t"
+                    "mova.m.x  %[ms]          \n\t"
+                    : [ms] "=&r"(ms)
+                    : [v] "r"(&sent), [r] "r"(row)
+                    : "f0", "memory");
+            } else {
+                __asm__ volatile(
+                    "mova.x.m  %[ms]          \n\t"
+                    "mov.m.x   m0, x0, 0xFF   \n\t"
+                    "fbc.ps    f1, 0(%[v])    \n\t"
+                    "flw.ps    f0, 0(%[r])    \n\t"
+                    "fadd.ps   f0, f0, f1     \n\t"
+                    "fsw.ps    f0, 0(%[r])    \n\t"
+                    "mova.m.x  %[ms]          \n\t"
+                    : [ms] "=&r"(ms)
+                    : [v] "r"(&mv), [r] "r"(row)
+                    : "f0", "f1", "memory");
+            }
+        }
+    }
+
+    // lane max over the 16 KV rows
+    __asm__ volatile(
+        "mova.x.m  %[ms]            \n\t"
+        "mov.m.x   m0, x0, 0xFF     \n\t"
+        "flw.ps    f0, 0(%[sc])     \n\t"
+        "flw.ps    f1, 64(%[sc])    \n\t"
+        "flw.ps    f2, 128(%[sc])   \n\t"
+        "flw.ps    f3, 192(%[sc])   \n\t"
+        "flw.ps    f4, 256(%[sc])   \n\t"
+        "flw.ps    f5, 320(%[sc])   \n\t"
+        "flw.ps    f6, 384(%[sc])   \n\t"
+        "flw.ps    f7, 448(%[sc])   \n\t"
+        "flw.ps    f8, 512(%[sc])   \n\t"
+        "flw.ps    f9, 576(%[sc])   \n\t"
+        "flw.ps    f10, 640(%[sc])  \n\t"
+        "flw.ps    f11, 704(%[sc])  \n\t"
+        "flw.ps    f12, 768(%[sc])  \n\t"
+        "flw.ps    f13, 832(%[sc])  \n\t"
+        "flw.ps    f14, 896(%[sc])  \n\t"
+        "flw.ps    f15, 960(%[sc])  \n\t"
+        "fmax.ps   f0, f0, f1       \n\t"
+        "fmax.ps   f2, f2, f3       \n\t"
+        "fmax.ps   f4, f4, f5       \n\t"
+        "fmax.ps   f6, f6, f7       \n\t"
+        "fmax.ps   f8, f8, f9       \n\t"
+        "fmax.ps   f10, f10, f11    \n\t"
+        "fmax.ps   f12, f12, f13    \n\t"
+        "fmax.ps   f14, f14, f15    \n\t"
+        "fmax.ps   f0, f0, f2       \n\t"
+        "fmax.ps   f4, f4, f6       \n\t"
+        "fmax.ps   f8, f8, f10      \n\t"
+        "fmax.ps   f12, f12, f14    \n\t"
+        "fmax.ps   f0, f0, f4       \n\t"
+        "fmax.ps   f8, f8, f12      \n\t"
+        "fmax.ps   f0, f0, f8       \n\t"
+        "fsw.ps    f0, 0(%[t])      \n\t"
+        "mova.m.x  %[ms]            \n\t"
+        : [ms] "=&r"(ms)
+        : [sc] "r"(sc), [t] "r"(T)
+        : "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15",
+          "memory");
+
+    // a half with no score above the -FLT_MAX sentinel is skipped, as the row path skips such a tile
+    {
+        int64_t live = 0;
+        for (int64_t lane = 0; lane < gqa; ++lane) {
+            live += T[lane] > ET_NEG_INF_F;
+        }
+        if (live == 0) {
+            gq_softmax_half(scp, h, GQ_MASKED, mrow, kv_base, gqa, scale, dv);
+            return;
+        }
+    }
+
+    // a lane whose tile max exceeds its running max rescales its accumulator row and sum (the row path's rule)
+    float * acc_h = (float *) (scp + GQ_ACC_OFF) + h * gqa * (GQ_ACC_ROW / sizeof(float));
+    for (int64_t lane = 0; lane < gqa; ++lane) {
+        const float tm = T[lane];
+        if (tm > M[lane]) {
+            const float rescale = et_exp2f((M[lane] - tm) * log2e);
+            scale_acc_vec(acc_h + lane * (GQ_ACC_ROW / sizeof(float)), dv, rescale);
+            S[lane] *= rescale;
+            M[lane] = tm;
+        }
+    }
+
+    // p = exp2((s - M) * log2e) per lane; fp16 copies scattered into the probability rows (lane j -> row h*gqa + j,
+    // halfword i); lane sums in the row path's tree order ((a0+a1)+(a2+a3)) + ((a4+a5)+(a6+a7)), a_k = p_k + p_{k+8}
+    static const int32_t __attribute__((aligned(32))) prow_offs[8] = { 0, 64, 128, 192, 256, 320, 384, 448 };
+    const uint64_t lane_mask = (1ULL << gqa) - 1;
+    __asm__ volatile(
+        "mova.x.m  %[ms]            \n\t"
+        "mov.m.x   m0, x0, 0xFF     \n\t"
+        "flw.ps    f16, 0(%[pm])    \n\t"
+        "fbc.ps    f17, 0(%[pl])    \n\t"
+        "flw.ps    f18, 0(%[po])    \n\t"
+        "flw.ps    f0, 0(%[sc])   \n\t"
+        "flw.ps    f1, 64(%[sc])   \n\t"
+        "flw.ps    f2, 128(%[sc])   \n\t"
+        "flw.ps    f3, 192(%[sc])   \n\t"
+        "flw.ps    f4, 256(%[sc])   \n\t"
+        "flw.ps    f5, 320(%[sc])   \n\t"
+        "flw.ps    f6, 384(%[sc])   \n\t"
+        "flw.ps    f7, 448(%[sc])   \n\t"
+        "flw.ps    f8, 512(%[sc])   \n\t"
+        "flw.ps    f9, 576(%[sc])   \n\t"
+        "flw.ps    f10, 640(%[sc])   \n\t"
+        "flw.ps    f11, 704(%[sc])   \n\t"
+        "flw.ps    f12, 768(%[sc])   \n\t"
+        "flw.ps    f13, 832(%[sc])   \n\t"
+        "flw.ps    f14, 896(%[sc])   \n\t"
+        "flw.ps    f15, 960(%[sc])   \n\t"
+        "fsub.ps   f0, f0, f16   \n\t"
+        "fsub.ps   f1, f1, f16   \n\t"
+        "fsub.ps   f2, f2, f16   \n\t"
+        "fsub.ps   f3, f3, f16   \n\t"
+        "fsub.ps   f4, f4, f16   \n\t"
+        "fsub.ps   f5, f5, f16   \n\t"
+        "fsub.ps   f6, f6, f16   \n\t"
+        "fsub.ps   f7, f7, f16   \n\t"
+        "fsub.ps   f8, f8, f16   \n\t"
+        "fsub.ps   f9, f9, f16   \n\t"
+        "fsub.ps   f10, f10, f16   \n\t"
+        "fsub.ps   f11, f11, f16   \n\t"
+        "fsub.ps   f12, f12, f16   \n\t"
+        "fsub.ps   f13, f13, f16   \n\t"
+        "fsub.ps   f14, f14, f16   \n\t"
+        "fsub.ps   f15, f15, f16   \n\t"
+        "fmul.ps   f0, f0, f17   \n\t"
+        "fmul.ps   f1, f1, f17   \n\t"
+        "fmul.ps   f2, f2, f17   \n\t"
+        "fmul.ps   f3, f3, f17   \n\t"
+        "fmul.ps   f4, f4, f17   \n\t"
+        "fmul.ps   f5, f5, f17   \n\t"
+        "fmul.ps   f6, f6, f17   \n\t"
+        "fmul.ps   f7, f7, f17   \n\t"
+        "fmul.ps   f8, f8, f17   \n\t"
+        "fmul.ps   f9, f9, f17   \n\t"
+        "fmul.ps   f10, f10, f17   \n\t"
+        "fmul.ps   f11, f11, f17   \n\t"
+        "fmul.ps   f12, f12, f17   \n\t"
+        "fmul.ps   f13, f13, f17   \n\t"
+        "fmul.ps   f14, f14, f17   \n\t"
+        "fmul.ps   f15, f15, f17   \n\t"
+        "fexp.ps   f0, f0        \n\t"
+        "fexp.ps   f1, f1        \n\t"
+        "fexp.ps   f2, f2        \n\t"
+        "fexp.ps   f3, f3        \n\t"
+        "fexp.ps   f4, f4        \n\t"
+        "fexp.ps   f5, f5        \n\t"
+        "fexp.ps   f6, f6        \n\t"
+        "fexp.ps   f7, f7        \n\t"
+        "fexp.ps   f8, f8        \n\t"
+        "fexp.ps   f9, f9        \n\t"
+        "fexp.ps   f10, f10        \n\t"
+        "fexp.ps   f11, f11        \n\t"
+        "fexp.ps   f12, f12        \n\t"
+        "fexp.ps   f13, f13        \n\t"
+        "fexp.ps   f14, f14        \n\t"
+        "fexp.ps   f15, f15        \n\t"
+        "mov.m.x   m0, %[lm], 0     \n\t"
+        "fcvt.f16.ps f19, f0      \n\t"
+        "addi      t0, %[pr], 0    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f1      \n\t"
+        "addi      t0, %[pr], 2    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f2      \n\t"
+        "addi      t0, %[pr], 4    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f3      \n\t"
+        "addi      t0, %[pr], 6    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f4      \n\t"
+        "addi      t0, %[pr], 8    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f5      \n\t"
+        "addi      t0, %[pr], 10    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f6      \n\t"
+        "addi      t0, %[pr], 12    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f7      \n\t"
+        "addi      t0, %[pr], 14    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f8      \n\t"
+        "addi      t0, %[pr], 16    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f9      \n\t"
+        "addi      t0, %[pr], 18    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f10      \n\t"
+        "addi      t0, %[pr], 20    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f11      \n\t"
+        "addi      t0, %[pr], 22    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f12      \n\t"
+        "addi      t0, %[pr], 24    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f13      \n\t"
+        "addi      t0, %[pr], 26    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f14      \n\t"
+        "addi      t0, %[pr], 28    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "fcvt.f16.ps f19, f15      \n\t"
+        "addi      t0, %[pr], 30    \n\t"
+        "fsch.ps   f19, f18(t0)    \n\t"
+        "mov.m.x   m0, x0, 0xFF     \n\t"
+        "fadd.ps   f0, f0, f8, rne \n\t"
+        "fadd.ps   f1, f1, f9, rne \n\t"
+        "fadd.ps   f2, f2, f10, rne \n\t"
+        "fadd.ps   f3, f3, f11, rne \n\t"
+        "fadd.ps   f4, f4, f12, rne \n\t"
+        "fadd.ps   f5, f5, f13, rne \n\t"
+        "fadd.ps   f6, f6, f14, rne \n\t"
+        "fadd.ps   f7, f7, f15, rne \n\t"
+        "fadd.ps   f0, f0, f1, rne \n\t"
+        "fadd.ps   f2, f2, f3, rne \n\t"
+        "fadd.ps   f4, f4, f5, rne \n\t"
+        "fadd.ps   f6, f6, f7, rne \n\t"
+        "fadd.ps   f0, f0, f2, rne  \n\t"
+        "fadd.ps   f4, f4, f6, rne  \n\t"
+        "fadd.ps   f0, f0, f4, rne  \n\t"
+        "fsw.ps    f0, 0(%[t])      \n\t"
+        "mova.m.x  %[ms]            \n\t"
+        : [ms] "=&r"(ms)
+        : [sc] "r"(sc), [pm] "r"(M), [pl] "r"(&log2e), [po] "r"(prow_offs), [lm] "r"(lane_mask), [pr] "r"(prow),
+          [t] "r"(T)
+        : "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "f13", "f14", "f15", "f16",
+          "f17", "f18", "f19", "t0", "memory");
+
+    for (int64_t lane = 0; lane < gqa; ++lane) {
+        S[lane] += T[lane];
+    }
+}
+
+// After a P x V FMA: acc[row0 + r][dv_off .. dv_off + 15] = O + acc, O in f(2r), f(2r + 1), for r < rows <= 12, in the
+// row path's operand order. m0 must be all lanes.
+static inline void __attribute__((always_inline)) gq_acc_add(float * acc_row0, int64_t rows) {
+    if (rows > 0) {
+        float * a = acc_row0 + 0 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f0, f0, f30         \n\t"
+            "fadd.ps   f1, f1, f31         \n\t"
+            "fsw.ps    f0, 0(%[a])            \n\t"
+            "fsw.ps    f1, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f0", "f1", "f30", "f31", "memory");
+    }
+    if (rows > 1) {
+        float * a = acc_row0 + 1 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f2, f2, f30         \n\t"
+            "fadd.ps   f3, f3, f31         \n\t"
+            "fsw.ps    f2, 0(%[a])            \n\t"
+            "fsw.ps    f3, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f2", "f3", "f30", "f31", "memory");
+    }
+    if (rows > 2) {
+        float * a = acc_row0 + 2 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f4, f4, f30         \n\t"
+            "fadd.ps   f5, f5, f31         \n\t"
+            "fsw.ps    f4, 0(%[a])            \n\t"
+            "fsw.ps    f5, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f4", "f5", "f30", "f31", "memory");
+    }
+    if (rows > 3) {
+        float * a = acc_row0 + 3 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f6, f6, f30         \n\t"
+            "fadd.ps   f7, f7, f31         \n\t"
+            "fsw.ps    f6, 0(%[a])            \n\t"
+            "fsw.ps    f7, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f6", "f7", "f30", "f31", "memory");
+    }
+    if (rows > 4) {
+        float * a = acc_row0 + 4 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f8, f8, f30         \n\t"
+            "fadd.ps   f9, f9, f31         \n\t"
+            "fsw.ps    f8, 0(%[a])            \n\t"
+            "fsw.ps    f9, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f8", "f9", "f30", "f31", "memory");
+    }
+    if (rows > 5) {
+        float * a = acc_row0 + 5 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f10, f10, f30         \n\t"
+            "fadd.ps   f11, f11, f31         \n\t"
+            "fsw.ps    f10, 0(%[a])            \n\t"
+            "fsw.ps    f11, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f10", "f11", "f30", "f31", "memory");
+    }
+    if (rows > 6) {
+        float * a = acc_row0 + 6 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f12, f12, f30         \n\t"
+            "fadd.ps   f13, f13, f31         \n\t"
+            "fsw.ps    f12, 0(%[a])            \n\t"
+            "fsw.ps    f13, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f12", "f13", "f30", "f31", "memory");
+    }
+    if (rows > 7) {
+        float * a = acc_row0 + 7 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f14, f14, f30         \n\t"
+            "fadd.ps   f15, f15, f31         \n\t"
+            "fsw.ps    f14, 0(%[a])            \n\t"
+            "fsw.ps    f15, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f14", "f15", "f30", "f31", "memory");
+    }
+    if (rows > 8) {
+        float * a = acc_row0 + 8 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f16, f16, f30         \n\t"
+            "fadd.ps   f17, f17, f31         \n\t"
+            "fsw.ps    f16, 0(%[a])            \n\t"
+            "fsw.ps    f17, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f16", "f17", "f30", "f31", "memory");
+    }
+    if (rows > 9) {
+        float * a = acc_row0 + 9 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f18, f18, f30         \n\t"
+            "fadd.ps   f19, f19, f31         \n\t"
+            "fsw.ps    f18, 0(%[a])            \n\t"
+            "fsw.ps    f19, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f18", "f19", "f30", "f31", "memory");
+    }
+    if (rows > 10) {
+        float * a = acc_row0 + 10 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f20, f20, f30         \n\t"
+            "fadd.ps   f21, f21, f31         \n\t"
+            "fsw.ps    f20, 0(%[a])            \n\t"
+            "fsw.ps    f21, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f20", "f21", "f30", "f31", "memory");
+    }
+    if (rows > 11) {
+        float * a = acc_row0 + 11 * (GQ_ACC_ROW / sizeof(float));
+        __asm__ volatile(
+            "flw.ps    f30, 0(%[a])           \n\t"
+            "flw.ps    f31, 32(%[a])          \n\t"
+            "fadd.ps   f22, f22, f30         \n\t"
+            "fadd.ps   f23, f23, f31         \n\t"
+            "fsw.ps    f22, 0(%[a])            \n\t"
+            "fsw.ps    f23, 32(%[a])           \n\t"
+            :
+            : [a] "r"(a)
+            : "f22", "f23", "f30", "f31", "memory");
+    }
+}
+
+// Spill the 32 QK^T output registers: f(k) -> sc + 32 k.
+static inline void __attribute__((always_inline)) gq_spill_scores(float * sc) {
+    unsigned long ms;
+    __asm__ volatile(
+        "mova.x.m  %[ms]            \n\t"
+        "mov.m.x   m0, x0, 0xFF     \n\t"
+        "fsw.ps    f0, 0(%[sc])  \n\t"
+        "fsw.ps    f1, 32(%[sc])  \n\t"
+        "fsw.ps    f2, 64(%[sc])  \n\t"
+        "fsw.ps    f3, 96(%[sc])  \n\t"
+        "fsw.ps    f4, 128(%[sc])  \n\t"
+        "fsw.ps    f5, 160(%[sc])  \n\t"
+        "fsw.ps    f6, 192(%[sc])  \n\t"
+        "fsw.ps    f7, 224(%[sc])  \n\t"
+        "fsw.ps    f8, 256(%[sc])  \n\t"
+        "fsw.ps    f9, 288(%[sc])  \n\t"
+        "fsw.ps    f10, 320(%[sc])  \n\t"
+        "fsw.ps    f11, 352(%[sc])  \n\t"
+        "fsw.ps    f12, 384(%[sc])  \n\t"
+        "fsw.ps    f13, 416(%[sc])  \n\t"
+        "fsw.ps    f14, 448(%[sc])  \n\t"
+        "fsw.ps    f15, 480(%[sc])  \n\t"
+        "fsw.ps    f16, 512(%[sc])  \n\t"
+        "fsw.ps    f17, 544(%[sc])  \n\t"
+        "fsw.ps    f18, 576(%[sc])  \n\t"
+        "fsw.ps    f19, 608(%[sc])  \n\t"
+        "fsw.ps    f20, 640(%[sc])  \n\t"
+        "fsw.ps    f21, 672(%[sc])  \n\t"
+        "fsw.ps    f22, 704(%[sc])  \n\t"
+        "fsw.ps    f23, 736(%[sc])  \n\t"
+        "fsw.ps    f24, 768(%[sc])  \n\t"
+        "fsw.ps    f25, 800(%[sc])  \n\t"
+        "fsw.ps    f26, 832(%[sc])  \n\t"
+        "fsw.ps    f27, 864(%[sc])  \n\t"
+        "fsw.ps    f28, 896(%[sc])  \n\t"
+        "fsw.ps    f29, 928(%[sc])  \n\t"
+        "fsw.ps    f30, 960(%[sc])  \n\t"
+        "fsw.ps    f31, 992(%[sc])  \n\t"
+        "mova.m.x  %[ms]            \n\t"
+        : [ms] "=&r"(ms)
+        : [sc] "r"(sc)
+        : "memory");
+}
+
+static int fa_gqa_tiles(struct ggml_et_flash_attn_ext_params * params, uint64_t shire_id, uint64_t local_minion) {
+    const struct ggml_tensor * q    = &params->src0;
+    const struct ggml_tensor * k    = &params->src1;
+    const struct ggml_tensor * v    = &params->src2;
+    const struct ggml_tensor * dst  = &params->dst;
+    const struct ggml_tensor * mask = params->has_mask ? &params->mask : (const struct ggml_tensor *) 0;
+
+    const int64_t dk  = q->ne[0];
+    const int64_t nq  = q->ne[1];
+    const int64_t nhq = q->ne[2];
+    const int64_t no  = q->ne[3];
+    const int64_t nk  = k->ne[1];
+    const int64_t nhk = k->ne[2];
+    const int64_t dv  = v->ne[0];
+    const int64_t gqa = nhq / nhk;
+    const int64_t nc  = dk / TILE_K;
+    const float   scale = params->scale;
+
+    // P x V in one FMA of 2*gqa rows when the outputs leave f30/f31 free for the accumulator, else one per position
+    const int64_t pv_rows   = (2 * gqa <= 12) ? 2 * gqa : gqa;
+    const int64_t pv_groups = (2 * gqa) / pv_rows;
+
+    char *  scp = (char *) et_shire_l2scp_local(local_minion * GQ_PER_MINION);
+    char *  qt  = scp + GQ_QT_OFF;
+    float * acc = (float *) (scp + GQ_ACC_OFF);
+    float * st  = (float *) (scp + GQ_ST_OFF);
+    float * sc  = (float *) (scp + GQ_SC_OFF);
+
+    const int64_t tpb     = (nq + 1) / 2;  // teams per (batch, KV head)
+    const int64_t n_teams = no * nhk * tpb;
+    const int64_t g       = (int64_t) shire_id * MINIONS_PER_SHIRE + (int64_t) local_minion;
+
+    for (int64_t t = g; t < n_teams; t += (int64_t) NUM_COMPUTE_SHIRES * MINIONS_PER_SHIRE) {
+        const int64_t iq3      = t / (nhk * tpb);
+        const int64_t ik2      = (t / tpb) % nhk;
+        const int64_t p0       = 2 * (t % tpb);
+        const int     p1_valid = p0 + 1 < nq;
+
+        gq_build_qt(qt, (const char *) q->data, q, dk, gqa, ik2, p0, p1_valid, iq3);
+
+        for (int64_t i = 0; i < 2 * GQ_LANES; ++i) {
+            st[GQ_ST_M + i] = ET_NEG_INF_F;
+            st[GQ_ST_S + i] = 0.0f;
+        }
+        for (int64_t r = 0; r < 2 * gqa; ++r) {
+            zero_acc_vec(acc + r * (GQ_ACC_ROW / sizeof(float)), dv);
+        }
+
+        const char * mrow[2] = { 0, 0 };
+        if (mask) {
+            const char * mb = (const char *) mask->data + (iq3 % mask->ne[3]) * mask->nb[3];
+            mrow[0]         = mb + p0 * mask->nb[1];
+            mrow[1]         = p1_valid ? mb + (p0 + 1) * mask->nb[1] : 0;
+        }
+        const char * k_head = (const char *) k->data + ik2 * k->nb[2] + iq3 * k->nb[3];
+        const char * v_head = (const char *) v->data + ik2 * v->nb[2] + iq3 * v->nb[3];
+        const uint64_t nb1_k = (uint64_t) k->nb[1];
+        const uint64_t nb1_v = (uint64_t) v->nb[1];
+
+        for (int64_t kv_base = 0; kv_base < nk; kv_base += TILE_KV) {
+            const int cls0 = gq_mask_class(mrow[0], kv_base);
+            const int cls1 = p1_valid ? gq_mask_class(mrow[1], kv_base) : GQ_MASKED;
+            if (cls0 == GQ_MASKED && cls1 == GQ_MASKED) {
+                continue;
+            }
+
+            // QK^T: A = 16 K rows of chunk c (load id 0, double-buffered), B = Q^T chunk c through TenB
+            const char * kt = k_head + kv_base * (int64_t) nb1_k;
+            tensor_load(false, false, GQ_KB0, TENSOR_LOAD_PLAIN, 0, (uint64_t) kt, 0, 15, nb1_k, 0);
+            for (int64_t c = 0; c < nc; ++c) {
+                tensor_wait(TENSOR_LOAD_WAIT_0);
+                if (c + 1 < nc) {
+                    tensor_load(false, false, ((c + 1) & 1) ? GQ_KB1 : GQ_KB0, TENSOR_LOAD_PLAIN, 0,
+                                (uint64_t) (kt + (c + 1) * 64), 0, 15, nb1_k, 0);
+                }
+                tensor_load_setup_b(false, (uint64_t) (qt + c * GQ_QT_CHUNK), 15, 64, 1);
+                tensor_fma(false, 3, 15, 15, 0, false, false, false, true, 0, (c & 1) ? GQ_KB1 : GQ_KB0,
+                           TENSOR_FMA_OP_FP16, c == 0);
+                GQ_CLOBBER_F;
+                tensor_wait(TENSOR_FMA_WAIT);
+                GQ_CLOBBER_F;
+            }
+            gq_spill_scores(sc);
+            GQ_CLOBBER_F;
+
+            gq_softmax_half(scp, 0, cls0, mrow[0], kv_base, gqa, scale, dv);
+            gq_softmax_half(scp, 1, cls1, mrow[1], kv_base, gqa, scale, dv);
+
+            // P x V: A = the 2*gqa probability rows, B = V by INTERLEAVE16 (load id 1, double-buffered)
+            FENCE;
+            flush_to_l2(scp + GQ_P_OFF, (uint64_t) (2 * gqa), 64);
+            WAIT_CACHEOPS;
+            tensor_load(false, false, GQ_PL1, TENSOR_LOAD_PLAIN, 0, (uint64_t) (scp + GQ_P_OFF), 0,
+                        (uint64_t) (2 * gqa - 1), 64, 0);
+            const uintptr_t v_base = (uintptr_t) v_head + kv_base * (int64_t) nb1_v;
+            uint64_t        b_cur  = GQ_VB0;
+            tensor_load(false, false, b_cur, TENSOR_LOAD_INTERLEAVE16, 0, (uint64_t) v_base, 0, 7, nb1_v, 1);
+            tensor_wait(TENSOR_LOAD_WAIT_0);
+            tensor_wait(TENSOR_LOAD_WAIT_1);
+
+            unsigned long ms;
+            __asm__ volatile("mova.x.m  %[ms]          \n\t"
+                             "mov.m.x   m0, x0, 0xFF   \n\t"
+                             : [ms] "=&r"(ms));
+            for (int64_t dv_off = 0; dv_off < dv; dv_off += 16) {
+                const uint64_t b_nxt = (b_cur == GQ_VB0) ? GQ_VB1 : GQ_VB0;
+                if (dv_off + 16 < dv) {
+                    tensor_load(false, false, b_nxt, TENSOR_LOAD_INTERLEAVE16, 0, (uint64_t) (v_base + (dv_off + 16) * 2),
+                                0, 7, nb1_v, 1);
+                }
+                for (int64_t grp = 0; grp < pv_groups; ++grp) {
+                    tensor_fma(false, 3, (uint64_t) (pv_rows - 1), 7, 0, false, false, false, false, b_cur,
+                               (uint64_t) (GQ_PL1 + grp * pv_rows), TENSOR_FMA_OP_FP16, true);
+                    GQ_CLOBBER_F;
+                    tensor_wait(TENSOR_FMA_WAIT);
+                    GQ_CLOBBER_F;
+                    gq_acc_add(acc + grp * pv_rows * (GQ_ACC_ROW / sizeof(float)) + dv_off, pv_rows);
+                    GQ_CLOBBER_F;
+                }
+                if (dv_off + 16 < dv) {
+                    tensor_wait(TENSOR_LOAD_WAIT_1);
+                    b_cur = b_nxt;
+                }
+            }
+            __asm__ volatile("mova.m.x  %[ms]          \n\t" : : [ms] "r"(ms));
+        }
+
+        // normalise and store each query row (whole 64-byte lines of its dst row, one writer)
+        for (int64_t r = 0; r < 2 * gqa; ++r) {
+            const int64_t h = r / gqa;
+            if (h == 1 && !p1_valid) {
+                break;
+            }
+            const int64_t lane  = r % gqa;
+            const int64_t iq1   = p0 + h;
+            const int64_t iq2   = ik2 * gqa + lane;
+            float *       out   = (float *) ((char *) dst->data + iq2 * dst->nb[1] + iq1 * dst->nb[2] + iq3 * dst->nb[3]);
+            const float   S     = st[GQ_ST_S + h * GQ_LANES + lane];
+            const float   S_inv = S == 0.0f ? 0.0f : et_fdiv(1.0f, S);
+            normalize_store_vec(out, acc + r * (GQ_ACC_ROW / sizeof(float)), dv, S_inv, 1);
+        }
+    }
+
+    FENCE;
+    return 0;
+}
+
 int entry_point(struct ggml_et_flash_attn_ext_params * params, void * env) {
     (void) env;
 
@@ -481,6 +1319,11 @@ int entry_point(struct ggml_et_flash_attn_ext_params * params, void * env) {
 
     et_barrier(ET_BARRIER_SHIRE);
     // et_barrier(ET_BARRIER_GLOBAL);
+
+    // The decision depends on launch parameters only, so every hart takes the same path.
+    if (fa_gqa_eligible(params)) {
+        return is_hart1 ? 0 : fa_gqa_tiles(params, shire_id, local_minion);
+    }
 
     if (is_hart1) {
         // et_barrier(ET_BARRIER_GLOBAL);
