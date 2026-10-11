@@ -372,19 +372,20 @@ static inline void __attribute__((always_inline)) merge_rescale_add_asm(float * 
 }
 
 //******************************************************************************
-// GQA tile path (batches of >= GQ_MIN_NQ queries, no KV split)
+// GQA tile path (GGML_ET_FA_GQA: mode 1 batches of >= GQ_MIN_NQ queries, mode 2 >= 2 queries, mode 3 every batch)
 //
-// A team is (batch, KV head, two consecutive query positions p0, p1) and runs on one minion's hart 0. The 16 tile
+// A team is (batch, KV head, two consecutive query positions p0, p1). Its KV tiles run on ks minions' hart 0 (ks = 1
+// in mode 1 and for large batches; up to 32 of one shire in modes 2-3, merged between two shire barriers). The 16 tile
 // columns are the GQA query heads of the two positions: column j < 8 is head ik2*gqa + j at p0, column 8 + j the same
 // head at p1 (lanes >= gqa are zero padding). QK^T takes K as the A operand (16 KV rows by plain loads straight from
 // the cache) and Q^T as B (a panel built once per team in the L2 scratchpad and streamed through TenB), so the score
 // of KV row i, column j lands in f(2i) lane j (p0) or f(2i+1) lane j - 8 (p1) and the softmax runs lane-wise, one lane
 // per query row, with no horizontal reductions. P x V takes the 2*gqa probability rows as A and V by INTERLEAVE16 as
-// B, as the row path does. Each query row sees the row path's arithmetic in the row path's order: the same fp16
-// products in the same pair order, scale, mask, max, exp2, the same sum tree, rescale and accumulation.
+// B, as the row path does. With ks = 1 each query row sees the row path's arithmetic in the row path's order: the same
+// fp16 products in the same pair order, scale, mask, max, exp2, the same sum tree, rescale and accumulation.
 //
 // The row path re-reads K and V once per query row and packs K on hart 1; here a K/V tile is read once per 2*gqa
-// rows and hart 1 has no work.
+// rows and hart 1 only takes the merge barriers.
 //******************************************************************************
 
 #define GQ_LANES  8   // lanes of one position's half of the tile (b_num_col 3: 16 columns = two halves)
@@ -1332,6 +1333,7 @@ static void gq_merge_line(struct ggml_et_flash_attn_ext_params * params, struct 
         evict_to_l2(base + GQ_ACC_OFF + r * GQ_ACC_ROW + c * 64, (uint64_t) cnt, GQ_PER_MINION);
     }
     WAIT_CACHEOPS;
+    __asm__ volatile("" ::: "memory");  // WAIT_CACHEOPS has no memory clobber: keep the peer loads after it
 
     float Mx = ET_NEG_INF_F;
     for (int64_t m = 0; m < ks; ++m) {
